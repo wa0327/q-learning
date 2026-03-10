@@ -12,11 +12,13 @@ FOOD_SIZE = 100         # 食物數量
 PREDATOR_SIZE = 10       # 增加掠食者數量，強化生存壓力
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
-EVOLUTION_INTERVAL = 30 # 固定每n秒進化一次
+EVOLUTION_TICKS = 2000 # 固定每n幀進化一次
 SAVE_PATH = "survivors.pt" # 存檔路徑
+MAX_ENERGY = 100.0
+ENERGY_DECAY = 0.15 # 每幀扣除能量 (數值越高，進食壓力越大)
 
-# 輸入層增加到 10：[食物cos, sin, 食物dist, X, Y, 速度X, 速度Y, 掠食者cos, 掠食者sin, 掠食者壓迫感]
-INPUT_SIZE = 10 
+# 輸入層增加到 11：[食物cos, sin, 食物dist, X, Y, 速度X, 速度Y, 掠食者cos, 掠食者sin, 掠食者壓迫感]
+INPUT_SIZE = 11 
 HIDDEN_SIZE = 16 
 OUTPUT_SIZE = 2
 
@@ -31,7 +33,7 @@ class EvolutionSim:
         
         # 基本屬性初始化
         self.generation_count = 1
-        self.last_evolution_time = time.time()
+        self.evolution_ticks = EVOLUTION_TICKS
         self.elite_indices = []
 
         # 初始化掠食者 (Predators) - 隨機移動，不參與進化
@@ -49,6 +51,7 @@ class EvolutionSim:
         self.survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
+        self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
 
         # --- 專家基因注入邏輯 ---
         expert_path = "expert_seed.pt"
@@ -82,7 +85,7 @@ class EvolutionSim:
             'generation_count': self.generation_count,
             'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
             'fitness': self.fitness, 'survival_age': self.survival_age,
-            'alive': self.alive,
+            'alive': self.alive, 'energy': self.energy,
             'w1': self.w1, 'w2': self.w2, 'food_pos': self.food_pos,
             'pred_pos': self.pred_pos, 'elite_indices': self.elite_indices
         }
@@ -96,7 +99,7 @@ class EvolutionSim:
                 self.generation_count = state['generation_count']
                 self.pos, self.vel, self.angle = state['pos'], state['vel'], state['angle']
                 self.fitness, self.survival_age = state['fitness'], state['survival_age']
-                self.alive = state['alive']
+                self.alive, self.energy = state['alive'], state['energy']
                 self.w1, self.w2 = state['w1'], state['w2']
                 self.food_pos, self.pred_pos = state['food_pos'], state['pred_pos']
                 self.elite_indices = state['elite_indices']
@@ -125,13 +128,17 @@ class EvolutionSim:
         # 3. 壓迫感計算：距離越近，值越大 (200/dist)
         pressure = torch.clamp(200.0 / (min_p_dist + 1.0), 0, 2)
 
+        # 4. 當前能量比例 (1.0 = 滿載, 0.0 = 瀕死)
+        energy_ratio = self.energy / MAX_ENERGY
+
         sensors = torch.stack([
             torch.cos(ang_to_food), torch.sin(ang_to_food), 
             torch.clamp(min_f_dist / 500.0, 0, 1),
             (self.pos[:, 0] / SCREEN_W) * 2 - 1, (self.pos[:, 1] / SCREEN_H) * 2 - 1,
             self.vel[:, 0] * 0.1, self.vel[:, 1] * 0.1,
             torch.cos(ang_to_pred), torch.sin(ang_to_pred),
-            pressure
+            pressure,
+            energy_ratio
         ], dim=1)
         return sensors
 
@@ -140,6 +147,16 @@ class EvolutionSim:
         if not active_mask.any():
             return 
 
+        # 1. 能量消耗
+        self.energy[active_mask] -= ENERGY_DECAY
+        
+        # 2. 餓死檢測
+        starved = (self.energy <= 0) & active_mask
+        if starved.any():
+            self.alive[starved] = False
+            self.fitness[starved] -= 100 # 餓死的懲罰比撞死重，強制它必須去探索
+            self.energy[starved] = 0
+            
         # 掠食者移動邏輯
         self.pred_pos += self.pred_vel
         mask_x = (self.pred_pos[:, 0] < 0) | (self.pred_pos[:, 0] > SCREEN_W)
@@ -178,6 +195,7 @@ class EvolutionSim:
             hits = torch.where(eaten_mask[i_idx])[0]
             if len(hits) > 0:
                 self.fitness[real_idx] += len(hits) * 10
+                self.energy[real_idx] = torch.clamp(self.energy[real_idx] + 30.0, max=MAX_ENERGY)
                 self.food_pos[hits] = torch.rand(len(hits), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
 
         # 掠食者與壓迫扣分
@@ -244,8 +262,9 @@ class EvolutionSim:
         self.w1, self.w2 = new_w1, new_w2
         self.alive[:] = True
         self.fitness *= 0 
+        self.energy[:] = MAX_ENERGY
         self.generation_count += 1
-        self.last_evolution_time = time.time()
+        self.evolution_ticks = EVOLUTION_TICKS
         # 進化完成後也自動存檔一次，防止意外中斷
         self.save_state()
         
@@ -259,10 +278,10 @@ class EvolutionSim:
         running = True
         while running:
             # 定時進化觸發
-            time_left = EVOLUTION_INTERVAL - (time.time() - self.last_evolution_time)
-            if time_left <= 0:
+            self.evolution_ticks -= 1
+            if self.evolution_ticks <= 0:
                 self.evolve()
-                time_left = EVOLUTION_INTERVAL
+                self.evolution_ticks = EVOLUTION_TICKS
 
             self.update_physics()
             self.screen.fill((20, 20, 25))
@@ -294,7 +313,7 @@ class EvolutionSim:
 
             # UI
             self.screen.blit(self.big_font.render(f"GEN: {self.generation_count}", True, (255,255,255)), (20, 20))
-            self.screen.blit(self.font.render(f"Next: {int(time_left)}s", True, (200,200,200)), (20, 60))
+            self.screen.blit(self.font.render(f"Next: {int(self.evolution_ticks)}", True, (200,200,200)), (20, 60))
             self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (100, 100, 150)), (20, 90))
             self.screen.blit(self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0)), (20, 120))
             
