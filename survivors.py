@@ -12,7 +12,7 @@ FOOD_SIZE = 100         # 食物數量
 PREDATOR_SIZE = 10       # 增加掠食者數量，強化生存壓力
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
-EVOLUTION_TICKS = 2000 # 固定每n幀進化一次
+EVOLUTION_TICKS = 5000 # 固定每n幀進化一次
 SAVE_PATH = "survivors.pt" # 存檔路徑
 MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.15 # 每幀扣除能量 (數值越高，進食壓力越大)
@@ -288,7 +288,7 @@ class EvolutionSim:
             
             # 畫食物
             for f in self.food_pos.cpu().numpy():
-                pygame.draw.circle(self.screen, (255, 60, 60), f.astype(int), 3)
+                pygame.draw.circle(self.screen, (0, 255, 0), f.astype(int), 3)
             
             # 繪製掠食者 (大白圓)
             for p in self.pred_pos.cpu().numpy():
@@ -305,7 +305,7 @@ class EvolutionSim:
                     pygame.draw.circle(self.screen, (80, 80, 80), p.astype(int), 3)
                     continue
 
-                color = (200, 100, 255) if age_np[i] >= 3 else (255, 215, 0) if i in self.elite_indices else (46, 204, 113)
+                color = (200, 100, 255) if age_np[i] >= 3 else (255, 215, 0) if i in self.elite_indices else (255, 215, 0)
                 radius = 7 if i in self.elite_indices else 4
                 pygame.draw.circle(self.screen, color, p.astype(int), radius)
                 if i in self.elite_indices:
