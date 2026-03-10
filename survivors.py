@@ -9,15 +9,15 @@ import os
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 POP_SIZE = 100          # 生物數量
 FOOD_SIZE = 100         # 食物數量
-PREDATOR_SIZE = 3       # 掠食者數量
+PREDATOR_SIZE = 5       # 增加掠食者數量，強化生存壓力
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
 EVOLUTION_INTERVAL = 30 # 固定每n秒進化一次
 SAVE_PATH = "survivors.pt" # 存檔路徑
 
-# 輸入層增加到 9：[食物cos, sin, 食物dist, X, Y, 速度X, 速度Y, 掠食者cos, 掠食者sin]
-INPUT_SIZE = 9 
-HIDDEN_SIZE = 16 # 稍微增加隱藏層神經元以處理更複雜的邏輯
+# 輸入層增加到 10：[食物cos, sin, 食物dist, X, Y, 速度X, 速度Y, 掠食者cos, 掠食者sin, 掠食者壓迫感]
+INPUT_SIZE = 10 
+HIDDEN_SIZE = 16 
 OUTPUT_SIZE = 2
 
 class EvolutionSim:
@@ -50,12 +50,10 @@ class EvolutionSim:
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
 
-        # 初始化神經網路權重 (CUDA)
         self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
         self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
 
     def save_state(self):
-        """儲存當前所有關鍵狀態到檔案"""
         state = {
             'generation_count': self.generation_count,
             'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
@@ -86,27 +84,30 @@ class EvolutionSim:
         return False
 
     def get_sensor_data(self):
-        # 1. 食物資訊
+        # 1. 最近食物
         dist_to_food = torch.cdist(self.pos, self.food_pos)
         min_f_dist, min_f_idx = torch.min(dist_to_food, dim=1)
         target_food = self.food_pos[min_f_idx]
         dir_to_food = target_food - self.pos
         ang_to_food = torch.atan2(dir_to_food[:, 1], dir_to_food[:, 0]) - self.angle
 
-        # 2. 掠食者資訊
+        # 2. 最近掠食者
         dist_to_pred = torch.cdist(self.pos, self.pred_pos)
         min_p_dist, min_p_idx = torch.min(dist_to_pred, dim=1)
         target_pred = self.pred_pos[min_p_idx]
         dir_to_pred = target_pred - self.pos
         ang_to_pred = torch.atan2(dir_to_pred[:, 1], dir_to_pred[:, 0]) - self.angle
 
-        # 3. 組合感測向量
+        # 3. 壓迫感計算：距離越近，值越大 (200/dist)
+        pressure = torch.clamp(200.0 / (min_p_dist + 1.0), 0, 2)
+
         sensors = torch.stack([
             torch.cos(ang_to_food), torch.sin(ang_to_food), 
             torch.clamp(min_f_dist / 500.0, 0, 1),
             (self.pos[:, 0] / SCREEN_W) * 2 - 1, (self.pos[:, 1] / SCREEN_H) * 2 - 1,
-            self.vel[:, 0] * 0.1, self.vel[:, 1] * 0.1, # 自身速度
-            torch.cos(ang_to_pred), torch.sin(ang_to_pred) # 掠食者方向
+            self.vel[:, 0] * 0.1, self.vel[:, 1] * 0.1,
+            torch.cos(ang_to_pred), torch.sin(ang_to_pred),
+            pressure
         ], dim=1)
         return sensors
 
@@ -122,45 +123,47 @@ class EvolutionSim:
         self.pred_vel[mask_x, 0] *= -1
         self.pred_vel[mask_y, 1] *= -1
 
-        # 取得感測器資料 (保持 100 筆以利批次 NN 運算)
+        # NN 運算
         sensors = self.get_sensor_data() 
-        
-        # NN 前向傳播
         h = torch.tanh(torch.bmm(sensors.unsqueeze(1), self.w1))
         out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
         
-        # --- 僅更新活著的生物 ---
-        # 轉向更新
+        # 物理更新
         self.angle[active_mask] += out[active_mask, 1] * 0.15
-        
-        # 速度更新
-        # 注意：speed 映射回 [0, 0.2] 的推力 (原 0.1 有點慢，建議可調)
         current_speed_vol = (out[active_mask, 0] + 1) * 0.1 
         move_dir = torch.stack([torch.cos(self.angle[active_mask]), torch.sin(self.angle[active_mask])], dim=1)
-        new_push = move_dir * current_speed_vol.unsqueeze(1)
         
         # 應用阻尼與推力
-        self.vel[active_mask] = self.vel[active_mask] * 0.95 + new_push
+        self.vel[active_mask] = self.vel[active_mask] * 0.95 + move_dir * current_speed_vol.unsqueeze(1)
         self.pos[active_mask] += self.vel[active_mask]
         
         # 邊界
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
 
-        # 1. 吃到食物檢測
+        # 生存獎勵：只要活著，每一幀給予微量加分
+        self.fitness[active_mask] += 0.01
+
+        # 檢測碰撞
+        active_indices = torch.where(active_mask)[0]
+        
+        # 食物
         dist_f = torch.cdist(self.pos[active_mask], self.food_pos)
         eaten_mask = dist_f < 10.0
-        
-        # 取得活著生物的索引
-        active_indices = torch.where(active_mask)[0]
         for i_idx, real_idx in enumerate(active_indices):
             hits = torch.where(eaten_mask[i_idx])[0]
             if len(hits) > 0:
                 self.fitness[real_idx] += len(hits) * 10
                 self.food_pos[hits] = torch.rand(len(hits), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
 
-        # 2. 掠食者碰撞檢測
+        # 掠食者與壓迫扣分
         dist_p = torch.cdist(self.pos[active_mask], self.pred_pos)
+        
+        # 壓迫感扣分：距離小於 80 開始每一幀扣分，鼓勵遠離
+        close_to_pred = (dist_p < 80.0).any(dim=1)
+        self.fitness[active_indices[close_to_pred]] -= 0.1
+
+        # 直接碰撞出局
         killed_sub_mask = (dist_p < 25.0).any(dim=1)
         if killed_sub_mask.any():
             killed_real_indices = active_indices[killed_sub_mask]
@@ -216,7 +219,7 @@ class EvolutionSim:
         # 更新權重並重置環境
         self.w1, self.w2 = new_w1, new_w2
         self.alive[:] = True
-        self.fitness *= 0 # 重置適應度，重新評估新一代
+        self.fitness *= 0 
         self.generation_count += 1
         self.last_evolution_time = time.time()
         # 進化完成後也自動存檔一次，防止意外中斷
@@ -252,36 +255,25 @@ class EvolutionSim:
             # 繪製生物
             pos_np = self.pos.cpu().numpy()
             age_np = self.survival_age.cpu().numpy()
+            alive_np = self.alive.cpu().numpy()
             for i, p in enumerate(pos_np):
-                # 死亡：畫成灰色，且不顯示年齡
-                if not self.alive[i]:
+                if not alive_np[i]:
+                    # 死亡：畫成灰色，且不顯示年齡
                     pygame.draw.circle(self.screen, (80, 80, 80), p.astype(int), 3)
                     continue
-
-                if i in self.elite_indices:
-                    age = age_np[i]
-                    # 超過 3 代的長青精英變換顏色 (紫色)
-                    color = (200, 100, 255) if age >= 3 else (255, 215, 0)
-                    pygame.draw.circle(self.screen, color, p.astype(int), 7)
-                    pygame.draw.circle(self.screen, color, p.astype(int), 12, 1) # 外環
-
-                    # 顯示年齡標註
-                    age_surf = self.font.render(f"{age}", True, color)
-                    self.screen.blit(age_surf, (p[0] - 5, p[1] - 25))
-                else:
-                    # 普通：綠色
-                    pygame.draw.circle(self.screen, (46, 204, 113), p.astype(int), 4)
-
-            # UI 資訊
-            gen_text = self.big_font.render(f"GENERATION: {self.generation_count}", True, (255, 255, 255))
-            self.screen.blit(gen_text, (20, 20))
-            timer_text = self.font.render(f"Next Evolution in: {int(time_left)}s", True, (200, 200, 200))
-            self.screen.blit(timer_text, (20, 60))
-            fps_text = self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0))
-            self.screen.blit(fps_text, (20, 90))
-            save_info = self.font.render("Auto-saves on exit or evolution", True, (100, 100, 150))
-            self.screen.blit(save_info, (20, 120))
                 
+                color = (200, 100, 255) if age_np[i] >= 3 else (255, 215, 0) if i in self.elite_indices else (46, 204, 113)
+                radius = 7 if i in self.elite_indices else 4
+                pygame.draw.circle(self.screen, color, p.astype(int), radius)
+                if i in self.elite_indices:
+                    pygame.draw.circle(self.screen, color, p.astype(int), radius+5, 1)
+
+            # UI
+            self.screen.blit(self.big_font.render(f"GEN: {self.generation_count}", True, (255,255,255)), (20, 20))
+            self.screen.blit(self.font.render(f"Next: {int(time_left)}s", True, (200,200,200)), (20, 60))
+            self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (100, 100, 150)), (20, 90))
+            self.screen.blit(self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0)), (20, 120))
+            
             pygame.display.flip()
             self.clock.tick(FPS)
 
