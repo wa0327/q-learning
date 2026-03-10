@@ -9,7 +9,7 @@ import os
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 POP_SIZE = 100          # 生物數量
 FOOD_SIZE = 100         # 食物數量
-PREDATOR_SIZE = 5       # 增加掠食者數量，強化生存壓力
+PREDATOR_SIZE = 10       # 增加掠食者數量，強化生存壓力
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
 EVOLUTION_INTERVAL = 30 # 固定每n秒進化一次
@@ -50,8 +50,32 @@ class EvolutionSim:
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
 
-        self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
-        self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
+        # --- 專家基因注入邏輯 ---
+        expert_path = "expert_seed.pt"
+        if os.path.exists(expert_path):
+            print(f"[System] Injecting Expert Seed from {expert_path}...")
+            expert_data = torch.load(expert_path, map_location=DEVICE)
+            base_w1 = expert_data['w1'] # (INPUT, HIDDEN)
+            base_w2 = expert_data['w2'] # (HIDDEN, OUTPUT)
+
+            # 擴散到 100 個個體
+            # 其中 20% 保持專家原樣 (純種)，80% 加上突變 (探索者)
+            new_w1 = base_w1.unsqueeze(0).repeat(POP_SIZE, 1, 1)
+            new_w2 = base_w2.unsqueeze(0).repeat(POP_SIZE, 1, 1)
+
+            # 對後 80% 進行變異
+            mutation_mask = int(POP_SIZE * 0.2)
+            noise_indices = range(mutation_mask, POP_SIZE)
+            for i in noise_indices:
+                new_w1[i] += torch.randn_like(new_w1[i]) * 0.2 # 較大的突變強度
+                new_w2[i] += torch.randn_like(new_w2[i]) * 0.2
+            
+            self.w1 = new_w1.to(DEVICE)
+            self.w2 = new_w2.to(DEVICE)
+        else:
+            print("[System] No expert seed found. Initializing with random weights.")
+            self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
+            self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
 
     def save_state(self):
         state = {
@@ -261,7 +285,7 @@ class EvolutionSim:
                     # 死亡：畫成灰色，且不顯示年齡
                     pygame.draw.circle(self.screen, (80, 80, 80), p.astype(int), 3)
                     continue
-                
+
                 color = (200, 100, 255) if age_np[i] >= 3 else (255, 215, 0) if i in self.elite_indices else (46, 204, 113)
                 radius = 7 if i in self.elite_indices else 4
                 pygame.draw.circle(self.screen, color, p.astype(int), radius)
