@@ -63,7 +63,7 @@ class EvolutionSim:
             'pred_pos': self.pred_pos, 'elite_indices': self.elite_indices
         }
         torch.save(state, SAVE_PATH)
-        print(f"\n[System] State saved to {SAVE_PATH} at Generation {self.generation_count}")
+        print(f"[System] State saved to {SAVE_PATH} at Generation {self.generation_count}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -152,46 +152,51 @@ class EvolutionSim:
         self.fitness[attacked.any(dim=1)] -= 50
 
     def evolve(self):
-        # 找出前 20% 精英
-        num_elites = int(POP_SIZE * 0.2)
+        # 1. 取得排序索引 (從高分到低分)
         sorted_indices = torch.argsort(self.fitness, descending=True)
-        current_elites = sorted_indices[:num_elites]
-        self.elite_indices = current_elites.cpu().numpy().tolist()
         
-        # 更新存活代數：精英 +1，其餘重置為 0
+        # 2. 定義兩個候選池
+        num_target = int(POP_SIZE * 0.2)
+        positive_mask = self.fitness[sorted_indices] > 0
+        elites_with_score = sorted_indices[positive_mask]
+        
+        # 判斷邏輯：如果有得分者，則僅取得分者（上限 20%）；若無得分者，則取前 20%
+        if len(elites_with_score) > 0:
+            # 僅取分數大於 0 的個體，且最多只取前 20% 的名額
+            current_elites = elites_with_score[:num_target]
+            print(f"[System] Prosperous Era: {len(current_elites)} elites with fitness > 0.")
+        else:
+            # 全員皆沒得分，強制取前 20% 作為種子
+            current_elites = sorted_indices[:num_target]
+            print(f"[System] Dark Age: No positive fitness. Using top 20% relative performers.")
+
+        self.elite_indices = current_elites.cpu().numpy().tolist()
+        num_found_elites = len(self.elite_indices)
+
+        # 更新存活代數
         new_survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
         new_survival_age[current_elites] = self.survival_age[current_elites] + 1
         self.survival_age = new_survival_age
         
-        # 進行進化更新
+        # 3. 準備新權重與平均分配
         new_w1 = self.w1.clone()
         new_w2 = self.w2.clone()
-        
-        # 找出需要被汰換的索引 (排除精英後的 80 個索引)
         non_elite_indices = [i for i in range(POP_SIZE) if i not in self.elite_indices]
-        
-        # 平均分配：每個精英產生固定數量的後代
-        # 每位精英分配到的後代數量 (例如 80 / 20 = 4)
-        offspring_per_elite = len(non_elite_indices) // num_elites
+
+        # 這裡的 num_found_elites 絕對會大於 0 (因為即使沒人得分也會取前 20%)
+        offspring_per_elite = len(non_elite_indices) // num_found_elites
         
         for idx, parent_idx in enumerate(self.elite_indices):
-            # 算出這位精英要負責填補哪幾個非精英的位置
-            start_pos = idx * offspring_per_elite
-            end_pos = start_pos + offspring_per_elite
-            
-            # 獲取這一組要更新的子代索引
-            target_indices = non_elite_indices[start_pos:end_pos]
-            
-            for i in target_indices:
-                # 繼承該精英的基因並加入隨機突變
+            start = idx * offspring_per_elite
+            # 處理最後一組餘數，確保填滿 100 個位置
+            end = (idx + 1) * offspring_per_elite if idx < num_found_elites - 1 else len(non_elite_indices)
+            target_group = non_elite_indices[start:end]
+            for i in target_group:
+                # 繼承並突變
                 new_w1[i] = self.w1[parent_idx] + torch.randn_like(self.w1[i]) * 0.15
                 new_w2[i] = self.w2[parent_idx] + torch.randn_like(self.w2[i]) * 0.15
-                
-                # 重置這些子代的位置與狀態
-                self.pos[i] = torch.rand(2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-                self.vel[i] *= 0
-                self.angle[i] = random.random() * 2 * np.pi
-        
+                self.reset_agent(i)
+
         # 更新權重並重置環境
         self.w1, self.w2 = new_w1, new_w2
         self.fitness *= 0 # 重置適應度，重新評估新一代
@@ -199,6 +204,12 @@ class EvolutionSim:
         self.last_evolution_time = time.time()
         # 進化完成後也自動存檔一次，防止意外中斷
         self.save_state()
+        
+    def reset_agent(self, i):
+        """輔助函式：重置個體狀態"""
+        self.pos[i] = torch.rand(2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        self.vel[i] *= 0
+        self.angle[i] = random.random() * 2 * np.pi
 
     def run(self):
         running = True
