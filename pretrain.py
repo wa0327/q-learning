@@ -5,19 +5,21 @@ import torch.optim as optim
 # 必須與原程式參數完全一致
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_SIZE = 11
-HIDDEN_SIZE = 16
+HIDDEN_SIZE = 64
 OUTPUT_SIZE = 2
-PRETRAIN_SAVE_PATH = "expert_seed.pt"
+PRETRAIN_SAVE_PATH = "pretrain.pt"
 
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
         self.w1 = nn.Parameter(torch.randn(INPUT_SIZE, HIDDEN_SIZE).to(DEVICE))
-        self.w2 = nn.Parameter(torch.randn(HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE))
+        self.w2 = nn.Parameter(torch.randn(HIDDEN_SIZE, HIDDEN_SIZE).to(DEVICE))
+        self.w3 = nn.Parameter(torch.randn(HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE))
 
     def forward(self, x):
-        h = torch.tanh(x @ self.w1)
-        return torch.tanh(h @ self.w2)
+        h1 = torch.tanh(x @ self.w1)
+        h2 = torch.tanh(h1 @ self.w2)
+        return torch.tanh(h2 @ self.w3)
 
 def expert_logic(sensors):
     """
@@ -50,13 +52,13 @@ def expert_logic(sensors):
     
     return targets
 
-def run_pretrain(epochs=50000):
+def run_pretrain(epochs=100000):
     model = Net().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=0.002) # 稍微提高學習率
     criterion = nn.MSELoss()
     
     # 批次訓練效率更高
-    BATCH_SIZE = 128 
+    BATCH_SIZE = 256 
     print_interval = max(1, epochs // 100)
 
     print(f"[Pretrain] Device: {DEVICE.type.upper()} | Epochs: {epochs}")
@@ -85,7 +87,11 @@ def run_pretrain(epochs=50000):
             print(f"Progress: {percentage:>3}% | Step: {i+1:>6} | Loss: {loss.item():.6f}")
 
     # 儲存權重 (僅儲存單個專家的權重)
-    torch.save({'w1': model.w1.data, 'w2': model.w2.data}, PRETRAIN_SAVE_PATH)
+    torch.save({
+        'w1': model.w1.data,
+        'w2': model.w2.data,
+        'w3': model.w3.data
+    }, PRETRAIN_SAVE_PATH)
     print(f"Expert weights saved to {PRETRAIN_SAVE_PATH}")
 
 if __name__ == "__main__":

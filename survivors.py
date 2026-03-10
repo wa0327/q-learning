@@ -7,12 +7,12 @@ import os
 
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 100          # 生物數量
+POP_SIZE = 50          # 生物數量
 FOOD_SIZE = 100         # 食物數量
-PREDATOR_SIZE = 10       # 增加掠食者數量，強化生存壓力
+PREDATOR_SIZE = 5       # 增加掠食者數量，強化生存壓力
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
-EVOLUTION_TICKS = 5000 # 固定每n幀進化一次
+EVOLUTION_TICKS = 10000 # 固定每n幀進化一次
 SAVE_PATH = "survivors.pt" # 存檔路徑
 MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.15 # 每幀扣除能量 (數值越高，進食壓力越大)
@@ -58,27 +58,34 @@ class EvolutionSim:
         if os.path.exists(expert_path):
             print(f"[System] Injecting Expert Seed from {expert_path}...")
             expert_data = torch.load(expert_path, map_location=DEVICE)
+            print(expert_data.keys())
             base_w1 = expert_data['w1'] # (INPUT, HIDDEN)
-            base_w2 = expert_data['w2'] # (HIDDEN, OUTPUT)
+            base_w2 = expert_data['w2'] # (HIDDEN, HIDDEN)
+            base_w3 = expert_data['w3'] # (HIDDEN, OUTPUT)
 
             # 擴散到 100 個個體
             # 其中 20% 保持專家原樣 (純種)，80% 加上突變 (探索者)
             new_w1 = base_w1.unsqueeze(0).repeat(POP_SIZE, 1, 1)
             new_w2 = base_w2.unsqueeze(0).repeat(POP_SIZE, 1, 1)
+            new_w3 = base_w3.unsqueeze(0).repeat(POP_SIZE, 1, 1)
 
             # 對後 80% 進行變異
             mutation_mask = int(POP_SIZE * 0.2)
             noise_indices = range(mutation_mask, POP_SIZE)
             for i in noise_indices:
-                new_w1[i] += torch.randn_like(new_w1[i]) * 0.2 # 較大的突變強度
-                new_w2[i] += torch.randn_like(new_w2[i]) * 0.2
-            
+                new_w1[i] += torch.randn_like(new_w1[i]) * 0.1
+                new_w2[i] += torch.randn_like(new_w2[i]) * 0.1
+                new_w3[i] += torch.randn_like(new_w3[i]) * 0.1
+
+            print(f"[System] Successfully initialized {POP_SIZE} agents from 3-layer expert.")
             self.w1 = new_w1.to(DEVICE)
             self.w2 = new_w2.to(DEVICE)
+            self.w3 = new_w3.to(DEVICE)
         else:
             print("[System] No expert seed found. Initializing with random weights.")
             self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
-            self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
+            self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, HIDDEN_SIZE).to(DEVICE)
+            self.w3 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
 
     def save_state(self):
         state = {
@@ -86,8 +93,9 @@ class EvolutionSim:
             'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
             'fitness': self.fitness, 'survival_age': self.survival_age,
             'alive': self.alive, 'energy': self.energy,
-            'w1': self.w1, 'w2': self.w2, 'food_pos': self.food_pos,
-            'pred_pos': self.pred_pos, 'elite_indices': self.elite_indices
+            'w1': self.w1, 'w2': self.w2, 'w3': self.w3,
+            'food_pos': self.food_pos, 'pred_pos': self.pred_pos,
+            'elite_indices': self.elite_indices
         }
         torch.save(state, SAVE_PATH)
         print(f"[System] State saved to {SAVE_PATH} at Generation {self.generation_count}")
@@ -100,7 +108,7 @@ class EvolutionSim:
                 self.pos, self.vel, self.angle = state['pos'], state['vel'], state['angle']
                 self.fitness, self.survival_age = state['fitness'], state['survival_age']
                 self.alive, self.energy = state['alive'], state['energy']
-                self.w1, self.w2 = state['w1'], state['w2']
+                self.w1, self.w2, self.w3 = state['w1'], state['w2'], state['w3']
                 self.food_pos, self.pred_pos = state['food_pos'], state['pred_pos']
                 self.elite_indices = state['elite_indices']
                 print(f"[System] Successfully loaded save: Generation {self.generation_count}")
@@ -156,6 +164,7 @@ class EvolutionSim:
             self.alive[starved] = False
             self.fitness[starved] -= 100 # 餓死的懲罰比撞死重，強制它必須去探索
             self.energy[starved] = 0
+            self.survival_age[starved] = 0
             
         # 掠食者移動邏輯
         self.pred_pos += self.pred_vel
@@ -166,8 +175,9 @@ class EvolutionSim:
 
         # NN 運算
         sensors = self.get_sensor_data() 
-        h = torch.tanh(torch.bmm(sensors.unsqueeze(1), self.w1))
-        out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
+        h1 = torch.tanh(torch.bmm(sensors.unsqueeze(1), self.w1))
+        h2 = torch.tanh(torch.bmm(h1, self.w2))
+        out = torch.tanh(torch.bmm(h2, self.w3)).squeeze(1)
         
         # 物理更新
         self.angle[active_mask] += out[active_mask, 1] * 0.15
@@ -210,7 +220,8 @@ class EvolutionSim:
         if killed_sub_mask.any():
             killed_real_indices = active_indices[killed_sub_mask]
             self.alive[killed_real_indices] = False
-            self.fitness[killed_real_indices] -= 50
+            self.fitness[killed_real_indices] -= 100
+            self.survival_age[killed_real_indices] = 0
 
     def evolve(self):
         # 1. 取得排序索引 (從高分到低分)
@@ -242,6 +253,7 @@ class EvolutionSim:
         # 3. 準備新權重與平均分配
         new_w1 = self.w1.clone()
         new_w2 = self.w2.clone()
+        new_w3 = self.w3.clone()
         non_elite_indices = [i for i in range(POP_SIZE) if i not in self.elite_indices]
 
         # 這裡的 num_found_elites 絕對會大於 0 (因為即使沒人得分也會取前 20%)
@@ -256,10 +268,11 @@ class EvolutionSim:
                 # 繼承並突變
                 new_w1[i] = self.w1[parent_idx] + torch.randn_like(self.w1[i]) * 0.15
                 new_w2[i] = self.w2[parent_idx] + torch.randn_like(self.w2[i]) * 0.15
+                new_w3[i] = self.w3[parent_idx] + torch.randn_like(self.w3[i]) * 0.15
                 self.reset_agent(i)
 
         # 更新權重並重置環境
-        self.w1, self.w2 = new_w1, new_w2
+        self.w1, self.w2, self.w3 = new_w1, new_w2, new_w3
         self.alive[:] = True
         self.fitness *= 0 
         self.energy[:] = MAX_ENERGY
@@ -278,8 +291,9 @@ class EvolutionSim:
         running = True
         while running:
             # 定時進化觸發
+            active_mask = self.alive == True
             self.evolution_ticks -= 1
-            if self.evolution_ticks <= 0:
+            if self.evolution_ticks <= 0 or not active_mask.any():
                 self.evolve()
                 self.evolution_ticks = EVOLUTION_TICKS
 
@@ -296,20 +310,39 @@ class EvolutionSim:
                 pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 5)
 
             # 繪製生物
+            LEVEL_COLORS = [
+                (255, 255, 255), # 0: 初級 - 白色
+                (100, 149, 237), # 1: 二級 - 藍色 (CornflowerBlue)
+                (200, 100, 255), # 2: 三級 - 紫色
+                (255, 165, 0),   # 3: 四級 - 橙色
+                (255, 215, 0)    # 4+: 五級 - 金色
+            ]
             pos_np = self.pos.cpu().numpy()
             age_np = self.survival_age.cpu().numpy()
             alive_np = self.alive.cpu().numpy()
+            energy_np = self.energy.cpu().numpy()
             for i, p in enumerate(pos_np):
-                if not alive_np[i]:
-                    # 死亡：畫成灰色，且不顯示年齡
-                    pygame.draw.circle(self.screen, (80, 80, 80), p.astype(int), 3)
+                if not alive_np[i]:# --- 死亡原因視覺化 ---
+                    if energy_np[i] <= 0:
+                        # 能量耗盡死亡：深灰色 (餓死)
+                        dead_color = (60, 60, 60) 
+                    else:
+                        # 能量尚存但死亡：深紅色 (被掠食者撞死)
+                        dead_color = (120, 0, 0)
+                    pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
                     continue
 
-                color = (200, 100, 255) if age_np[i] >= 3 else (255, 215, 0) if i in self.elite_indices else (255, 215, 0)
-                radius = 7 if i in self.elite_indices else 4
-                pygame.draw.circle(self.screen, color, p.astype(int), radius)
+                level = min(age_np[i], len(LEVEL_COLORS) - 1)
+                color = LEVEL_COLORS[level]
+                # 精英個體 (畫大一點並加上外環)
                 if i in self.elite_indices:
-                    pygame.draw.circle(self.screen, color, p.astype(int), radius+5, 1)
+                    radius = 7
+                    pygame.draw.circle(self.screen, color, p.astype(int), radius)
+                    pygame.draw.circle(self.screen, color, p.astype(int), radius+5, 1) # 外環                    
+                else:
+                    # 普通個體 (非精英但可能已存活多代)
+                    radius = 4
+                    pygame.draw.circle(self.screen, color, p.astype(int), radius)
 
             # UI
             self.screen.blit(self.big_font.render(f"GEN: {self.generation_count}", True, (255,255,255)), (20, 20))
