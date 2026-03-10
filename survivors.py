@@ -54,7 +54,7 @@ class EvolutionSim:
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
 
         # --- 專家基因注入邏輯 ---
-        expert_path = "expert_seed.pt"
+        expert_path = "pretrain.pt"
         if os.path.exists(expert_path):
             print(f"[System] Injecting Expert Seed from {expert_path}...")
             expert_data = torch.load(expert_path, map_location=DEVICE)
