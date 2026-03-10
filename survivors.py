@@ -48,7 +48,8 @@ class EvolutionSim:
         self.fitness = torch.zeros(POP_SIZE).to(DEVICE)
         self.survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        
+        self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
+
         # 初始化神經網路權重 (CUDA)
         self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
         self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
@@ -59,6 +60,7 @@ class EvolutionSim:
             'generation_count': self.generation_count,
             'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
             'fitness': self.fitness, 'survival_age': self.survival_age,
+            'alive': self.alive,
             'w1': self.w1, 'w2': self.w2, 'food_pos': self.food_pos,
             'pred_pos': self.pred_pos, 'elite_indices': self.elite_indices
         }
@@ -72,6 +74,7 @@ class EvolutionSim:
                 self.generation_count = state['generation_count']
                 self.pos, self.vel, self.angle = state['pos'], state['vel'], state['angle']
                 self.fitness, self.survival_age = state['fitness'], state['survival_age']
+                self.alive = state['alive']
                 self.w1, self.w2 = state['w1'], state['w2']
                 self.food_pos, self.pred_pos = state['food_pos'], state['pred_pos']
                 self.elite_indices = state['elite_indices']
@@ -108,48 +111,61 @@ class EvolutionSim:
         return sensors
 
     def update_physics(self):
-        # 掠食者移動 (隨機漫遊)
+        active_mask = self.alive == True
+        if not active_mask.any():
+            return 
+
+        # 掠食者移動邏輯
         self.pred_pos += self.pred_vel
-        # 掠食者邊界反彈
         mask_x = (self.pred_pos[:, 0] < 0) | (self.pred_pos[:, 0] > SCREEN_W)
         mask_y = (self.pred_pos[:, 1] < 0) | (self.pred_pos[:, 1] > SCREEN_H)
         self.pred_vel[mask_x, 0] *= -1
         self.pred_vel[mask_y, 1] *= -1
 
-        # 生物決策
-        sensors = self.get_sensor_data()
+        # 取得感測器資料 (保持 100 筆以利批次 NN 運算)
+        sensors = self.get_sensor_data() 
         
-        # 神經網路前向傳播 (批次運算) x = tanh(Input * W1) -> tanh(x * W2)
-        # 1. 矩陣相乘：Input * W1
-        # sensors.unsqueeze(1) 將 (100, 5) 變成 (100, 1, 5) 以進行批次矩陣乘法
+        # NN 前向傳播
         h = torch.tanh(torch.bmm(sensors.unsqueeze(1), self.w1))
-        # 2. 矩陣相乘：Hidden * W2
         out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
         
-        # 輸出控制：[前進力量, 轉向速度]
-        speed = (out[:, 0] + 1) * 0.1 # 確保主要向前運動
-        self.angle += out[:, 1] * 0.15
-        new_vel = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1) * speed.unsqueeze(1)
-        self.vel = self.vel * 0.95 + new_vel # 慣性與阻尼
-        self.pos += self.vel
+        # --- 僅更新活著的生物 ---
+        # 轉向更新
+        self.angle[active_mask] += out[active_mask, 1] * 0.15
         
-        # 邊界反彈 (簡單物理)
+        # 速度更新
+        # 注意：speed 映射回 [0, 0.2] 的推力 (原 0.1 有點慢，建議可調)
+        current_speed_vol = (out[active_mask, 0] + 1) * 0.1 
+        move_dir = torch.stack([torch.cos(self.angle[active_mask]), torch.sin(self.angle[active_mask])], dim=1)
+        new_push = move_dir * current_speed_vol.unsqueeze(1)
+        
+        # 應用阻尼與推力
+        self.vel[active_mask] = self.vel[active_mask] * 0.95 + new_push
+        self.pos[active_mask] += self.vel[active_mask]
+        
+        # 邊界
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
 
-        # 吃到食物檢測
-        dist_f = torch.cdist(self.pos, self.food_pos)
-        eaten = dist_f < 10.0
-        for i in range(POP_SIZE):
-            food_hit = torch.where(eaten[i])[0]
-            if len(food_hit) > 0:
-                self.fitness[i] += len(food_hit) * 10
-                self.food_pos[food_hit] = torch.rand(len(food_hit), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        # 1. 吃到食物檢測
+        dist_f = torch.cdist(self.pos[active_mask], self.food_pos)
+        eaten_mask = dist_f < 10.0
+        
+        # 取得活著生物的索引
+        active_indices = torch.where(active_mask)[0]
+        for i_idx, real_idx in enumerate(active_indices):
+            hits = torch.where(eaten_mask[i_idx])[0]
+            if len(hits) > 0:
+                self.fitness[real_idx] += len(hits) * 10
+                self.food_pos[hits] = torch.rand(len(hits), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
 
-        # 2. 被掠食者碰觸懲罰 (-10 每幀)
-        dist_p = torch.cdist(self.pos, self.pred_pos)
-        attacked = dist_p < 25.0 # 掠食者攻擊範圍較大
-        self.fitness[attacked.any(dim=1)] -= 50
+        # 2. 掠食者碰撞檢測
+        dist_p = torch.cdist(self.pos[active_mask], self.pred_pos)
+        killed_sub_mask = (dist_p < 25.0).any(dim=1)
+        if killed_sub_mask.any():
+            killed_real_indices = active_indices[killed_sub_mask]
+            self.alive[killed_real_indices] = False
+            self.fitness[killed_real_indices] -= 50
 
     def evolve(self):
         # 1. 取得排序索引 (從高分到低分)
@@ -199,6 +215,7 @@ class EvolutionSim:
 
         # 更新權重並重置環境
         self.w1, self.w2 = new_w1, new_w2
+        self.alive[:] = True
         self.fitness *= 0 # 重置適應度，重新評估新一代
         self.generation_count += 1
         self.last_evolution_time = time.time()
@@ -236,6 +253,11 @@ class EvolutionSim:
             pos_np = self.pos.cpu().numpy()
             age_np = self.survival_age.cpu().numpy()
             for i, p in enumerate(pos_np):
+                # 死亡：畫成灰色，且不顯示年齡
+                if not self.alive[i]:
+                    pygame.draw.circle(self.screen, (80, 80, 80), p.astype(int), 3)
+                    continue
+
                 if i in self.elite_indices:
                     age = age_np[i]
                     # 超過 3 代的長青精英變換顏色 (紫色)
@@ -258,7 +280,7 @@ class EvolutionSim:
             fps_text = self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0))
             self.screen.blit(fps_text, (20, 90))
             save_info = self.font.render("Auto-saves on exit or evolution", True, (100, 100, 150))
-            self.screen.blit(save_info, (20, 1150))
+            self.screen.blit(save_info, (20, 120))
                 
             pygame.display.flip()
             self.clock.tick(FPS)
