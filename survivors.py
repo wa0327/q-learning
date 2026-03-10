@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import random
 import time
+import os
 
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -10,10 +11,9 @@ POP_SIZE = 100          # 生物數量
 FOOD_SIZE = 100         # 食物數量
 SCREEN_W, SCREEN_H = 1600, 1200
 FPS = 60
-EVOLUTION_INTERVAL = 30  # 固定每n秒進化一次
+EVOLUTION_INTERVAL = 30 # 固定每n秒進化一次
+SAVE_PATH = "survivors.pt" # 存檔路徑
 
-# 神經網路結構：輸入(5) -> 隱藏(8) -> 輸出(2)
-# 輸入：[前方距離, 左方距離, 右方距離, 食物相對角度, 剩餘能量]
 INPUT_SIZE = 5
 HIDDEN_SIZE = 10
 OUTPUT_SIZE = 2
@@ -27,7 +27,20 @@ class EvolutionSim:
         self.font = pygame.font.SysFont("Arial", 18)
         self.big_font = pygame.font.SysFont("Arial", 28, bold=True)
         
-        # 初始化生物
+        # 基本屬性初始化
+        self.generation_count = 1
+        self.elite_indices = []
+
+        # 進化計時器
+        self.last_evolution_time = time.time()
+
+        # 嘗試載入舊數據
+        if not self.load_state():
+            print("No save found. Initializing new simulation...")
+            self.init_new_simulation()
+
+    def init_new_simulation(self):
+        """全新的初始化"""
         self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
         self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
@@ -44,9 +57,45 @@ class EvolutionSim:
         # 初始化神經網路權重 (CUDA)
         self.w1 = torch.randn(POP_SIZE, INPUT_SIZE, HIDDEN_SIZE).to(DEVICE)
         self.w2 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
-        
-        # 進化計時器
-        self.last_evolution_time = time.time()
+
+    def save_state(self):
+        """儲存當前所有關鍵狀態到檔案"""
+        state = {
+            'generation_count': self.generation_count,
+            'pos': self.pos,
+            'vel': self.vel,
+            'angle': self.angle,
+            'fitness': self.fitness,
+            'survival_age': self.survival_age,
+            'w1': self.w1,
+            'w2': self.w2,
+            'food_pos': self.food_pos,
+            'elite_indices': self.elite_indices
+        }
+        torch.save(state, SAVE_PATH)
+        print(f"\n[System] State saved to {SAVE_PATH} at Generation {self.generation_count}")
+
+    def load_state(self):
+        """從檔案載入狀態"""
+        if os.path.exists(SAVE_PATH):
+            try:
+                state = torch.load(SAVE_PATH, map_location=DEVICE)
+                self.generation_count = state['generation_count']
+                self.pos = state['pos']
+                self.vel = state['vel']
+                self.angle = state['angle']
+                self.fitness = state['fitness']
+                self.survival_age = state['survival_age']
+                self.w1 = state['w1']
+                self.w2 = state['w2']
+                self.food_pos = state['food_pos']
+                self.elite_indices = state['elite_indices']
+                print(f"[System] Successfully loaded save: Generation {self.generation_count}")
+                return True
+            except Exception as e:
+                print(f"[Error] Failed to load save: {e}")
+                return False
+        return False
 
     def get_sensor_data(self):
         dist_to_food = torch.cdist(self.pos, self.food_pos)
@@ -68,9 +117,11 @@ class EvolutionSim:
     def update_physics(self):
         sensors = self.get_sensor_data()
         
-        # 神經網路前向傳播 (批次運算)
-        # x = tanh(Input * W1) -> tanh(x * W2)
+        # 神經網路前向傳播 (批次運算) x = tanh(Input * W1) -> tanh(x * W2)
+        # 1. 矩陣相乘：Input * W1
+        # sensors.unsqueeze(1) 將 (100, 5) 變成 (100, 1, 5) 以進行批次矩陣乘法
         h = torch.tanh(torch.bmm(sensors.unsqueeze(1), self.w1))
+        # 2. 矩陣相乘：Hidden * W2
         out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
         
         # 輸出控制：[前進力量, 轉向速度]
@@ -125,7 +176,8 @@ class EvolutionSim:
         self.fitness *= 0 # 重置適應度，重新評估新一代
         self.generation_count += 1
         self.last_evolution_time = time.time()
-        print(f"Generation Evolved! Top Fitness: {torch.max(self.fitness).item()}")
+        # 進化完成後也自動存檔一次，防止意外中斷
+        self.save_state()
 
     def run(self):
         running = True
@@ -134,7 +186,11 @@ class EvolutionSim:
             time_left = EVOLUTION_INTERVAL - (current_time - self.last_evolution_time)
             
             for event in pygame.event.get():
-                if event.type == pygame.QUIT: running = False
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
 
             # 定時進化觸發
             if time_left <= 0:
@@ -159,13 +215,12 @@ class EvolutionSim:
                     age = age_np[i]
                     # 超過 3 代的長青精英變換顏色 (紫色)
                     color = (200, 100, 255) if age >= 3 else (255, 215, 0)
-                    
                     pygame.draw.circle(self.screen, color, p.astype(int), 7)
                     pygame.draw.circle(self.screen, color, p.astype(int), 12, 1) # 外環
-                    
+
                     # 顯示年齡標註
                     age_surf = self.font.render(f"{age}", True, color)
-                    self.screen.blit(age_surf, (p[0] - 15, p[1] - 25))
+                    self.screen.blit(age_surf, (p[0] - 5, p[1] - 25))
                 else:
                     # 普通：綠色
                     pygame.draw.circle(self.screen, (46, 204, 113), p.astype(int), 4)
@@ -173,15 +228,17 @@ class EvolutionSim:
             # UI 資訊
             gen_text = self.big_font.render(f"GENERATION: {self.generation_count}", True, (255, 255, 255))
             timer_text = self.font.render(f"Next Evolution in: {int(time_left)}s", True, (200, 200, 200))
-            elite_info = self.font.render(f"Top 20% Elites survive and reproduce", True, (255, 215, 0))
+            save_info = self.font.render("Auto-saves on exit or evolution", True, (100, 100, 150))
             
             self.screen.blit(gen_text, (20, 20))
             self.screen.blit(timer_text, (20, 60))
-            self.screen.blit(elite_info, (20, 90))
+            self.screen.blit(save_info, (20, 1150))
                 
             pygame.display.flip()
             self.clock.tick(FPS)
 
+        # 迴圈結束，執行存檔
+        self.save_state()
         pygame.quit()
 
 if __name__ == "__main__":
