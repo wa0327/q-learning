@@ -127,7 +127,7 @@ class EvolutionSim:
         out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
         
         # 輸出控制：[前進力量, 轉向速度]
-        speed = (out[:, 0] + 1) * 0.5 # 確保主要向前運動
+        speed = (out[:, 0] + 1) * 0.1 # 確保主要向前運動
         self.angle += out[:, 1] * 0.15
         new_vel = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1) * speed.unsqueeze(1)
         self.vel = self.vel * 0.95 + new_vel # 慣性與阻尼
@@ -166,17 +166,33 @@ class EvolutionSim:
         # 進行進化更新
         new_w1 = self.w1.clone()
         new_w2 = self.w2.clone()
-        for i in range(POP_SIZE):
-            if i not in self.elite_indices:
-                # 隨機挑選一個精英作為父母
-                parent_idx = current_elites[random.randint(0, num_elites - 1)]
-                # 繼承並加入突變
+        
+        # 找出需要被汰換的索引 (排除精英後的 80 個索引)
+        non_elite_indices = [i for i in range(POP_SIZE) if i not in self.elite_indices]
+        
+        # 平均分配：每個精英產生固定數量的後代
+        # 每位精英分配到的後代數量 (例如 80 / 20 = 4)
+        offspring_per_elite = len(non_elite_indices) // num_elites
+        
+        for idx, parent_idx in enumerate(self.elite_indices):
+            # 算出這位精英要負責填補哪幾個非精英的位置
+            start_pos = idx * offspring_per_elite
+            end_pos = start_pos + offspring_per_elite
+            
+            # 獲取這一組要更新的子代索引
+            target_indices = non_elite_indices[start_pos:end_pos]
+            
+            for i in target_indices:
+                # 繼承該精英的基因並加入隨機突變
                 new_w1[i] = self.w1[parent_idx] + torch.randn_like(self.w1[i]) * 0.15
                 new_w2[i] = self.w2[parent_idx] + torch.randn_like(self.w2[i]) * 0.15
-                # 失敗者位置重置
+                
+                # 重置這些子代的位置與狀態
                 self.pos[i] = torch.rand(2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+                self.vel[i] *= 0
                 self.angle[i] = random.random() * 2 * np.pi
         
+        # 更新權重並重置環境
         self.w1, self.w2 = new_w1, new_w2
         self.fitness *= 0 # 重置適應度，重新評估新一代
         self.generation_count += 1
