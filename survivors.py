@@ -10,7 +10,7 @@ POP_SIZE = 100          # 生物數量
 FOOD_SIZE = 100         # 食物數量
 SCREEN_W, SCREEN_H = 1600, 1200
 FPS = 60
-EVOLUTION_INTERVAL = 60  # 固定每 60 秒進化一次
+EVOLUTION_INTERVAL = 30  # 固定每n秒進化一次
 
 # 神經網路結構：輸入(5) -> 隱藏(8) -> 輸出(2)
 # 輸入：[前方距離, 左方距離, 右方距離, 食物相對角度, 剩餘能量]
@@ -24,7 +24,8 @@ class EvolutionSim:
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
         pygame.display.set_caption(f"NN Evolution - CUDA: {DEVICE.type.upper()}")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Arial", 20)
+        self.font = pygame.font.SysFont("Arial", 18)
+        self.big_font = pygame.font.SysFont("Arial", 28, bold=True)
         
         # 初始化生物
         self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
@@ -33,6 +34,8 @@ class EvolutionSim:
         self.fitness = torch.zeros(POP_SIZE).to(DEVICE)
         
         # 追蹤誰是精英 (用於渲染)
+        self.generation_count = 1
+        self.survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE) # 記錄連續存活代數
         self.elite_indices = []
         
         # 初始化食物
@@ -71,7 +74,7 @@ class EvolutionSim:
         out = torch.tanh(torch.bmm(h, self.w2)).squeeze(1)
         
         # 輸出控制：[前進力量, 轉向速度]
-        speed = (out[:, 0] + 1) * 2.0 # 確保主要向前運動
+        speed = (out[:, 0] + 1) * 0.5 # 確保主要向前運動
         self.angle += out[:, 1] * 0.15
         
         new_vel = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1) * speed.unsqueeze(1)
@@ -84,7 +87,7 @@ class EvolutionSim:
 
         # 吃到食物檢測
         dist_to_food = torch.cdist(self.pos, self.food_pos)
-        eaten = dist_to_food < 12.0
+        eaten = dist_to_food < 10.0
         for i in range(POP_SIZE):
             food_hit = torch.where(eaten[i])[0]
             if len(food_hit) > 0:
@@ -95,8 +98,13 @@ class EvolutionSim:
         # 找出前 20% 精英
         num_elites = int(POP_SIZE * 0.2)
         sorted_indices = torch.argsort(self.fitness, descending=True)
-        self.elite_indices = sorted_indices[:num_elites].cpu().numpy().tolist()
-        elite_idx_tensor = sorted_indices[:num_elites]
+        current_elites = sorted_indices[:num_elites]
+        self.elite_indices = current_elites.cpu().numpy().tolist()
+        
+        # 更新存活代數：精英 +1，其餘重置為 0
+        new_survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
+        new_survival_age[current_elites] = self.survival_age[current_elites] + 1
+        self.survival_age = new_survival_age
         
         # 進行進化更新
         new_w1 = self.w1.clone()
@@ -105,15 +113,17 @@ class EvolutionSim:
         for i in range(POP_SIZE):
             if i not in self.elite_indices:
                 # 隨機挑選一個精英作為父母
-                parent_idx = elite_idx_tensor[random.randint(0, num_elites - 1)]
+                parent_idx = current_elites[random.randint(0, num_elites - 1)]
                 # 繼承並加入突變
                 new_w1[i] = self.w1[parent_idx] + torch.randn_like(self.w1[i]) * 0.15
                 new_w2[i] = self.w2[parent_idx] + torch.randn_like(self.w2[i]) * 0.15
                 # 失敗者位置重置
                 self.pos[i] = torch.rand(2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+                self.angle[i] = random.random() * 2 * np.pi
         
         self.w1, self.w2 = new_w1, new_w2
         self.fitness *= 0 # 重置適應度，重新評估新一代
+        self.generation_count += 1
         self.last_evolution_time = time.time()
         print(f"Generation Evolved! Top Fitness: {torch.max(self.fitness).item()}")
 
@@ -140,22 +150,34 @@ class EvolutionSim:
             for f in self.food_pos.cpu().numpy():
                 pygame.draw.circle(self.screen, (255, 60, 60), f.astype(int), 3)
             
-            # 畫生物
+            # 畫生物與年齡標註
             pos_np = self.pos.cpu().numpy()
+            age_np = self.survival_age.cpu().numpy()
+            
             for i, p in enumerate(pos_np):
                 if i in self.elite_indices:
-                    # 精英：金色 + 較大 + 光環
-                    pygame.draw.circle(self.screen, (255, 215, 0), p.astype(int), 6)
-                    pygame.draw.circle(self.screen, (255, 215, 0), p.astype(int), 10, 1) # 光環
+                    age = age_np[i]
+                    # 超過 3 代的長青精英變換顏色 (紫色)
+                    color = (200, 100, 255) if age >= 3 else (255, 215, 0)
+                    
+                    pygame.draw.circle(self.screen, color, p.astype(int), 7)
+                    pygame.draw.circle(self.screen, color, p.astype(int), 12, 1) # 外環
+                    
+                    # 顯示年齡標註
+                    age_surf = self.font.render(f"{age}", True, color)
+                    self.screen.blit(age_surf, (p[0] - 15, p[1] - 25))
                 else:
                     # 普通：綠色
-                    pygame.draw.circle(self.screen, (46, 204, 113), p.astype(int), 3)
+                    pygame.draw.circle(self.screen, (46, 204, 113), p.astype(int), 4)
 
             # UI 資訊
-            timer_text = self.font.render(f"Next Evolution in: {int(time_left)}s", True, (255, 255, 255))
-            elite_text = self.font.render(f"Elites (Yellow): {int(POP_SIZE*0.2)} units", True, (255, 215, 0))
-            self.screen.blit(timer_text, (20, 20))
-            self.screen.blit(elite_text, (20, 50))
+            gen_text = self.big_font.render(f"GENERATION: {self.generation_count}", True, (255, 255, 255))
+            timer_text = self.font.render(f"Next Evolution in: {int(time_left)}s", True, (200, 200, 200))
+            elite_info = self.font.render(f"Top 20% Elites survive and reproduce", True, (255, 215, 0))
+            
+            self.screen.blit(gen_text, (20, 20))
+            self.screen.blit(timer_text, (20, 60))
+            self.screen.blit(elite_info, (20, 90))
                 
             pygame.display.flip()
             self.clock.tick(FPS)
