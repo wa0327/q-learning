@@ -12,15 +12,18 @@ print(f"目前使用的訓練設備為: {device}")
 
 # --- 1. 定義神經網路 (AI 的大腦) ---
 # 這個網路負責「預測」：輸入目前座標，輸出往四個方向走的「期望總分」(Q值)
+hidden_size = 256
 class QNet(nn.Module):
     def __init__(self):
         super(QNet, self).__init__()
         self.network = nn.Sequential(
-            nn.Linear(2, 128),  # 輸入層：接受 x, y 兩個座標數值
+            nn.Linear(2, hidden_size),  # 輸入層：接受 x, y 兩個座標數值
             nn.ReLU(),         # 激活函數：增加非線性表達能力，模擬神經元啟動
-            nn.Linear(128, 128), # 隱藏層：負責提取空間中的特徵關聯
+            nn.Linear(hidden_size, hidden_size), # 隱藏層：負責提取空間中的特徵關聯
             nn.ReLU(),
-            nn.Linear(128, 4)   # 輸出層：對應 上、下、左、右 四個動作的預估價值
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 4)   # 輸出層：對應 上、下、左、右 四個動作的預估價值
         )
     def forward(self, x):
         return self.network(x)
@@ -62,17 +65,17 @@ def train_step(batch_size=64):
     optimizer.step()      # 正式更新權重
 
 # --- 4. 視覺化函數：呈現學習效果 ---
-def plot_learning_effect(episode, path):
+def plot_learning_effect(episode, path, size=20):
     plt.clf()
     # 建立一個網格，探測神經網路對整個空間的「價值評價」
-    x = np.linspace(0, 1, 30)
-    y = np.linspace(0, 1, 30)
-    v_map = np.zeros((30, 30))
+    x = np.linspace(0, 1, size)
+    y = np.linspace(0, 1, size)
+    v_map = np.zeros((size, size))
     
     model.eval() # 切換為評估模式
     with torch.no_grad():
-        for i in range(30):
-            for j in range(30):
+        for i in range(size):
+            for j in range(size):
                 st = torch.tensor([x[j], y[i]], dtype=torch.float32).to(device)
                 v_map[i, j] = model(st).max().item() # 取得該位置最高動作價值
     model.train() # 切換回訓練模式
@@ -120,7 +123,7 @@ for ep in range(201):
         state = next_state
         path.append(state.numpy())
         
-        train_step(batch_size=128) # 執行一次神經網路學習，這會連帶優化相關的空間權重
+        train_step(batch_size=256) # 執行一次神經網路學習，這會連帶優化相關的空間權重
         if done: break
 
     # 每 20 局更新一次圖表，觀察 AI 變聰明的過程
