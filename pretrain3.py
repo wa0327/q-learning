@@ -8,7 +8,7 @@ import torch.nn.functional as F
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BRAIN_PATH = "pretrain3.pt"
 BATCH_SIZE = 256
-EPOCHS = 10000
+EPOCHS = 100000
 
 # --- 與 survivors3.py 相同的網路架構 ---
 class Actor(nn.Module):
@@ -159,8 +159,8 @@ def run_pretrain():
         optimizer.step()
 
         # 顯示進度
-        if epoch % 500 == 0:
-            print(f"Epoch {epoch}/{EPOCHS}, Pretrain Loss: {loss.item():.4f}")
+        if (epoch+1) % 1000 == 0:
+            print(f"Progress: {(epoch+1)/EPOCHS*100:3.0f}%, Epoch {epoch+1}/{EPOCHS}, Pretrain Loss: {loss.item():.4f}")
 
     # 存檔
     torch.save({
