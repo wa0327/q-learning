@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,8 +7,8 @@ import torch.nn.functional as F
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BRAIN_PATH = "pretrain3.pt"
-BATCH_SIZE = 128
-EPOCHS = 100000
+BATCH_SIZE = 256
+EPOCHS = 10000
 
 # --- 與 survivors3.py 相同的網路架構 ---
 class Actor(nn.Module):
@@ -19,7 +20,7 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 2), # 輸出 [Steer, Throttle]
+            nn.Linear(32, 2),
             nn.Tanh()
         )
 
@@ -84,15 +85,24 @@ def expert_logic(m_in, s_in):
     return targets.clamp(-1.0, 1.0)
 
 # --- 執行預訓練 ---
-def run_pretrain(epochs=EPOCHS):
+def run_pretrain():
     actor = Actor().to(DEVICE)
-    critic = Critic().to(DEVICE) # Critic 也實例化，用來一起打包存檔
+    critic = Critic().to(DEVICE)
     
+    if os.path.exists(BRAIN_PATH):
+        try:
+            brain_state = torch.load(BRAIN_PATH, map_location=DEVICE)
+            actor.load_state_dict(brain_state['actor'])
+            critic.load_state_dict(brain_state['critic'])
+            print(f"--- [Loaded] Brain weights. ---")
+        except Exception as e:
+            print(f"--- [Error] Brain loading failed: {e} ---")
+
     optimizer = optim.Adam(actor.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     print(f"--- [Pretrain] Training expert Actor to {BRAIN_PATH} ---")
-
-    for i in range(epochs):
+    
+    for i in range(EPOCHS):
         # 隨機生成符合維度的 Dummy 資料 (Batch, Channels, Objects)
         m_in = torch.randn(BATCH_SIZE, 6, 5).to(DEVICE)
         
@@ -116,13 +126,13 @@ def run_pretrain(epochs=EPOCHS):
         optimizer.step()
         
         # 顯示進度
-        if (i + 1) % 1000 == 0:
-            print(f"Progress: {(i+1)/epochs*100:.0f}% | Loss: {loss.item():.6f}")
+        if (i + 1) % 5000 == 0:
+            print(f"Progress: {(i+1)/EPOCHS*100:3.0f}% | Loss: {loss.item():.6f}")
 
-    # 打包成 survivors3.py 期望的字典格式
+    # 存檔
     torch.save({
         'actor': actor.state_dict(),
-        'critic': critic.state_dict() # Critic 還是隨機權重，進環境後再靠 TD Error 學習
+        'critic': critic.state_dict()
     }, BRAIN_PATH)
     print("--- Pretrain Complete. Weights properly saved! ---")
 
