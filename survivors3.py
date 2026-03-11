@@ -22,10 +22,12 @@ BATCH_SIZE = 128
 EPSILON_START = 1.0
 EPSILON_END = 0.02
 EPSILON_DECAY = 0.9999
+DIST_FOOD = 5
+DIST_PRED = 5
 
 # 環境參數
 FOOD_SIZE = 32
-PREDATOR_SIZE = 8
+PREDATOR_SIZE = 5
 MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.1
 
@@ -92,8 +94,8 @@ class RLSimulation:
     def get_states(self):
         dist_food = torch.cdist(self.pos, self.food_pos)
         dist_pred = torch.cdist(self.pos, self.pred_pos)
-        _, f_idx = torch.topk(dist_food, 5, largest=False)
-        _, p_idx = torch.topk(dist_pred, 3, largest=False)
+        _, f_idx = torch.topk(dist_food, DIST_FOOD, largest=False)
+        _, p_idx = torch.topk(dist_pred, DIST_PRED, largest=False)
 
         f_diff = self.food_pos[f_idx] - self.pos.unsqueeze(1)
         f_dist = torch.norm(f_diff, dim=2)
@@ -119,7 +121,6 @@ class RLSimulation:
     def update(self):
         if not self.alive.any():
             self.gen_count += 1
-            if self.gen_count % 5 == 0: self.save_state()
             self.reset_env()
             return
 
@@ -160,7 +161,7 @@ class RLSimulation:
         hits_p = (dist_p < 22.0).any(dim=1) & self.alive
         starved = (self.energy <= 0) & self.alive        
         rewards[hits_p] -= 50  # 被殺死
-        rewards[starved] -= 35 # 餓死
+        rewards[starved] -= 40 # 餓死
         
         dead_mask = hits_p | starved
         if dead_mask.any():
