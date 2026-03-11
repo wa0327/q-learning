@@ -11,7 +11,8 @@ from collections import deque
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 POP_SIZE = 1
 SCREEN_W, SCREEN_H = 1024, 768
-SAVE_PATH = "survivors3.pt"  # 統一存檔名
+SAVE_PATH = "survivors3.pt"
+BRAIN_PATH = "survivors3_brain.pt"
 
 # RL 核心參數
 GAMMA = 0.98
@@ -23,7 +24,7 @@ EPSILON_END = 0.02
 EPSILON_DECAY = 0.9998
 
 # 環境參數
-FOOD_SIZE = 80
+FOOD_SIZE = 5
 PREDATOR_SIZE = 5
 MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.12
@@ -218,6 +219,7 @@ class RLSimulation:
             'pred_pos': self.pred_pos
         }
         torch.save(state, SAVE_PATH)
+        torch.save(self.policy_net.state_dict(), BRAIN_PATH)
         print(f"--- [Saved] Progress to {SAVE_PATH} ---")
 
     def load_state(self):
@@ -239,6 +241,17 @@ class RLSimulation:
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
                 return False
+            
+        if os.path.exists(BRAIN_PATH):
+            try:
+                brain_state = torch.load(BRAIN_PATH, map_location=DEVICE)
+                self.policy_net.load_state_dict(brain_state)
+                self.epsilon = 0.2 
+                print(f"--- [Loaded] Brain weights only. Experience transfered. ---")
+                return True
+            except Exception as e:
+                print(f"--- [Error] Brain loading failed: {e} ---")
+
         return False
 
     def draw(self):
