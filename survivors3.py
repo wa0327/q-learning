@@ -9,7 +9,7 @@ from collections import deque
 
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 12
+POP_SIZE = 1
 SCREEN_W, SCREEN_H = 1024, 768
 SAVE_PATH = "survivors3.pt"  # 統一存檔名
 
@@ -211,7 +211,6 @@ class RLSimulation:
             'eps': self.epsilon,
             'steps': self.steps_done,
             'gen': self.gen_count,
-            # 加入環境狀態，讓讀檔後完全恢復
             'pos': self.pos,
             'energy': self.energy,
             'alive': self.alive,
@@ -230,15 +229,11 @@ class RLSimulation:
                 self.epsilon = state['eps']
                 self.steps_done = state['steps']
                 self.gen_count = state.get('gen', 1)
-                
-                # 載入環境變數 (如果有的話)
-                if 'pos' in state:
-                    self.pos = state['pos']
-                    self.energy = state['energy']
-                    self.alive = state['alive']
-                    self.food_pos = state['food_pos']
-                    self.pred_pos = state['pred_pos']
-                
+                self.pos = state['pos']
+                self.energy = state['energy']
+                self.alive = state['alive']
+                self.food_pos = state['food_pos']
+                self.pred_pos = state['pred_pos']
                 print(f"--- [Loaded] Gen {self.gen_count}, Steps {self.steps_done} ---")
                 return True
             except Exception as e:
