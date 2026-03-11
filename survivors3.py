@@ -9,7 +9,7 @@ from collections import deque
 
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 1
+POP_SIZE = 16
 SCREEN_W, SCREEN_H = 1024, 768
 SAVE_PATH = "survivors3.pt"
 BRAIN_PATH = "survivors3_brain.pt"
@@ -21,13 +21,13 @@ MEMORY_SIZE = 50000
 BATCH_SIZE = 128
 EPSILON_START = 1.0
 EPSILON_END = 0.02
-EPSILON_DECAY = 0.9998
+EPSILON_DECAY = 0.9999
 
 # 環境參數
-FOOD_SIZE = 5
-PREDATOR_SIZE = 5
+FOOD_SIZE = 32
+PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.12
+ENERGY_DECAY = 0.1
 
 # --- DQN 腦架構 ---
 class DQNBrain(nn.Module):
@@ -66,7 +66,6 @@ class RLSimulation:
         self.font = pygame.font.SysFont("Consolas", 16)
         self.big_font = pygame.font.SysFont("Consolas", 20, bold=True)
         
-        # 1. 初始化模型
         self.policy_net = DQNBrain().to(DEVICE)
         self.target_net = DQNBrain().to(DEVICE)
         self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=LR)
@@ -77,10 +76,7 @@ class RLSimulation:
         self.loss_val = 0.0
         self.gen_count = 1
         
-        # 2. 先進行環境初始化 (確保 alive 等屬性一定存在)
         self.reset_env()
-        
-        # 3. 嘗試讀取存檔覆蓋狀態
         self.load_state()
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
@@ -136,7 +132,6 @@ class RLSimulation:
             if not self.alive[i]: continue
             if actions[i] == 0: self.angle[i] -= 0.12
             elif actions[i] == 1: self.angle[i] += 0.12
-            
             speed = 4.0 if actions[i] == 2 else 2.5
             move_dir = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
             self.pos[i] += move_dir * speed
@@ -145,11 +140,13 @@ class RLSimulation:
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
         self.energy -= ENERGY_DECAY
 
+        # 掠食者移動
         self.pred_pos += self.pred_vel
         hit_wall = (self.pred_pos < 0) | (self.pred_pos > torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE))
         if hit_wall.any():
             self.pred_vel[hit_wall.any(dim=1)] *= -1
 
+        # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
         hits_f = (dist_f < 15.0) & self.alive.unsqueeze(1)
         if hits_f.any():
@@ -158,13 +155,15 @@ class RLSimulation:
             self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 35, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
+        # 區分死因的獎勵邏輯
         dist_p = torch.cdist(self.pos, self.pred_pos)
         hits_p = (dist_p < 22.0).any(dim=1) & self.alive
-        starved = (self.energy <= 0) & self.alive
+        starved = (self.energy <= 0) & self.alive        
+        rewards[hits_p] -= 50  # 被殺死
+        rewards[starved] -= 35 # 餓死
         
         dead_mask = hits_p | starved
         if dead_mask.any():
-            rewards[dead_mask] -= 25.0
             self.alive[dead_mask] = False
 
         next_states = self.get_states()
@@ -182,8 +181,8 @@ class RLSimulation:
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
             return
-        batch = self.memory.sample(BATCH_SIZE)
         
+        batch = self.memory.sample(BATCH_SIZE)
         f_b = torch.cat([x[0][0] for x in batch])
         p_b = torch.cat([x[0][1] for x in batch])
         s_b = torch.cat([x[0][2] for x in batch])
@@ -220,14 +219,15 @@ class RLSimulation:
         }
         torch.save(state, SAVE_PATH)
         torch.save(self.policy_net.state_dict(), BRAIN_PATH)
-        print(f"--- [Saved] Progress to {SAVE_PATH} ---")
+        print(f"--- [Saved] Progress to {SAVE_PATH} and {BRAIN_PATH} ---")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
-                self.policy_net.load_state_dict(state['net'])
-                self.optimizer.load_state_dict(state['opt'])
+                if state['pos'].shape[0] == POP_SIZE:
+                    self.policy_net.load_state_dict(state['net'])
+                    self.optimizer.load_state_dict(state['opt'])
                 self.epsilon = state['eps']
                 self.steps_done = state['steps']
                 self.gen_count = state.get('gen', 1)
@@ -246,7 +246,7 @@ class RLSimulation:
             try:
                 brain_state = torch.load(BRAIN_PATH, map_location=DEVICE)
                 self.policy_net.load_state_dict(brain_state)
-                self.epsilon = 0.2 
+                self.epsilon = 0.25
                 print(f"--- [Loaded] Brain weights only. Experience transfered. ---")
                 return True
             except Exception as e:
@@ -276,10 +276,9 @@ class RLSimulation:
             end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
             pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
 
-        current_fps = int(self.clock.get_fps())
         ui_labels = [
             (f"DQN RL - survivors3.py", (255, 255, 255), True),
-            (f"FPS: {current_fps}", (0, 255, 0), False),
+            (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
             (f"Generation: {self.gen_count}", (200, 200, 200), False),
             (f"Exploration: {self.epsilon:.4f}", (0, 255, 255), False),
             (f"Loss: {self.loss_val:.6f}", (255, 100, 100), False),
@@ -295,7 +294,11 @@ class RLSimulation:
         running = True
         while running:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT: running = False
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
             self.update()
             self.draw()
         self.save_state()
