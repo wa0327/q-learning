@@ -6,14 +6,16 @@ import numpy as np
 import os
 import random
 from collections import deque
+from pathlib import Path
 
+script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 16
+POP_SIZE = 8
 SCREEN_W, SCREEN_H = 900, 700
-SAVE_PATH = "survivors3.pt"
-BRAIN_PATH = "survivors3_brain.pt"
+SAVE_PATH = f"{script_name}.pt"
+BRAIN_PATH = f"{script_name}_brain.pt"
 
 # DDPG 核心參數
 GAMMA = 0.98
@@ -29,7 +31,7 @@ DIST_FOOD = 5
 DIST_PRED = 5
 
 # 環境參數
-FOOD_SIZE = 16
+FOOD_SIZE = POP_SIZE * 2
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
@@ -152,6 +154,7 @@ class RLSimulation:
 
     def reset_env(self):
         self.gen_start_time = pygame.time.get_ticks()
+        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
         self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
@@ -180,7 +183,8 @@ class RLSimulation:
 
         mixed_in = torch.cat([food_in, pred_in], dim=1)
         speed = torch.norm(self.vel, dim=1) / 10.0
-        self_in = torch.stack([speed, torch.zeros_like(speed), self.energy/MAX_ENERGY], dim=1)
+        last_steer = self.last_actions[:, 0]
+        self_in = torch.stack([speed, last_steer, self.energy/MAX_ENERGY], dim=1)
         
         return (mixed_in, self_in)
 
@@ -202,6 +206,9 @@ class RLSimulation:
             actions = self.actor(m, s)
             noise = torch.randn_like(actions) * self.epsilon
             actions = torch.clamp(actions + noise, -1.0, 1.0)
+            # 包含噪音的實際執行值。
+            # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
+            self.last_actions = actions.detach().clone()
             
         rewards = torch.full((POP_SIZE,), 0.05, device=DEVICE) # 給予微小存活獎勵
         
@@ -216,7 +223,6 @@ class RLSimulation:
             
             self.angle[i] += steer
             dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-            
             # 慣性與阻力：新速度 = 舊速度 * 摩擦係數 + 方向 * 油門加速度
             self.vel[i] = (self.vel[i] * 0.85) + (dir_vec * throttle)
             self.pos[i] += self.vel[i]
@@ -354,6 +360,7 @@ class RLSimulation:
             'gen': self.gen_count,
             'gen_ticks': self.gen_ticks,
             'pos': self.pos,
+            'last_actions': self.last_actions,
             'energy': self.energy,
             'alive': self.alive,
             'food_pos': self.food_pos,
@@ -378,6 +385,7 @@ class RLSimulation:
                 self.gen_count = state['gen']
                 self.gen_ticks = state['gen_ticks']
                 self.pos = state['pos']
+                self.last_actions = state['last_actions']
                 self.energy = state['energy']
                 self.alive = state['alive']
                 self.food_pos = state['food_pos']
