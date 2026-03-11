@@ -15,11 +15,11 @@ FPS = 240
 EVOLUTION_TICKS = 10000 # 固定每n幀進化一次
 SAVE_PATH = "survivors.pt" # 存檔路徑
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.15 # 每幀扣除能量 (數值越高，進食壓力越大)
+ENERGY_DECAY = 0.1 # 每幀扣除能量 (數值越高，進食壓力越大)
 
 # 輸入層增加到 11：[食物cos, sin, 食物dist, X, Y, 速度X, 速度Y, 掠食者cos, 掠食者sin, 掠食者壓迫感]
 INPUT_SIZE = 11 
-HIDDEN_SIZE = 16 
+HIDDEN_SIZE = 16
 OUTPUT_SIZE = 2
 
 class EvolutionSim:
@@ -58,19 +58,18 @@ class EvolutionSim:
         if os.path.exists(expert_path):
             print(f"[System] Injecting Expert Seed from {expert_path}...")
             expert_data = torch.load(expert_path, map_location=DEVICE)
-            print(expert_data.keys())
             base_w1 = expert_data['w1'] # (INPUT, HIDDEN)
             base_w2 = expert_data['w2'] # (HIDDEN, HIDDEN)
             base_w3 = expert_data['w3'] # (HIDDEN, OUTPUT)
 
-            # 擴散到 100 個個體
-            # 其中 20% 保持專家原樣 (純種)，80% 加上突變 (探索者)
+            # 擴散到全部個體
+            # 其中 10% 保持專家原樣 (純種)，90% 加上突變 (探索者)
             new_w1 = base_w1.unsqueeze(0).repeat(POP_SIZE, 1, 1)
             new_w2 = base_w2.unsqueeze(0).repeat(POP_SIZE, 1, 1)
             new_w3 = base_w3.unsqueeze(0).repeat(POP_SIZE, 1, 1)
 
-            # 對後 80% 進行變異
-            mutation_mask = int(POP_SIZE * 0.2)
+            # 對後 90% 進行變異
+            mutation_mask = int(POP_SIZE * 0.1)
             noise_indices = range(mutation_mask, POP_SIZE)
             for i in noise_indices:
                 new_w1[i] += torch.randn_like(new_w1[i]) * 0.1
@@ -88,7 +87,7 @@ class EvolutionSim:
             self.w3 = torch.randn(POP_SIZE, HIDDEN_SIZE, OUTPUT_SIZE).to(DEVICE)
 
     def save_state(self):
-        state = {
+        torch.save({
             'generation_count': self.generation_count,
             'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
             'fitness': self.fitness, 'survival_age': self.survival_age,
@@ -96,10 +95,24 @@ class EvolutionSim:
             'w1': self.w1, 'w2': self.w2, 'w3': self.w3,
             'food_pos': self.food_pos, 'pred_pos': self.pred_pos,
             'elite_indices': self.elite_indices
-        }
-        torch.save(state, SAVE_PATH)
-        print(f"[System] State saved to {SAVE_PATH} at Generation {self.generation_count}")
+        }, SAVE_PATH)
+        print(f"[System] State saved to {SAVE_PATH} at GEN {self.generation_count}")
 
+        # 1. 找出當前族群中表現最好的索引
+        best_idx = torch.argmax(self.fitness + (self.survival_age.float() * 50.0))
+        # 2. 提取該最強個體的權重
+        # 由於 self.w1 的維度是 [POP_SIZE, IN, OUT]，我們取 [best_idx]
+        best_w1 = self.w1[best_idx].cpu()
+        best_w2 = self.w2[best_idx].cpu()
+        best_w3 = self.w3[best_idx].cpu()
+        expert_save_path = "expert_seed.pt"
+        torch.save({
+            'w1': best_w1,
+            'w2': best_w2,
+            'w3': best_w3
+        }, expert_save_path)
+        print(f"[System] Expert seed saved to expert_seed.pt at GEN {self.generation_count}")
+        
     def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
@@ -111,7 +124,7 @@ class EvolutionSim:
                 self.w1, self.w2, self.w3 = state['w1'], state['w2'], state['w3']
                 self.food_pos, self.pred_pos = state['food_pos'], state['pred_pos']
                 self.elite_indices = state['elite_indices']
-                print(f"[System] Successfully loaded save: Generation {self.generation_count}")
+                print(f"[System] Successfully loaded save: GEN {self.generation_count}")
                 return True
             except Exception as e:
                 print(f"[Error] Failed to load save: {e}")
@@ -151,18 +164,18 @@ class EvolutionSim:
         return sensors
 
     def update_physics(self):
-        active_mask = self.alive == True
-        if not active_mask.any():
+        alive_mask = self.alive == True
+        if not alive_mask.any():
             return 
 
         # 1. 能量消耗
-        self.energy[active_mask] -= ENERGY_DECAY
+        self.energy[alive_mask] -= ENERGY_DECAY
         
         # 2. 餓死檢測
-        starved = (self.energy <= 0) & active_mask
+        starved = (self.energy <= 0) & alive_mask
         if starved.any():
             self.alive[starved] = False
-            self.fitness[starved] -= 100 # 餓死的懲罰比撞死重，強制它必須去探索
+            self.fitness[starved] -= 200 # 餓死的懲罰比撞死重，強制它必須去探索
             self.energy[starved] = 0
             self.survival_age[starved] = 0
             
@@ -180,26 +193,26 @@ class EvolutionSim:
         out = torch.tanh(torch.bmm(h2, self.w3)).squeeze(1)
         
         # 物理更新
-        self.angle[active_mask] += out[active_mask, 1] * 0.15
-        current_speed_vol = (out[active_mask, 0] + 1) * 0.1 
-        move_dir = torch.stack([torch.cos(self.angle[active_mask]), torch.sin(self.angle[active_mask])], dim=1)
+        self.angle[alive_mask] += out[alive_mask, 1] * 0.15
+        current_speed_vol = (out[alive_mask, 0] + 1) * 0.1 
+        move_dir = torch.stack([torch.cos(self.angle[alive_mask]), torch.sin(self.angle[alive_mask])], dim=1)
         
         # 應用阻尼與推力
-        self.vel[active_mask] = self.vel[active_mask] * 0.95 + move_dir * current_speed_vol.unsqueeze(1)
-        self.pos[active_mask] += self.vel[active_mask]
+        self.vel[alive_mask] = self.vel[alive_mask] * 0.95 + move_dir * current_speed_vol.unsqueeze(1)
+        self.pos[alive_mask] += self.vel[alive_mask]
         
         # 邊界
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
 
         # 生存獎勵：只要活著，每一幀給予微量加分
-        self.fitness[active_mask] += 0.01
+        self.fitness[alive_mask] += 0.01
 
         # 檢測碰撞
-        active_indices = torch.where(active_mask)[0]
+        active_indices = torch.where(alive_mask)[0]
         
         # 食物
-        dist_f = torch.cdist(self.pos[active_mask], self.food_pos)
+        dist_f = torch.cdist(self.pos[alive_mask], self.food_pos)
         eaten_mask = dist_f < 10.0
         for i_idx, real_idx in enumerate(active_indices):
             hits = torch.where(eaten_mask[i_idx])[0]
@@ -209,7 +222,7 @@ class EvolutionSim:
                 self.food_pos[hits] = torch.rand(len(hits), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
 
         # 掠食者與壓迫扣分
-        dist_p = torch.cdist(self.pos[active_mask], self.pred_pos)
+        dist_p = torch.cdist(self.pos[alive_mask], self.pred_pos)
         
         # 壓迫感扣分：距離小於 80 開始每一幀扣分，鼓勵遠離
         close_to_pred = (dist_p < 80.0).any(dim=1)
@@ -228,26 +241,26 @@ class EvolutionSim:
         sorted_indices = torch.argsort(self.fitness, descending=True)
         
         # 2. 定義兩個候選池
-        num_target = int(POP_SIZE * 0.2)
+        num_target = int(POP_SIZE * 0.1)
         positive_mask = self.fitness[sorted_indices] > 0
         elites_with_score = sorted_indices[positive_mask]
         
-        # 判斷邏輯：如果有得分者，則僅取得分者（上限 20%）；若無得分者，則取前 20%
+        # 判斷邏輯：如果有得分者，則僅取得分者（上限 10%）；若無得分者，則取前 10%
         if len(elites_with_score) > 0:
-            # 僅取分數大於 0 的個體，且最多只取前 20% 的名額
+            # 僅取分數大於 0 的個體，且最多只取前 10% 的名額
             current_elites = elites_with_score[:num_target]
             print(f"[System] Prosperous Era: {len(current_elites)} elites with fitness > 0.")
         else:
-            # 全員皆沒得分，強制取前 20% 作為種子
+            # 全員皆沒得分，強制取前 10% 作為種子
             current_elites = sorted_indices[:num_target]
-            print(f"[System] Dark Age: No positive fitness. Using top 20% relative performers.")
+            print(f"[System] Dark Age: No positive fitness. Using top 10% relative performers.")
 
         self.elite_indices = current_elites.cpu().numpy().tolist()
         num_found_elites = len(self.elite_indices)
 
         # 更新存活代數
         new_survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
-        new_survival_age[current_elites] = self.survival_age[current_elites] + 1
+        new_survival_age[self.alive] = self.survival_age[self.alive] + 1
         self.survival_age = new_survival_age
         
         # 3. 準備新權重與平均分配
@@ -256,7 +269,7 @@ class EvolutionSim:
         new_w3 = self.w3.clone()
         non_elite_indices = [i for i in range(POP_SIZE) if i not in self.elite_indices]
 
-        # 這裡的 num_found_elites 絕對會大於 0 (因為即使沒人得分也會取前 20%)
+        # 這裡的 num_found_elites 絕對會大於 0 (因為即使沒人得分也會取前 10%)
         offspring_per_elite = len(non_elite_indices) // num_found_elites
         
         for idx, parent_idx in enumerate(self.elite_indices):
@@ -312,7 +325,7 @@ class EvolutionSim:
             # 繪製生物
             LEVEL_COLORS = [
                 (255, 255, 255), # 0: 初級 - 白色
-                (100, 149, 237), # 1: 二級 - 藍色 (CornflowerBlue)
+                (100, 149, 237), # 1: 二級 - 藍色
                 (200, 100, 255), # 2: 三級 - 紫色
                 (255, 165, 0),   # 3: 四級 - 橙色
                 (255, 215, 0)    # 4+: 五級 - 金色
@@ -331,25 +344,48 @@ class EvolutionSim:
                         dead_color = (120, 0, 0)
                     pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
                     continue
-
-                level = min(age_np[i], len(LEVEL_COLORS) - 1)
+                
+                age = age_np[i]
+                level = min(age, len(LEVEL_COLORS) - 1)
                 color = LEVEL_COLORS[level]
-                # 精英個體 (畫大一點並加上外環)
-                if i in self.elite_indices:
-                    radius = 7
-                    pygame.draw.circle(self.screen, color, p.astype(int), radius)
-                    pygame.draw.circle(self.screen, color, p.astype(int), radius+5, 1) # 外環                    
+                # 存活代數越高，圓圈越大
+                if age < 1:
+                    radius = 4  # 新生兒
+                elif age < 3:
+                    radius = 6  # 活過兩代
                 else:
-                    # 普通個體 (非精英但可能已存活多代)
-                    radius = 4
-                    pygame.draw.circle(self.screen, color, p.astype(int), radius)
+                    radius = 8  # 活過兩代以上 (老手)
+                # 繪製主體
+                pygame.draw.circle(self.screen, color, p.astype(int), radius)
+
+                # --- 外環邏輯：只有「長青個體」才擁有光環 ---
+                if age >= 3:
+                    # 繪製發光外環 (寬度隨代數微增，增加視覺張力)
+                    ring_radius = radius + 5
+                    pygame.draw.circle(self.screen, color, p.astype(int), ring_radius, 1)
 
             # UI
             self.screen.blit(self.big_font.render(f"GEN: {self.generation_count}", True, (255,255,255)), (20, 20))
-            self.screen.blit(self.font.render(f"Next: {int(self.evolution_ticks)}", True, (200,200,200)), (20, 60))
-            self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (100, 100, 150)), (20, 90))
-            self.screen.blit(self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0)), (20, 120))
+            self.screen.blit(self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0)), (20, 90))
+            self.screen.blit(self.font.render(f"Next: {int(self.evolution_ticks)}", True, (200,200,200)), (20, 120))
+            self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (100, 100, 150)), (20, 150))
             
+            # 取得維度資訊 (從第一個個體 index 0 提取)
+            # self.w1 shape: [POP, IN, OUT] -> 所以 w1.shape[1] 是 Input, [2] 是 Hidden1
+            n_in = self.w1.shape[1]
+            n_h1 = self.w1.shape[2]
+            n_h2 = self.w2.shape[2]
+            n_out = self.w3.shape[2]
+            total_params = (n_in * n_h1) + (n_h1 * n_h2) + (n_h2 * n_out)
+            struct_surf = self.font.render(f"NN: {n_in} -> {n_h1} -> {n_h2} -> {n_out} | {total_params}", True, (200, 200, 200))
+            self.screen.blit(struct_surf, (20, 60)) # 顯示在左上角第二行
+
+            # 顯示冠軍數值
+            best_idx = torch.argmax(self.fitness + (self.survival_age.float() * 50.0))
+            champ_text = f"Best: {best_idx} | Age {int(self.survival_age[best_idx])} | Fit {self.fitness[best_idx]:.0f} | Eng {self.energy[best_idx]:.0f}"
+            champ_surf = self.font.render(champ_text, True, (0, 255, 127)) # 使用亮綠色區分
+            self.screen.blit(champ_surf, (400, 20))
+                
             pygame.display.flip()
             self.clock.tick(FPS)
 

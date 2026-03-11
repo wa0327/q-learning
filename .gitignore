@@ -1,3 +1,2 @@
 .venv
-survivors.pt
-pretrain.pt
+*.pt

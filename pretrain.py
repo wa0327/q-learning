@@ -5,7 +5,7 @@ import torch.optim as optim
 # 必須與原程式參數完全一致
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 INPUT_SIZE = 11
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 16
 OUTPUT_SIZE = 2
 PRETRAIN_SAVE_PATH = "pretrain.pt"
 
