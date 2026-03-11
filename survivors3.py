@@ -32,7 +32,8 @@ DIST_PRED = 5
 FOOD_SIZE = 16
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.01
+FOOD_ENERGY = 5.0
+ENERGY_DECAY = 0.08
 
 # --- DDPG 網路架構 ---
 # --- Actor 網路：策略決策者 ---
@@ -273,7 +274,7 @@ class RLSimulation:
         if hits_f.any():
             a_idx, f_idx = torch.where(hits_f)
             rewards[a_idx] += 5.0
-            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 5, max=MAX_ENERGY)
+            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + FOOD_ENERGY, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
         # 區分死因的獎勵邏輯
@@ -421,8 +422,14 @@ class RLSimulation:
             g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
             b = int(255 * (1 - en_ratio))    # 越餓越藍
             color = (r, g, b)
-            pygame.draw.circle(self.screen, color, pos_tuple, int(4 + 4 * en_ratio))
-            
+            radius = int(4 + 4 * en_ratio)
+            pygame.draw.circle(self.screen, color, pos_tuple, radius)
+            # --- 顯示能量數值 ---
+            energy_text = f"{e_np[i]:.0f}" 
+            text_surface = self.font.render(energy_text, True, (255, 255, 255)) # 白色文字
+            text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
+            self.screen.blit(text_surface, text_rect)
+
             # 畫出方向指示線
             angle = self.angle[i].cpu().item()
             end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
