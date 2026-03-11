@@ -145,12 +145,12 @@ class RLSimulation:
         self.load_state()
 
     def reset_env(self):
+        self.gen_start_time = pygame.time.get_ticks()
         self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
         self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
-        
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5).to(DEVICE) * 3.5
@@ -178,7 +178,10 @@ class RLSimulation:
         return (mixed_in, self_in)
 
     def update(self):
+        self.gen_ticks = pygame.time.get_ticks() - self.gen_start_time
+
         if not self.alive.any():
+            print(f"Gen {self.gen_count} finished. Survived for {self.gen_ticks:.0f} ticks.")
             self.gen_count += 1
             self.reset_env()
             return
@@ -342,6 +345,7 @@ class RLSimulation:
             'eps': self.epsilon,
             'steps': self.steps_done,
             'gen': self.gen_count,
+            'gen_ticks': self.gen_ticks,
             'pos': self.pos,
             'energy': self.energy,
             'alive': self.alive,
@@ -364,7 +368,8 @@ class RLSimulation:
                 self.critic_target.load_state_dict(self.critic.state_dict())
                 self.epsilon = state['eps']
                 self.steps_done = state['steps']
-                self.gen_count = state.get('gen', 1)
+                self.gen_count = state['gen']
+                self.gen_ticks = state['gen_ticks']
                 self.pos = state['pos']
                 self.energy = state['energy']
                 self.alive = state['alive']
@@ -420,9 +425,10 @@ class RLSimulation:
         ui_labels = [
             (f"DDPG MARL", (255, 255, 255), True),
             (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
-            (f"Generation: {self.gen_count}", (200, 200, 200), False),
-            (f"Exploration (Noise): {self.epsilon:.4f}", (0, 255, 255), False),
-            (f"Actor Loss: {self.a_loss_val:.4f} | Critic Loss: {self.c_loss_val:.4f}", (255, 100, 100), False),
+            (f"Steps: {self.steps_done:,}", (0, 255, 255), False),
+            (f"Generation: {self.gen_count} | {self.gen_ticks:,}", (200, 200, 200), False),
+            (f"Actor Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
+            (f"Critic Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
             (f"Alive: {int(self.alive.sum())}/{POP_SIZE}", (100, 255, 100), False)
         ]
         for i, (text, color, bold) in enumerate(ui_labels):
