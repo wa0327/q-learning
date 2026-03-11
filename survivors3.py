@@ -26,8 +26,8 @@ DIST_FOOD = 5
 DIST_PRED = 5
 
 # 環境參數
-FOOD_SIZE = 32
-PREDATOR_SIZE = 5
+FOOD_SIZE = 16
+PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.1
 
@@ -134,7 +134,8 @@ class RLSimulation:
         rewards = torch.full((POP_SIZE,), 0.05, device=DEVICE)
         
         for i in range(POP_SIZE):
-            if not self.alive[i]: continue
+            if not self.alive[i]:
+                continue
             if actions[i] == 0: self.angle[i] -= 0.12
             elif actions[i] == 1: self.angle[i] += 0.12
             speed = 4.0 if actions[i] == 2 else 2.5
@@ -154,8 +155,8 @@ class RLSimulation:
         hits_f = (dist_f < 15.0) & self.alive.unsqueeze(1)
         if hits_f.any():
             a_idx, f_idx = torch.where(hits_f)
-            rewards[a_idx] += 12.0
-            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 35, max=MAX_ENERGY)
+            rewards[a_idx] += 35.0
+            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 25, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
         # 區分死因的獎勵邏輯
@@ -207,6 +208,7 @@ class RLSimulation:
         loss = F.smooth_l1_loss(q_values, target_q.unsqueeze(1))
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0) # 長時間訓練必備：防止梯度爆炸
         self.optimizer.step()
         self.loss_val = loss.item()
 
@@ -275,9 +277,12 @@ class RLSimulation:
             if not a_np[i]:
                 continue
             pos_tuple = (int(p[0]), int(p[1]))
-            en_ratio = e_np[i]/MAX_ENERGY
-            color = (int(255*(1-en_ratio)), int(255*en_ratio), 255)
-            pygame.draw.circle(self.screen, color, pos_tuple, 8)
+            en_ratio = e_np[i] / MAX_ENERGY
+            r = int(255 * en_ratio)          # 越飽越紅
+            g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
+            b = int(255 * (1 - en_ratio))    # 越餓越藍
+            color = (r, g, b)
+            pygame.draw.circle(self.screen, color, pos_tuple, int(4 + 4 * en_ratio))
             angle = self.angle[i].cpu().item()
             end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
             pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
@@ -298,6 +303,7 @@ class RLSimulation:
 
     def run(self):
         running = True
+        show_gui = True
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -305,8 +311,16 @@ class RLSimulation:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_t:
+                        show_gui = not show_gui
             self.update()
-            self.draw()
+            if self.steps_done % 5000 == 0:
+                self.save_state()
+            if show_gui:
+                self.draw()
+            else:
+                if self.steps_done % 1000 == 0:
+                    print(f"Steps: {self.steps_done}, Eps: {self.epsilon:.4f}, Loss: {self.loss_val:.5f}")
         self.save_state()
         pygame.quit()
 
