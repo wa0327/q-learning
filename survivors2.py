@@ -94,9 +94,9 @@ class EvolutionSim:
         self.survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
         
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        # 修正掠食者速率：保持舊版穩定的移動感
-        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5) * 2.0
+        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5)
         self.pred_vel = F.normalize(self.pred_vel, dim=1) * 2.5
 
     def get_batch_sensors(self):
@@ -163,9 +163,42 @@ class EvolutionSim:
             self.alive[killed] = False
             self.fitness[killed] -= 50
 
+        # --- 掠食者動態變速與移動邏輯 ---
+        # 1. 隨機擾動：增加隨機性
+        change_mask = torch.rand(PREDATOR_SIZE).to(DEVICE) < 0.02
+        if change_mask.any():
+            # 產生隨機擾動
+            random_noise = (torch.rand(change_mask.sum(), 2).to(DEVICE) - 0.5) * 0.8
+            self.pred_vel[change_mask] += random_noise
+            # 修正：限制「總速率」而非分量，確保動能
+            speeds = torch.norm(self.pred_vel, dim=1, keepdim=True)
+            # 保持速度在 1.5 ~ 2.5 之間
+            target_speeds = torch.clamp(speeds, 1.5, 2.5)
+            self.pred_vel = (self.pred_vel / (speeds + 1e-6)) * target_speeds
+
+        # 2. 移動掠食者
         self.pred_pos += self.pred_vel
-        self.pred_vel[(self.pred_pos[:,0]<0)|(self.pred_pos[:,0]>SCREEN_W), 0] *= -1
-        self.pred_vel[(self.pred_pos[:,1]<0)|(self.pred_pos[:,1]>SCREEN_H), 1] *= -1
+
+        # 3. 強力邊界反彈 (解決貼牆問題)
+        # 檢測是否出界
+        hit_left   = self.pred_pos[:, 0] < 0
+        hit_right  = self.pred_pos[:, 0] > SCREEN_W
+        hit_top    = self.pred_pos[:, 1] < 0
+        hit_bottom = self.pred_pos[:, 1] > SCREEN_H
+        # 處理 X 軸反彈：係數改回 -1.0 並強制座標回彈，防止黏在邊緣
+        if hit_left.any():
+            self.pred_vel[hit_left, 0] *= -1.0
+            self.pred_pos[hit_left, 0] = 1.0  # 強制推離牆面
+        if hit_right.any():
+            self.pred_vel[hit_right, 0] *= -1.0
+            self.pred_pos[hit_right, 0] = SCREEN_W - 1.0
+        # 處理 Y 軸反彈
+        if hit_top.any():
+            self.pred_vel[hit_top, 1] *= -1.0
+            self.pred_pos[hit_top, 1] = 1.0
+        if hit_bottom.any():
+            self.pred_vel[hit_bottom, 1] *= -1.0
+            self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
 
     def evolve(self):
         # 依照 Fitness + 生存獎勵選擇精英
@@ -181,7 +214,8 @@ class EvolutionSim:
 
         # 演化：精英權重 + 隨機突變
         for i in range(POP_SIZE):
-            if i == elite_idx: continue
+            if i == elite_idx:
+                continue
             self.brains[i].load_state_dict(best_sd)
             with torch.no_grad():
                 for p in self.brains[i].parameters():
@@ -193,11 +227,6 @@ class EvolutionSim:
         self.evolution_ticks = EVOLUTION_TICKS
 
     def save_state(self):
-        # 找出當前最優精英（Fitness + 生存獎勵）
-        score = self.fitness + (self.survival_age.float() * 50.0)
-        best_idx = torch.argmax(score)
-        best_brain_sd = self.brains[best_idx].state_dict()
-
         # 1. 儲存遊戲進度
         state = {
             'gen': self.generation_count, 
@@ -207,7 +236,12 @@ class EvolutionSim:
         torch.save(state, SAVE_PATH)
 
         # 2. 自動回寫預訓練權重 (讓新族群繼承最優精英)
+        # 找出當前最優精英（Fitness + 生存獎勵）
+        score = self.fitness + (self.survival_age.float() * 50.0)
+        best_idx = torch.argmax(score)
+        best_brain_sd = self.brains[best_idx].state_dict()
         torch.save(best_brain_sd, PRETRAIN_PATH)
+        
         print(f"[System] Progress saved to {SAVE_PATH}. Best brain updated to {PRETRAIN_PATH}")
 
     def load_state(self):
@@ -228,7 +262,11 @@ class EvolutionSim:
         running = True
         while running:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT: running = False
+                if event.type == pygame.QUIT:
+                    running = False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
 
             self.update_physics()
             self.evolution_ticks -= 1
