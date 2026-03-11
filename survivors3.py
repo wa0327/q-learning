@@ -107,7 +107,9 @@ class RLSimulation:
         p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
         pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), torch.clamp(200.0/(p_dist+1),0,2)], dim=1)
 
-        self_in = torch.stack([torch.zeros(POP_SIZE).to(DEVICE), torch.zeros(POP_SIZE).to(DEVICE), self.energy/MAX_ENERGY], dim=1)
+        zeros_tensor = torch.zeros(POP_SIZE, device=DEVICE)
+        self_in = torch.stack([zeros_tensor, zeros_tensor, self.energy/MAX_ENERGY], dim=1)
+        
         return (food_in, pred_in, self_in)
 
     def select_action(self, states):
@@ -123,6 +125,9 @@ class RLSimulation:
             self.gen_count += 1
             self.reset_env()
             return
+
+        # 記錄回合開始前誰是活著的，只有活著的才有資格寫入記憶庫
+        was_alive = self.alive.clone()
 
         current_states = self.get_states()
         actions = self.select_action(current_states)
@@ -141,11 +146,9 @@ class RLSimulation:
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
         self.energy -= ENERGY_DECAY
 
-        # 掠食者移動
         self.pred_pos += self.pred_vel
         hit_wall = (self.pred_pos < 0) | (self.pred_pos > torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE))
-        if hit_wall.any():
-            self.pred_vel[hit_wall.any(dim=1)] *= -1
+        self.pred_vel[hit_wall] *= -1
 
         # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
@@ -168,7 +171,12 @@ class RLSimulation:
             self.alive[dead_mask] = False
 
         next_states = self.get_states()
+        
+        # 把經驗推入 Replay Buffer
         for i in range(POP_SIZE):
+            if not was_alive[i]: 
+                continue # 忽略死屍的經驗
+                
             s_i = (current_states[0][i:i+1], current_states[1][i:i+1], current_states[2][i:i+1])
             ns_i = (next_states[0][i:i+1], next_states[1][i:i+1], next_states[2][i:i+1])
             self.memory.push(s_i, actions[i].unsqueeze(0), rewards[i].unsqueeze(0), ns_i, dead_mask[i].unsqueeze(0))
