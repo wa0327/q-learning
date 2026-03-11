@@ -34,41 +34,75 @@ MAX_ENERGY = 100.0
 ENERGY_DECAY = 0.05
 
 # --- DDPG 網路架構 ---
+# --- Actor 網路：策略決策者 ---
 class Actor(nn.Module):
     def __init__(self):
-        super(Actor, self).__init__()
-        self.conv = nn.Conv1d(6, 32, 1)
+        super(Actor, self).__init__()# 6 個輸入通道：
+        # [0:2] 食物角度(cos, sin), [2] 食物距離
+        # [3:5] 掠食者角度(cos, sin), [5] 掠食者威脅度
+        self.conv = nn.Conv1d(6, 32, 1) 
         self.fc = nn.Sequential(
+            # 32 (卷積特徵) + 3 (自身狀態: 速度, 0, 能量) = 35
             nn.Linear(35, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 2), # 輸出兩個連續動作: [Steer, Throttle]
-            nn.Tanh()         # 將輸出壓縮在 [-1, 1] 之間
+            nn.Linear(32, 2), # 輸出 2: [Steer(轉向), Throttle(油門)]
+            nn.Tanh()         # 將輸出壓縮至 [-1, 1]
         )
 
     def forward(self, m_in, s_in):
+        """
+        輸入:
+        m_in: Tensor [Batch, 6, 5] -> 6個特徵，探測周圍最近的 5 個物體，這裡的 '5' 指的是 DIST_FOOD (5個) 與 DIST_PRED (5個) 對齊後的物體槽位
+        s_in: Tensor [Batch, 3]    -> 自身狀態 (Speed, Constant_0, Energy)
+        
+        輸出:
+        actions: Tensor [Batch, 2] -> 每個 Agent 的 [轉向, 加速] 連續值
+        """
+        # Conv1d 處理局部感應數據 -> [Batch, 32, 5]
+        # Max 降維取最強特徵 -> [Batch, 32]
         x = torch.max(F.relu(self.conv(m_in)), dim=2)[0]
+        
+        # 結合感應特徵與自身狀態 -> [Batch, 35]
         combined = torch.cat([x, s_in], dim=1)
+        
+        # 輸出最終動作
         return self.fc(combined)
 
+# --- Critic 網路：價值評估者 ---
 class Critic(nn.Module):
     def __init__(self):
         super(Critic, self).__init__()
         self.conv = nn.Conv1d(6, 32, 1)
         self.fc = nn.Sequential(
-            nn.Linear(35 + 2, 64), # 狀態維度(35) + 動作維度(2)
+            # 32 (感應特徵) + 3 (自身狀態) + 2 (動作) = 37
+            nn.Linear(35 + 2, 64), 
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(32, 1)  # 輸出 1: 該 狀態+動作 的預期 Q 值 (分數)
         )
 
     def forward(self, m_in, s_in, action):
+        """
+        輸入:
+        m_in: Tensor [Batch, 6, 5]
+        s_in: Tensor [Batch, 3]
+        action: Tensor [Batch, 2] -> 來自 Actor 預測或 Memory 紀錄的動作
+        
+        輸出:
+        q_value: Tensor [Batch, 1] -> 預測的未來總分回報
+        """
+        # 處理感應數據 -> [Batch, 32]
         x = torch.max(F.relu(self.conv(m_in)), dim=2)[0]
+        
+        # 結合特徵、自身狀態與動作數據 -> [Batch, 37]
         combined = torch.cat([x, s_in, action], dim=1)
+        
+        # 評估該動作在該狀態下的價值
         return self.fc(combined)
-
+    
 class ReplayMemory:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
@@ -194,10 +228,10 @@ class RLSimulation:
 
         # 掠食者移動
         # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
-        change_mask = torch.rand(PREDATOR_SIZE, device=DEVICE) < 0.02
+        change_mask = torch.rand(PREDATOR_SIZE, device=DEVICE) < 0.05
         if change_mask.any():
             # 產生隨機加速度擾動
-            random_noise = (torch.rand(int(change_mask.sum()), 2, device=DEVICE) - 0.5) * 0.8
+            random_noise = (torch.rand(int(change_mask.sum()), 2, device=DEVICE) - 0.5) * 1.8
             self.pred_vel[change_mask] += random_noise
             
             # 重新標準化速度，確保掠食者不會無限加速或停下
@@ -229,7 +263,7 @@ class RLSimulation:
         hits_f = (dist_f < 15.0) & self.alive.unsqueeze(1)
         if hits_f.any():
             a_idx, f_idx = torch.where(hits_f)
-            rewards[a_idx] += 45.0
+            rewards[a_idx] += 5.0
             self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 5, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
@@ -237,8 +271,8 @@ class RLSimulation:
         dist_p = torch.cdist(self.pos, self.pred_pos)
         hits_p = (dist_p < 22.0).any(dim=1) & self.alive
         starved = (self.energy <= 0) & self.alive        
-        rewards[hits_p] -= 50  # 被殺死
-        rewards[starved] -= 40 # 餓死
+        rewards[hits_p] -= 10  # 被殺死
+        rewards[starved] -= -8 # 餓死
         
         dead_mask = hits_p | starved
         if dead_mask.any():
