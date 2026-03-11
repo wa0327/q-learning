@@ -12,7 +12,7 @@ FOOD_SIZE = 100
 PREDATOR_SIZE = 5
 SCREEN_W, SCREEN_H = 1024, 768
 FPS = 240
-EVOLUTION_TICKS = 10000 
+EVOLUTION_TICKS = 10000
 SAVE_PATH = "survivors2.pt"
 PRETRAIN_PATH = "pretrain2.pt"
 MAX_ENERGY = 100.0
@@ -66,9 +66,23 @@ class EvolutionSim:
         self.brains = [HybridBrain().to(DEVICE) for _ in range(POP_SIZE)]
 
         if not self.load_state():
+            self.init_environment()
             self.inject_pretrain_weights()
         
-        self.init_environment()
+    def init_environment(self):
+        self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
+        self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
+        self.fitness = torch.zeros(POP_SIZE).to(DEVICE)
+        self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
+        self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
+        self.age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
+        
+        self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        
+        self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
+        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5)
+        self.pred_vel = F.normalize(self.pred_vel, dim=1) * 2.5
 
     def inject_pretrain_weights(self):
         if os.path.exists(PRETRAIN_PATH):
@@ -83,21 +97,6 @@ class EvolutionSim:
                             p.add_(torch.randn(p.size()).to(DEVICE) * 0.15)
         else:
             print("[Warning] No pretrain2.pt found.")
-
-    def init_environment(self):
-        self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
-        self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
-        self.fitness = torch.zeros(POP_SIZE).to(DEVICE)
-        self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
-        self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
-        self.survival_age = torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE)
-        
-        self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        
-        self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5)
-        self.pred_vel = F.normalize(self.pred_vel, dim=1) * 2.5
 
     def get_batch_sensors(self):
         dist_food = torch.cdist(self.pos, self.food_pos)
@@ -167,32 +166,26 @@ class EvolutionSim:
         # 1. 隨機擾動：增加隨機性
         change_mask = torch.rand(PREDATOR_SIZE).to(DEVICE) < 0.02
         if change_mask.any():
-            # 產生隨機擾動
             random_noise = (torch.rand(change_mask.sum(), 2).to(DEVICE) - 0.5) * 0.8
             self.pred_vel[change_mask] += random_noise
-            # 修正：限制「總速率」而非分量，確保動能
             speeds = torch.norm(self.pred_vel, dim=1, keepdim=True)
-            # 保持速度在 1.5 ~ 2.5 之間
             target_speeds = torch.clamp(speeds, 1.5, 2.5)
             self.pred_vel = (self.pred_vel / (speeds + 1e-6)) * target_speeds
 
         # 2. 移動掠食者
         self.pred_pos += self.pred_vel
 
-        # 3. 強力邊界反彈 (解決貼牆問題)
-        # 檢測是否出界
+        # 3. 強力邊界反彈
         hit_left   = self.pred_pos[:, 0] < 0
         hit_right  = self.pred_pos[:, 0] > SCREEN_W
         hit_top    = self.pred_pos[:, 1] < 0
         hit_bottom = self.pred_pos[:, 1] > SCREEN_H
-        # 處理 X 軸反彈：係數改回 -1.0 並強制座標回彈，防止黏在邊緣
         if hit_left.any():
             self.pred_vel[hit_left, 0] *= -1.0
-            self.pred_pos[hit_left, 0] = 1.0  # 強制推離牆面
+            self.pred_pos[hit_left, 0] = 1.0
         if hit_right.any():
             self.pred_vel[hit_right, 0] *= -1.0
             self.pred_pos[hit_right, 0] = SCREEN_W - 1.0
-        # 處理 Y 軸反彈
         if hit_top.any():
             self.pred_vel[hit_top, 1] *= -1.0
             self.pred_pos[hit_top, 1] = 1.0
@@ -201,57 +194,96 @@ class EvolutionSim:
             self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
 
     def evolve(self):
-        # 依照 Fitness + 生存獎勵選擇精英
-        score = self.fitness + (self.survival_age.float() * 50.0)
+        # 結算存活代數：僅此時活著的加 1，其餘重置為 0 (損失 survival_age)
+        self.age[self.alive] += 1
+        self.age[~self.alive] = 0
+        
+        # 依照綜合評分選擇精英
+        score = self.fitness + (self.age.float() * 50.0)
         sorted_idx = torch.argsort(score, descending=True)
-        elite_idx = sorted_idx[0]
         
-        # 只有存活到最後的個體才算增加代數
-        self.survival_age[self.alive] += 1
+        # 10% 精英數量
+        num_elites = max(1, int(POP_SIZE * 0.1))
+        elites_idx = sorted_idx[:num_elites]
         
-        best_sd = self.brains[elite_idx].state_dict()
-        print(f"[System] GEN {self.generation_count} Evolving. Best Score: {score[elite_idx]:.1f}")
-
-        # 演化：精英權重 + 隨機突變
-        for i in range(POP_SIZE):
-            if i == elite_idx:
-                continue
-            self.brains[i].load_state_dict(best_sd)
+        print(f"[System] GEN {self.generation_count} Evolving. Top Score: {score[elites_idx[0]]:.1f}")
+        
+        # 備份精英權重
+        elite_dicts = [self.brains[i].state_dict() for i in elites_idx]
+        
+        # 90% 權重分配邏輯：餘下個體平均繼承精英
+        # 例如 50 個個體，5 個精英，每人產生 (50-5)/5 = 9 個繼承者
+        followers_per_elite = (POP_SIZE - num_elites) // num_elites
+        
+        current_idx = 0
+        # 重新填充族群
+        for e_idx in range(num_elites):
+            # 保留精英本人（前 10% 不變異或微量變異）
+            self.brains[current_idx].load_state_dict(elite_dicts[e_idx])
+            current_idx += 1
+            
+            # 產生該精英的繼承者
+            for _ in range(followers_per_elite):
+                if current_idx >= POP_SIZE: break
+                self.brains[current_idx].load_state_dict(elite_dicts[e_idx])
+                with torch.no_grad():
+                    for p in self.brains[current_idx].parameters():
+                        p.add_(torch.randn(p.size()).to(DEVICE) * 0.12)
+                current_idx += 1
+        
+        # 補足因除法產生的餘數個體（繼承第一名）
+        while current_idx < POP_SIZE:
+            self.brains[current_idx].load_state_dict(elite_dicts[0])
             with torch.no_grad():
-                for p in self.brains[i].parameters():
+                for p in self.brains[current_idx].parameters():
                     p.add_(torch.randn(p.size()).to(DEVICE) * 0.12)
-        
-        self.save_state() # 內含自動回寫預訓練
+            current_idx += 1
+
+        self.alive[:] = True
+        self.fitness *= 0 
+        self.energy[:] = MAX_ENERGY
         self.generation_count += 1
-        self.init_environment()
         self.evolution_ticks = EVOLUTION_TICKS
+        self.save_state() 
 
     def save_state(self):
-        # 1. 儲存遊戲進度
         state = {
             'gen': self.generation_count, 
             'brains': [b.state_dict() for b in self.brains],
-            'survival_age': self.survival_age
+            'fitness': self.fitness,
+            'age': self.age,
+            'alive': self.alive,
+            'energy': self.energy,
+            'food_pos': self.food_pos,
+            'pred_pos': self.pred_pos,
+            'pred_vel': self.pred_vel,
+            'pos': self.pos, 'vel': self.vel, 'angle': self.angle,
         }
         torch.save(state, SAVE_PATH)
 
-        # 2. 自動回寫預訓練權重 (讓新族群繼承最優精英)
-        # 找出當前最優精英（Fitness + 生存獎勵）
-        score = self.fitness + (self.survival_age.float() * 50.0)
+        # 自動回寫最強精英至 PRETRAIN_PATH
+        score = self.fitness + (self.age.float() * 50.0)
         best_idx = torch.argmax(score)
-        best_brain_sd = self.brains[best_idx].state_dict()
-        torch.save(best_brain_sd, PRETRAIN_PATH)
+        torch.save(self.brains[best_idx].state_dict(), PRETRAIN_PATH)
         
-        print(f"[System] Progress saved to {SAVE_PATH}. Best brain updated to {PRETRAIN_PATH}")
+        print(f"[System] Progress saved. Best brain updated to {PRETRAIN_PATH}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
                 self.generation_count = state['gen']
-                self.survival_age = state.get('survival_age', torch.zeros(POP_SIZE, dtype=torch.int).to(DEVICE))
-                for i in range(POP_SIZE): self.brains[i].load_state_dict(state['brains'][i])
-                print(f"[System] Successfully loaded save: GEN {self.generation_count}")
+                for i in range(POP_SIZE):
+                    self.brains[i].load_state_dict(state['brains'][i])
+                self.fitness = state['fitness']
+                self.age = state['age']
+                self.alive = state['alive']
+                self.energy = state['energy']
+                self.food_pos = state['food_pos']
+                self.pred_pos = state['pred_pos']
+                self.pred_vel = state['pred_vel']
+                self.pos, self.vel, self.angle = state['pos'], state['vel'], state['angle']
+                print(f"[System] Loaded save: GEN {self.generation_count}")
                 return True
             except:
                 return False
@@ -274,17 +306,14 @@ class EvolutionSim:
                 self.evolve()
 
             self.screen.fill((20, 20, 25))
-            
-            # 畫場景
             for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 100), f.astype(int), 3)
             for p in self.pred_pos.cpu().numpy():
                 pygame.draw.circle(self.screen, (255, 255, 255), p.astype(int), 15, 1)
                 pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 5)
 
-            # 畫個體
             p_np = self.pos.cpu().numpy()
             a_np = self.alive.cpu().numpy()
-            age_np = self.survival_age.cpu().numpy()
+            age_np = self.age.cpu().numpy()
             e_np = self.energy.cpu().numpy()
 
             for i, p in enumerate(p_np):
@@ -305,8 +334,7 @@ class EvolutionSim:
             self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (150, 150, 255)), (20, 90))
             self.screen.blit(self.font.render(f"Ticks: {self.evolution_ticks}", True, (200, 200, 200)), (20, 115))
             
-            # 顯示最佳個體資訊
-            score = self.fitness + (self.survival_age.float() * 50.0)
+            score = self.fitness + (self.age.float() * 50.0)
             best_idx = torch.argmax(score)
             champ_text = f"Top Elite: #{best_idx} | Age: {age_np[best_idx]} | Score: {score[best_idx]:.0f}"
             self.screen.blit(self.font.render(champ_text, True, (0, 255, 150)), (400, 20))
