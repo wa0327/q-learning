@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-import random
 
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -17,7 +16,7 @@ EVOLUTION_TICKS = 10000
 SAVE_PATH = "survivors2.pt"
 PRETRAIN_PATH = "pretrain2.pt"
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.12
+ENERGY_DECAY = 0.12     
 
 # 感知與網路參數
 NEARBY_FOOD_COUNT = 5
@@ -73,7 +72,7 @@ class EvolutionSim:
 
     def inject_pretrain_weights(self):
         if os.path.exists(PRETRAIN_PATH):
-            print(f"[System] No save. Injecting Expert Genes from {PRETRAIN_PATH}...")
+            print(f"[System] Injecting Expert Genes from {PRETRAIN_PATH}...")
             expert_sd = torch.load(PRETRAIN_PATH, map_location=DEVICE)
             pure_count = int(POP_SIZE * 0.1)
             for i in range(POP_SIZE):
@@ -96,7 +95,9 @@ class EvolutionSim:
         
         self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5) * 4.0
+        # 修正掠食者速率：保持舊版穩定的移動感
+        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5) * 2.0
+        self.pred_vel = F.normalize(self.pred_vel, dim=1) * 2.5
 
     def get_batch_sensors(self):
         dist_food = torch.cdist(self.pos, self.food_pos)
@@ -124,12 +125,17 @@ class EvolutionSim:
         food_in, pred_in, self_in = self.get_batch_sensors()
         with torch.no_grad():
             for i in range(POP_SIZE):
-                if not self.alive[i]: continue
+                if not self.alive[i]:
+                    continue
                 out = self.brains[i](food_in[i:i+1], pred_in[i:i+1], self_in[i:i+1]).squeeze()
+                
+                # 速率一致性修正：轉向與推力
                 self.angle[i] += out[1] * 0.15
-                speed = (out[0] + 1.0) * 0.15
+                thrust = (out[0] + 1.0) * 0.15 # 提高係數以對齊舊版靈敏度
                 move_dir = torch.stack([torch.cos(self.angle[i]), torch.sin(self.angle[i])])
-                self.vel[i] = self.vel[i] * 0.9 + move_dir * speed
+                
+                # 使用 0.9 衰減確保輕快感
+                self.vel[i] = self.vel[i] * 0.9 + move_dir * thrust
                 self.pos[i] += self.vel[i]
 
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
@@ -162,13 +168,18 @@ class EvolutionSim:
         self.pred_vel[(self.pred_pos[:,1]<0)|(self.pred_pos[:,1]>SCREEN_H), 1] *= -1
 
     def evolve(self):
-        sorted_idx = torch.argsort(self.fitness, descending=True)
+        # 依照 Fitness + 生存獎勵選擇精英
+        score = self.fitness + (self.survival_age.float() * 50.0)
+        sorted_idx = torch.argsort(score, descending=True)
         elite_idx = sorted_idx[0]
         
+        # 只有存活到最後的個體才算增加代數
         self.survival_age[self.alive] += 1
+        
         best_sd = self.brains[elite_idx].state_dict()
-        print(f"[System] GEN {self.generation_count} Evolving. Best Fitness: {self.fitness[elite_idx]:.1f}")
+        print(f"[System] GEN {self.generation_count} Evolving. Best Score: {score[elite_idx]:.1f}")
 
+        # 演化：精英權重 + 隨機突變
         for i in range(POP_SIZE):
             if i == elite_idx: continue
             self.brains[i].load_state_dict(best_sd)
@@ -176,18 +187,28 @@ class EvolutionSim:
                 for p in self.brains[i].parameters():
                     p.add_(torch.randn(p.size()).to(DEVICE) * 0.12)
         
-        self.save_state()
+        self.save_state() # 內含自動回寫預訓練
         self.generation_count += 1
         self.init_environment()
         self.evolution_ticks = EVOLUTION_TICKS
 
     def save_state(self):
+        # 找出當前最優精英（Fitness + 生存獎勵）
+        score = self.fitness + (self.survival_age.float() * 50.0)
+        best_idx = torch.argmax(score)
+        best_brain_sd = self.brains[best_idx].state_dict()
+
+        # 1. 儲存遊戲進度
         state = {
             'gen': self.generation_count, 
             'brains': [b.state_dict() for b in self.brains],
             'survival_age': self.survival_age
         }
         torch.save(state, SAVE_PATH)
+
+        # 2. 自動回寫預訓練權重 (讓新族群繼承最優精英)
+        torch.save(best_brain_sd, PRETRAIN_PATH)
+        print(f"[System] Progress saved to {SAVE_PATH}. Best brain updated to {PRETRAIN_PATH}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -233,7 +254,6 @@ class EvolutionSim:
                     dead_color = (60, 60, 60) if e_np[i] <= 0 else (120, 0, 0)
                     pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
                     continue
-                
                 age = age_np[i]
                 color = LEVEL_COLORS[min(age, len(LEVEL_COLORS)-1)]
                 radius = 4 if age < 1 else (6 if age < 3 else 8)
@@ -241,15 +261,16 @@ class EvolutionSim:
                 if age >= 3:
                     pygame.draw.circle(self.screen, color, p.astype(int), radius + 5, 1)
 
-            # UI 顯示 (包含 FPS)
+            # UI 顯示
             self.screen.blit(self.big_font.render(f"GEN: {self.generation_count}", True, (255,255,255)), (20, 20))
             self.screen.blit(self.font.render(f"FPS: {int(self.clock.get_fps())}", True, (0, 255, 0)), (20, 60))
             self.screen.blit(self.font.render(f"Alive: {int(self.alive.sum())}/{POP_SIZE}", True, (150, 150, 255)), (20, 90))
-            self.screen.blit(self.font.render(f"Next: {self.evolution_ticks}", True, (200, 200, 200)), (20, 115))
+            self.screen.blit(self.font.render(f"Ticks: {self.evolution_ticks}", True, (200, 200, 200)), (20, 115))
             
             # 顯示最佳個體資訊
-            best_idx = torch.argmax(self.fitness)
-            champ_text = f"Best Agent: #{best_idx} | Level: {age_np[best_idx]} | Fit: {self.fitness[best_idx]:.0f}"
+            score = self.fitness + (self.survival_age.float() * 50.0)
+            best_idx = torch.argmax(score)
+            champ_text = f"Top Elite: #{best_idx} | Age: {age_np[best_idx]} | Score: {score[best_idx]:.0f}"
             self.screen.blit(self.font.render(champ_text, True, (0, 255, 150)), (400, 20))
 
             pygame.display.flip()
