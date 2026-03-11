@@ -35,8 +35,7 @@ ENERGY_DECAY = 0.1
 class DQNBrain(nn.Module):
     def __init__(self):
         super(DQNBrain, self).__init__()
-        self.food_conv = nn.Conv1d(3, 16, 1)
-        self.pred_conv = nn.Conv1d(3, 16, 1)
+        self.conv = nn.Conv1d(6, 32, 1)
         self.fc = nn.Sequential(
             nn.Linear(35, 64),
             nn.ReLU(),
@@ -45,10 +44,9 @@ class DQNBrain(nn.Module):
             nn.Linear(32, 3) 
         )
 
-    def forward(self, f_in, p_in, s_in):
-        f = torch.max(F.relu(self.food_conv(f_in)), dim=2)[0]
-        p = torch.max(F.relu(self.pred_conv(p_in)), dim=2)[0]
-        combined = torch.cat([f, p, s_in], dim=1)
+    def forward(self, m_in, s_in):
+        x = torch.max(F.relu(self.conv(m_in)), dim=2)[0]
+        combined = torch.cat([x, s_in], dim=1)
         return self.fc(combined)
 
 class ReplayMemory:
@@ -107,16 +105,17 @@ class RLSimulation:
         p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
         pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), torch.clamp(200.0/(p_dist+1),0,2)], dim=1)
 
+        mixed_in = torch.cat([food_in, pred_in], dim=1)
         zeros_tensor = torch.zeros(POP_SIZE, device=DEVICE)
         self_in = torch.stack([zeros_tensor, zeros_tensor, self.energy/MAX_ENERGY], dim=1)
         
-        return (food_in, pred_in, self_in)
+        return (mixed_in, self_in)
 
     def select_action(self, states):
-        f, p, s = states
+        m, s = states
         if random.random() > self.epsilon:
             with torch.no_grad():
-                return self.policy_net(f, p, s).max(1)[1]
+                return self.policy_net(m, s).max(1)[1]
         else:
             return torch.tensor([random.randrange(3) for _ in range(POP_SIZE)], device=DEVICE)
 
@@ -177,8 +176,8 @@ class RLSimulation:
             if not was_alive[i]: 
                 continue # 忽略死屍的經驗
                 
-            s_i = (current_states[0][i:i+1], current_states[1][i:i+1], current_states[2][i:i+1])
-            ns_i = (next_states[0][i:i+1], next_states[1][i:i+1], next_states[2][i:i+1])
+            s_i = (current_states[0][i:i+1], current_states[1][i:i+1])
+            ns_i = (next_states[0][i:i+1], next_states[1][i:i+1])
             self.memory.push(s_i, actions[i].unsqueeze(0), rewards[i].unsqueeze(0), ns_i, dead_mask[i].unsqueeze(0))
 
         self.optimize_model()
@@ -192,19 +191,17 @@ class RLSimulation:
             return
         
         batch = self.memory.sample(BATCH_SIZE)
-        f_b = torch.cat([x[0][0] for x in batch])
-        p_b = torch.cat([x[0][1] for x in batch])
-        s_b = torch.cat([x[0][2] for x in batch])
+        m_b = torch.cat([x[0][0] for x in batch])
+        s_b = torch.cat([x[0][1] for x in batch])
         a_b = torch.cat([x[1] for x in batch])
         r_b = torch.cat([x[2] for x in batch])
-        nf_b = torch.cat([x[3][0] for x in batch])
-        np_b = torch.cat([x[3][1] for x in batch])
-        ns_b = torch.cat([x[3][2] for x in batch])
+        nm_b = torch.cat([x[3][0] for x in batch])
+        ns_b = torch.cat([x[3][1] for x in batch])
         d_b = torch.cat([x[4] for x in batch])
 
-        q_values = self.policy_net(f_b, p_b, s_b).gather(1, a_b.unsqueeze(1))
+        q_values = self.policy_net(m_b, s_b).gather(1, a_b.unsqueeze(1))
         with torch.no_grad():
-            max_next_q = self.target_net(nf_b, np_b, ns_b).max(1)[0]
+            max_next_q = self.target_net(nm_b, ns_b).max(1)[0]
             target_q = r_b + (GAMMA * max_next_q * (1 - d_b.float()))
         
         loss = F.smooth_l1_loss(q_values, target_q.unsqueeze(1))
