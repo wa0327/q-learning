@@ -31,7 +31,7 @@ DIST_PRED = 5
 FOOD_SIZE = 16
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.15
+ENERGY_DECAY = 0.05
 
 # --- DDPG 網路架構 ---
 class Actor(nn.Module):
@@ -229,8 +229,8 @@ class RLSimulation:
         hits_f = (dist_f < 15.0) & self.alive.unsqueeze(1)
         if hits_f.any():
             a_idx, f_idx = torch.where(hits_f)
-            rewards[a_idx] += 35.0
-            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 25, max=MAX_ENERGY)
+            rewards[a_idx] += 45.0
+            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + 5, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
         # 區分死因的獎勵邏輯
