@@ -169,7 +169,8 @@ class RLSimulation:
         p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
         p_dist = torch.norm(p_diff, dim=2)
         p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
-        pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), torch.clamp(200.0/(p_dist+1),0,2)], dim=1)
+        threat_score = 10.0 / (p_dist / 10.0 + 1) # 距離0時=10, 距離10時=5, 距離90時=1
+        pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), threat_score], dim=1)
 
         mixed_in = torch.cat([food_in, pred_in], dim=1)
         speed = torch.norm(self.vel, dim=1) / 10.0
