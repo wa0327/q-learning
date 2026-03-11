@@ -7,6 +7,7 @@ import os
 import random
 from collections import deque
 
+CAPTION = "Vectra: Apex Protocol"
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 POP_SIZE = 16
@@ -19,7 +20,7 @@ GAMMA = 0.98
 TAU = 0.005 # 軟更新係數
 LR_ACTOR = 0.003
 LR_CRITIC = 0.001
-MEMORY_SIZE = 50000
+MEMORY_SIZE = 500000
 BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
@@ -31,7 +32,7 @@ DIST_PRED = 5
 FOOD_SIZE = 16
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
-ENERGY_DECAY = 0.05
+ENERGY_DECAY = 0.01
 
 # --- DDPG 網路架構 ---
 # --- Actor 網路：策略決策者 ---
@@ -121,6 +122,7 @@ class RLSimulation:
         self.font = pygame.font.SysFont("Consolas", 16)
         self.big_font = pygame.font.SysFont("Consolas", 20, bold=True)
         self.fps = 240
+        self.update_caption()
         
         # 初始化 DDPG 網路
         self.actor = Actor().to(DEVICE)
@@ -143,6 +145,9 @@ class RLSimulation:
         
         self.reset_env()
         self.load_state()
+
+    def update_caption(self):
+        pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
     def reset_env(self):
         self.gen_start_time = pygame.time.get_ticks()
@@ -182,7 +187,7 @@ class RLSimulation:
         self.gen_ticks = pygame.time.get_ticks() - self.gen_start_time
 
         if not self.alive.any():
-            print(f"Gen {self.gen_count} finished. Survived for {self.gen_ticks:.0f} ticks.")
+            print(f"Gen {self.gen_count} finished. Survived for {self.gen_ticks:,} ticks.")
             self.gen_count += 1
             self.reset_env()
             return
@@ -205,8 +210,8 @@ class RLSimulation:
             
             # Action[0] 為轉向 (-1 到 1 映射至 -0.15 到 0.15 弧度)
             steer = actions[i][0] * 0.15
-            # Action[1] 為油門 (-1 到 1 映射至 0 到 0.25 加速度)
-            throttle = (actions[i][1] + 1.0) * 0.25
+            # Action[1] 為油門 (-1 到 1 映射至 0 到 0.3 加速度)
+            throttle = (actions[i][1] + 1.0) * 0.3
             
             self.angle[i] += steer
             dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
@@ -376,7 +381,7 @@ class RLSimulation:
                 self.alive = state['alive']
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
-                print(f"--- [Loaded] Gen {self.gen_count}, Steps {self.steps_done} ---")
+                print(f"--- [Loaded] Gen {self.gen_count}, Steps {self.steps_done:,} ---")
                 return
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
@@ -424,7 +429,6 @@ class RLSimulation:
             pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
 
         ui_labels = [
-            (f"DDPG MARL", (255, 255, 255), True),
             (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
             (f"Steps: {self.steps_done:,}", (0, 255, 255), False),
             (f"Generation: {self.gen_count} | {self.gen_ticks:,}", (200, 200, 200), False),
@@ -452,10 +456,10 @@ class RLSimulation:
                         show_gui = not show_gui
                     elif event.key == pygame.K_UP:
                         self.fps += 5
-                        pygame.display.set_caption(f"當前目標 FPS: {self.fps}")
+                        self.update_caption()
                     elif event.key == pygame.K_DOWN:
                         self.fps -= 5
-                        pygame.display.set_caption(f"當前目標 FPS: {self.fps}")
+                        self.update_caption()
             self.update()
             if self.steps_done % 5000 == 0:
                 self.save_state()
