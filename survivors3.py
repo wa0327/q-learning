@@ -12,7 +12,7 @@ script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 8
+POP_SIZE = 16
 SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
 BRAIN_PATH = f"{script_name}_brain.pt"
@@ -26,7 +26,7 @@ MEMORY_SIZE = 500000
 BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
-EPSILON_DECAY = 0.9999
+EPSILON_DECAY = 0.9995
 DIST_FOOD = 5
 DIST_PRED = 5
 
@@ -116,6 +116,24 @@ class ReplayMemory:
         return random.sample(self.buffer, batch_size)
     def __len__(self): return len(self.buffer)
 
+class OUNoise:
+    def __init__(self, action_dimension, mu=0, theta=0.15, sigma=0.2):
+        self.action_dim = action_dimension
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.state = np.ones(self.action_dim) * self.mu
+        self.reset()
+
+    def reset(self):
+        self.state = np.ones(self.action_dim) * self.mu
+
+    def sample(self):
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(len(x))
+        self.state = x + dx
+        return torch.tensor(self.state, dtype=torch.float).to(DEVICE)
+    
 # --- 模擬環境 ---
 class RLSimulation:
     def __init__(self):
@@ -140,6 +158,7 @@ class RLSimulation:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
         self.memory = ReplayMemory(MEMORY_SIZE)
+        self.ou_noise = OUNoise(2) # 2 個動作維度
         self.epsilon = EPSILON_START
         self.steps_done = 0
         self.a_loss_val = 0.0
@@ -204,7 +223,7 @@ class RLSimulation:
         with torch.no_grad():
             m, s = current_states
             actions = self.actor(m, s)
-            noise = torch.randn_like(actions) * self.epsilon
+            noise = self.ou_noise.sample() * self.epsilon
             actions = torch.clamp(actions + noise, -1.0, 1.0)
             # 包含噪音的實際執行值。
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
