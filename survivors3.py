@@ -173,7 +173,7 @@ class RLSimulation:
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
     def reset_env(self):
-        self.gen_start_time = pygame.time.get_ticks()
+        self.gen_steps = 0
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
         self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
@@ -209,10 +209,8 @@ class RLSimulation:
         return (mixed_in, self_in)
 
     def update(self):
-        self.gen_ticks = pygame.time.get_ticks() - self.gen_start_time
-
         if not self.alive.any():
-            print(f"Gen {self.gen_count} finished. Survived for {self.gen_ticks:,} ticks.")
+            print(f"Gen {self.gen_count} finished, survived for {self.gen_steps:,} steps.")
             self.gen_count += 1
             self.reset_env()
             return
@@ -340,6 +338,7 @@ class RLSimulation:
         self.optimize_model()
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
         self.steps_done += 1
+        self.gen_steps += 1
 
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
@@ -390,7 +389,7 @@ class RLSimulation:
             'eps': self.epsilon,
             'steps': self.steps_done,
             'gen': self.gen_count,
-            'gen_ticks': self.gen_ticks,
+            'gen_steps': self.gen_steps,
             'pos': self.pos,
             'last_actions': self.last_actions,
             'energy': self.energy,
@@ -415,7 +414,7 @@ class RLSimulation:
                 self.epsilon = state['eps']
                 self.steps_done = state['steps']
                 self.gen_count = state['gen']
-                self.gen_ticks = state['gen_ticks']
+                self.gen_steps = state['gen_steps']
                 self.pos = state['pos']
                 self.last_actions = state['last_actions']
                 self.energy = state['energy']
@@ -484,7 +483,7 @@ class RLSimulation:
         ui_labels = [
             (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
             (f"Steps: {self.steps_done:,}", (0, 255, 255), False),
-            (f"Generation: {self.gen_count} | {self.gen_ticks:,}", (200, 200, 200), False),
+            (f"Generation: {self.gen_count} | {self.gen_steps:,}", (200, 200, 200), False),
             (f"Actor Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
             (f"Critic Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
             (f"Alive: {int(self.alive.sum())}/{POP_SIZE}", (100, 255, 100), False)
