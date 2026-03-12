@@ -39,6 +39,7 @@ ENERGY_DECAY = 0.08
 ALERT_RADIUS = 100 # 定義警戒半徑
 
 # --- DDPG 網路架構 ---
+
 # --- Actor 網路：策略決策者 ---
 class Actor(nn.Module):
     def __init__(self):
@@ -75,6 +76,86 @@ class Actor(nn.Module):
         # 輸出最終動作
         return self.fc(combined)
 
+class ActorPlus(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv1d(6, 32, 1) 
+        # 維度：32(Max) + 32(Mean) + 3(Self) = 67
+        self.fc = nn.Sequential(
+            nn.Linear(67, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Tanh()
+        )
+
+    def forward(self, m_in, s_in):
+        feat = F.relu(self.conv(m_in)) # [Batch, 32, 5]
+        
+        # 關鍵差異：同時保留最強威脅與整體分佈
+        x_max = torch.max(feat, dim=2)[0]
+        x_avg = torch.mean(feat, dim=2)
+        
+        combined = torch.cat([x_max, x_avg, s_in], dim=1)
+        return self.fc(combined)
+    
+class ActorAttentionPooling(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv1d(6, 32, 1)
+        # 學習如何幫 5 個物體打分數
+        self.attn_weights = nn.Linear(32, 1) 
+        self.fc = nn.Sequential(
+            nn.Linear(32 + 3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Tanh()
+        )
+
+    def forward(self, m_in, s_in):
+        feat = F.relu(self.conv(m_in)) # [Batch, 32, 5]
+        feat = feat.transpose(1, 2)    # -> [Batch, 5, 32]
+        
+        # 計算每個物體的注意得分
+        weights = F.softmax(self.attn_weights(feat), dim=1) # [Batch, 5, 1]
+        # 加權總和：將 5 個物體融合成 1 個特徵向量
+        x_attn = torch.sum(feat * weights, dim=1)           # [Batch, 32]
+        
+        combined = torch.cat([x_attn, s_in], dim=1)
+        return self.fc(combined)
+    
+class ActorTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 將輸入 6 維映射到 Transformer 的維度 (例如 32)
+        self.embedding = nn.Linear(6, 32)
+        
+        # Transformer 層：專門處理物體間的關係
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=32, nhead=4, dim_feedforward=64, batch_first=True, dropout=0
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(32 + 3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Tanh()
+        )
+
+    def forward(self, m_in, s_in):
+        # m_in: [Batch, 6, 5] -> transpose -> [Batch, 5, 6]
+        x = m_in.transpose(1, 2)
+        x = self.embedding(x)               # [Batch, 5, 32]
+        
+        # 關鍵：Transformer 處理 5 個物體之間的包夾、距離、相對速度關係
+        x = self.transformer(x)             # [Batch, 5, 32]
+        
+        # 聚合所有物體的戰略資訊 (這裡用 Mean)
+        x_global = torch.mean(x, dim=1)     # [Batch, 32]
+        
+        combined = torch.cat([x_global, s_in], dim=1)
+        return self.fc(combined)
+    
 # --- Critic 網路：價值評估者 ---
 class Critic(nn.Module):
     def __init__(self):
@@ -141,14 +222,14 @@ class RLSimulation:
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.SCALED)
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Consolas", 16)
-        self.big_font = pygame.font.SysFont("Consolas", 20, bold=True)
+        self.font = pygame.font.SysFont("Consolas", 14)
+        self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
         self.fps = 240
         self.update_caption()
         
         # 初始化 DDPG 網路
-        self.actor = Actor().to(DEVICE)
-        self.actor_target = Actor().to(DEVICE)
+        self.actor = ActorAttentionPooling().to(DEVICE)
+        self.actor_target = ActorAttentionPooling().to(DEVICE)
         self.critic = Critic().to(DEVICE)
         self.critic_target = Critic().to(DEVICE)
         
@@ -161,11 +242,9 @@ class RLSimulation:
         self.memory = ReplayMemory(MEMORY_SIZE)
         self.ou_noise = OUNoise(2) # 2 個動作維度
         self.epsilon = EPSILON_START
-        self.steps_done = 0
+        self.steps = 0
         self.a_loss_val = 0.0
         self.c_loss_val = 0.0
-        self.gen_count = 1
-        
         self.reset_env()
         self.load_state()
 
@@ -173,16 +252,17 @@ class RLSimulation:
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
     def reset_env(self):
-        self.gen_steps = 0
-        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
-        self.pos = torch.rand(POP_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.vel = torch.zeros(POP_SIZE, 2).to(DEVICE)
-        self.angle = torch.rand(POP_SIZE).to(DEVICE) * 2 * np.pi
-        self.energy = torch.full((POP_SIZE,), MAX_ENERGY).to(DEVICE)
-        self.alive = torch.ones(POP_SIZE, dtype=torch.bool).to(DEVICE)
-        self.food_pos = torch.rand(FOOD_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.pred_pos = torch.rand(PREDATOR_SIZE, 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).float().to(DEVICE)
-        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2).to(DEVICE) - 0.5).to(DEVICE) * 3.5
+        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)   
+        self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
+        self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)        
+        self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
+        self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
+        self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
+        screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+        self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * screen_size
+        self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * screen_size
+        self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * screen_size
+        self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
     def get_states(self):
         dist_food = torch.cdist(self.pos, self.food_pos)
@@ -209,12 +289,6 @@ class RLSimulation:
         return (mixed_in, self_in)
 
     def update(self):
-        if not self.alive.any():
-            print(f"Gen {self.gen_count} finished, survived for {self.gen_steps:,} steps.")
-            self.gen_count += 1
-            self.reset_env()
-            return
-
         was_alive = self.alive.clone()
         current_states = self.get_states()
         
@@ -259,7 +333,8 @@ class RLSimulation:
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
 
-        self.energy -= ENERGY_DECAY
+        self.energy[self.alive] -= ENERGY_DECAY
+        self.respawn_timer[~self.alive] -= 1
 
         # 掠食者移動
         # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
@@ -319,12 +394,13 @@ class RLSimulation:
         starved = (self.energy <= 0) & self.alive        
         rewards[hits_p] -= 10  # 被殺死
         rewards[starved] -= -8 # 餓死
-        
+
         dead_mask = hits_p | starved
         if dead_mask.any():
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
-
+            self.respawn_timer[dead_mask] = torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
+        
         next_states = self.get_states()
         
         # 把經驗推入 Replay Buffer
@@ -336,9 +412,19 @@ class RLSimulation:
             self.memory.push(s_i, actions[i].unsqueeze(0), rewards[i].unsqueeze(0), ns_i, dead_mask[i].unsqueeze(0))
 
         self.optimize_model()
+
+        ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
+        if ready_to_respawn.any():
+            indices = torch.where(ready_to_respawn)[0]
+            for idx in indices:
+                safe_pos = self.get_safest_pos()
+                self.pos[idx] = safe_pos
+                self.alive[idx] = True
+                self.energy[idx] = MAX_ENERGY
+                self.vel[idx] = 0.0
+
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
-        self.steps_done += 1
-        self.gen_steps += 1
+        self.steps += 1
 
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
@@ -382,18 +468,27 @@ class RLSimulation:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
 
+    def get_safest_pos(self):
+        pad = 10.0
+        samples = torch.empty((5, 2), device=DEVICE)
+        samples[:, 0].uniform_(pad, SCREEN_W - pad)
+        samples[:, 1].uniform_(pad, SCREEN_H - pad)
+        dists = torch.cdist(samples, self.pred_pos)
+        min_dists = torch.min(dists, dim=1).values
+        best_idx = torch.argmax(min_dists)
+        return samples[best_idx]
+
     def save_state(self):
         torch.save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'eps': self.epsilon,
-            'steps': self.steps_done,
-            'gen': self.gen_count,
-            'gen_steps': self.gen_steps,
+            'steps': self.steps,
             'pos': self.pos,
             'last_actions': self.last_actions,
             'energy': self.energy,
             'alive': self.alive,
+            'respawn_timer': self.respawn_timer,
             'food_pos': self.food_pos,
             'pred_pos': self.pred_pos
         }, SAVE_PATH)
@@ -401,7 +496,7 @@ class RLSimulation:
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict()
         }, BRAIN_PATH)
-        print(f"--- [Saved] Progress to {SAVE_PATH} and {BRAIN_PATH} ---")
+        print(f"--- [Saved] Progress to {SAVE_PATH} and {BRAIN_PATH}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f} ---")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -412,16 +507,15 @@ class RLSimulation:
                 self.critic.load_state_dict(state['critic'])
                 self.critic_target.load_state_dict(self.critic.state_dict())
                 self.epsilon = state['eps']
-                self.steps_done = state['steps']
-                self.gen_count = state['gen']
-                self.gen_steps = state['gen_steps']
+                self.steps = state['steps']
                 self.pos = state['pos']
                 self.last_actions = state['last_actions']
                 self.energy = state['energy']
                 self.alive = state['alive']
+                self.respawn_timer = state['respawn_timer']
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
-                print(f"--- [Loaded] Gen {self.gen_count}, Steps {self.steps_done:,} ---")
+                print(f"--- [Loaded] Steps {self.steps:,} ---")
                 return
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
@@ -439,66 +533,63 @@ class RLSimulation:
                 print(f"--- [Error] Brain loading failed: {e} ---")
 
 
-    def draw(self, fps_only, draw_alert):
+    def draw(self, label_only, draw_alert):
         self.screen.fill((20, 20, 25))
 
-        if fps_only:
-            surf = self.big_font.render(f"FPS: {int(self.clock.get_fps())}", True, (255, 255, 255))
-            self.screen.blit(surf, (20, 20))
-            pygame.display.flip()
-            self.clock.tick(self.fps)
-            return
+        if not label_only:
+            for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
+            for p in self.pred_pos.cpu().numpy(): 
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 20, 1)
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 4)
 
-        for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
-        for p in self.pred_pos.cpu().numpy(): 
-            pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 20, 1)
-            pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 4)
+            p_np = self.pos.cpu().numpy()
+            a_np = self.alive.cpu().numpy()
+            e_np = self.energy.cpu().numpy()
+            t_np = self.respawn_timer.cpu().numpy()
 
-        p_np = self.pos.cpu().numpy()
-        a_np = self.alive.cpu().numpy()
-        e_np = self.energy.cpu().numpy()
-        
-        for i, p in enumerate(p_np):
-            if not a_np[i]:
-                dead_color = (60, 60, 60) if e_np[i] <= 0 else (120, 0, 0)
-                pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
-                continue
+            for i, p in enumerate(p_np):
+                if not a_np[i]:
+                    dead_color = (60, 60, 60) if e_np[i] <= 0 else (120, 0, 0)
+                    pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
+                    img = self.font.render(f"{t_np[i]:.0f}", True, dead_color)
+                    text_rect = img.get_rect(center=(int(p[0]), int(p[1]) - 15))
+                    self.screen.blit(img, text_rect)
+                    continue
 
-            pos_tuple = (int(p[0]), int(p[1]))
-            en_ratio = e_np[i] / MAX_ENERGY
-            r = int(255 * en_ratio)          # 越飽越紅
-            g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
-            b = int(255 * (1 - en_ratio))    # 越餓越藍
-            color = (r, g, b)
-            radius = int(4 + 4 * en_ratio)
-            pygame.draw.circle(self.screen, color, pos_tuple, radius)
+                pos_tuple = (int(p[0]), int(p[1]))
+                en_ratio = e_np[i] / MAX_ENERGY
+                r = int(255 * en_ratio)          # 越飽越紅
+                g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
+                b = int(255 * (1 - en_ratio))    # 越餓越藍
+                color = (r, g, b)
+                radius = int(4 + 4 * en_ratio)
+                pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
-            # --- 顯示能量數值 ---
-            energy_text = f"{e_np[i]:.0f}" 
-            text_surface = self.font.render(energy_text, True, (255, 255, 255)) # 白色文字
-            text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
-            self.screen.blit(text_surface, text_rect)
+                # --- 顯示能量數值 ---
+                energy_text = f"{e_np[i]:.0f}" 
+                text_surface = self.font.render(energy_text, True, (255, 255, 255)) # 白色文字
+                text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
+                self.screen.blit(text_surface, text_rect)
 
-            # 畫出方向指示線
-            angle = self.angle[i].cpu().item()
-            end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
-            pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
+                # 畫出方向指示線
+                angle = self.angle[i].cpu().item()
+                end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
+                pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
 
-            # 畫出警戒範圍
-            if draw_alert:
-                pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
+                # 畫出警戒範圍
+                if draw_alert:
+                    pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
 
         ui_labels = [
-            (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
-            (f"Steps: {self.steps_done:,}", (0, 255, 255), False),
-            (f"Generation: {self.gen_count} | {self.gen_steps:,}", (200, 200, 200), False),
-            (f"Actor Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
-            (f"Critic Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
+            (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), True),
+            (f"Steps: {self.steps:,}", (0, 255, 255), False),
+            (f"A-Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
+            (f"C-Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
             (f"Alive: {int(self.alive.sum())}/{POP_SIZE}", (100, 255, 100), False)
         ]
         for i, (text, color, bold) in enumerate(ui_labels):
             surf = (self.big_font if bold else self.font).render(text, True, color)
-            self.screen.blit(surf, (20, 20 + i*30))
+            self.screen.blit(surf, (10, 10 + i * 25))
 
         pygame.display.flip()
         self.clock.tick(self.fps)
@@ -508,7 +599,7 @@ class RLSimulation:
         draw_ui = True
         is_paused = False
         draw_alert = False
-        fps_only = False
+        label_only = False
 
         while running:
             for event in pygame.event.get():
@@ -521,8 +612,10 @@ class RLSimulation:
                         draw_ui = not draw_ui
                     elif event.key == pygame.K_a:
                         draw_alert = not draw_alert
-                    elif event.key == pygame.K_f:
-                        fps_only = not fps_only
+                    elif event.key == pygame.K_h:
+                        label_only = not label_only
+                    elif event.key == pygame.K_r:
+                        self.reset_env()
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
                     elif event.key == pygame.K_UP:
@@ -534,14 +627,14 @@ class RLSimulation:
 
             if not is_paused:
                 self.update()
-                if self.steps_done % 5000 == 0:
+                if self.steps % 5000 == 0:
                     self.save_state()
                 
             if draw_ui:
-                self.draw(fps_only, draw_alert)
+                self.draw(label_only, draw_alert)
             else:
-                if not is_paused and self.steps_done % 1000 == 0:
-                    print(f"Steps: {self.steps_done}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}")
+                if not is_paused and self.steps % 1000 == 0:
+                    print(f"Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}")
                     
         self.save_state()
         pygame.quit()
