@@ -496,7 +496,7 @@ class RLSimulation:
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict()
         }, BRAIN_PATH)
-        print(f"--- [Saved] Progress to {SAVE_PATH} and {BRAIN_PATH}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f} ---")
+        print(f"--- [Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f} ---")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
