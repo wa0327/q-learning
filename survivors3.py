@@ -25,19 +25,22 @@ EPSILON_END = 0.05
 EPSILON_DECAY = 0.9995
 OBSERVE_COUNT = 5
 
+# 物理參數設定
+FRICTION = 0.85      # 環境阻力 (0.95-0.98 之間，越高慣性越強)
+BRAKE_POWER = 0.5    # 剎車係數 (按下油門負值時的額外減速)
+
 # 環境參數
 POP_SIZE = 1
-FOOD_SIZE = 16
+FOOD_SIZE = 8
 PREDATOR_SIZE = 0
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
-ENERGY_DECAY = 0.033
+ENERGY_DECAY = 0.0
 PERCEPTION_RADIUS = 200 # 視野感知半徑
 ALERT_RADIUS = 100      # 敵方懲罰半徑
 TEAM_RADIUS = 20        # 友方懲罰半徑
 
 # --- DDPG 網路架構 ---
-
 # --- Actor 網路：策略決策者 ---
 class Actor(nn.Module):
     def __init__(self):
@@ -401,22 +404,27 @@ class RLSimulation:
         for i in range(POP_SIZE):
             if not self.alive[i]:
                 continue
-
+            
+            # 計算當前速度
             speed_val = torch.norm(self.vel[i])
 
-            # actions[0] 為轉向 (-1 到 1 映射至 -0.15 到 0.15 弧度)
-            # --- 動力學優化 ---
-            # 只有在有速度時，轉向才有效（模擬舵效或向心力）轉向力隨速度縮放
+            # 轉向優化：轉向影響「角度」，而非直接改變速度向量
+            # 舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
             steer_power = torch.clamp(speed_val / 2.0, 0, 1.0) 
-            steer = actions[i][0] * 0.20 * steer_power
-
-            # actions[1] 為油門 (-1 到 1 映射至 -0.1 到 0.3 加速度)
-            throttle = actions[i][1] * 0.1 + 0.2
-            
+            steer = actions[i][0] * 0.15 * steer_power
             self.angle[i] += steer
-            dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-            # 慣性與阻力：新速度 = 舊速度 * 摩擦係數 + 方向 * 油門加速度
-            self.vel[i] = (self.vel[i] * 0.85) + (dir_vec * throttle)
+
+            # 油門與剎車邏輯, 映射 actions[i][1] (-1 to 1) -> (-0.1 to 0.3)
+            throttle = actions[i][1] * 0.2 + 0.1
+            if throttle < 0:
+                self.vel[i] *= (FRICTION * BRAKE_POWER)
+            else:
+                self.vel[i] *= FRICTION
+                # 4. 向量動力學：計算前進方向推力
+                dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
+                self.vel[i] += dir_vec * throttle
+            
+            # 更新位置
             self.pos[i] += self.vel[i]
             
             # --- 精準進場獎勵 (解決繞圈問題) ---
