@@ -412,8 +412,6 @@ class RLSimulation:
         danger_mask = (min_dist_p < ALERT_RADIUS) & self.alive
         if danger_mask.any():
             # 懲罰函數：距離越近扣越多
-            # 當距離=22(碰撞邊緣)時，大約扣 0.4
-            # 當距離=100時，扣 0.1
             danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
             rewards[danger_mask] -= danger_penalty
 
