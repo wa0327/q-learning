@@ -12,10 +12,8 @@ script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-POP_SIZE = 16
 SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
-BRAIN_PATH = f"{script_name}_brain.pt"
 
 # DDPG 核心參數
 GAMMA = 0.98
@@ -30,14 +28,15 @@ EPSILON_DECAY = 0.9995
 OBSERVE_COUNT = 5
 
 # 環境參數
+POP_SIZE = 16
 FOOD_SIZE = POP_SIZE
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
-ENERGY_DECAY = 0.025
-PERCEPTION_RADIUS = 200 # 視野半徑
-ALERT_RADIUS = 100 # 警戒半徑
-TEAM_RADIUS = 50 # 隊友保持半徑
+ENERGY_DECAY = 0.033
+PERCEPTION_RADIUS = 200 # 視野感知半徑
+ALERT_RADIUS = 100      # 敵方懲罰半徑
+TEAM_RADIUS = 50        # 友方懲罰半徑
 
 # --- DDPG 網路架構 ---
 
@@ -265,12 +264,11 @@ class RLSimulation:
         # 初始化 DDPG 網路
         self.actor = ActorAttentionPooling().to(DEVICE)
         self.actor_target = ActorAttentionPooling().to(DEVICE)
+        self.brain_path = f"{self.actor.__class__.__name__}.pt"
         self.critic = Critic().to(DEVICE)
         self.critic_target = Critic().to(DEVICE)
-        
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
-        
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
@@ -302,6 +300,40 @@ class RLSimulation:
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
+    def reset_weights(self):
+        @torch.no_grad()
+        def init_weights(m):
+            # 1. 處理線性層 (Linear) 和 卷積層 (Conv1d)
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                # 使用 Xavier 初始化，這對 ReLU 和 Tanh 混合的網路效果很好
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            
+            # 2. 針對 Transformer 內部的 LayerNorm 做特殊處理（如果有用到）
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+                
+            # 3. 針對 Transformer 內部的 Embedding（如果你之後有用到 nn.Embedding）
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=0.02)
+
+        # 執行重置
+        self.actor.apply(init_weights)
+        self.critic.apply(init_weights)
+        
+        # 同步 Target Networks (這步非常重要，否則 Target 會停在舊權重)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        
+        # 徹底重置優化器 (Optimizer)
+        # 必須重新建立，因為 Adam 內部的 exp_avg (動量) 必須歸零
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
+
+        print(f"[{self.actor.__class__.__name__}] Network & Optimizer Reset complete.")
+        
     def get_states(self):
         # 取得視野內的食物
         dist_food = torch.cdist(self.pos, self.food_pos)
@@ -314,15 +346,22 @@ class RLSimulation:
         food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=1) * food_mask
 
         # 取得視野內的威脅
-        dist_pred = torch.cdist(self.pos, self.pred_pos)
-        val_p, p_idx = torch.topk(dist_pred, OBSERVE_COUNT, largest=False)
-        p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
-        p_dist = torch.norm(p_diff, dim=2)
-        p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
-        pred_threat = 100.0 / ((p_dist / 10.0)**2 + 1)
-        pred_mask = (val_p < PERCEPTION_RADIUS).unsqueeze(1)
-        pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=1) * pred_mask
-        
+        if self.pred_pos.shape[0] > 0:
+            dist_pred = torch.cdist(self.pos, self.pred_pos)
+            k = min(OBSERVE_COUNT, self.pred_pos.shape[0])
+            val_p, p_idx = torch.topk(dist_pred, k, largest=False)
+            p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
+            p_dist = torch.norm(p_diff, dim=2)
+            p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
+            pred_threat = 100.0 / ((p_dist / 10.0)**2 + 1)
+            pred_mask = (val_p < PERCEPTION_RADIUS).unsqueeze(1)
+            pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=1) * pred_mask
+            if k < OBSERVE_COUNT:
+                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k), device=DEVICE)
+                pred_in = torch.cat([pred_in, padding], dim=2)
+        else:
+            pred_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
+
         # 取得視野內的隊友
         dist_agents = torch.cdist(self.pos, self.pos)
         dist_agents.fill_diagonal_(999.0) # 排除自己
@@ -392,36 +431,39 @@ class RLSimulation:
         self.respawn_timer[~self.alive] -= 1
 
         # 掠食者移動
-        # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
-        change_mask = torch.rand(PREDATOR_SIZE, device=DEVICE) < 0.05
-        if change_mask.any():
-            # 產生隨機加速度擾動
-            random_noise = (torch.rand(int(change_mask.sum()), 2, device=DEVICE) - 0.5) * 1.8
-            self.pred_vel[change_mask] += random_noise
-            
-            # 重新標準化速度，確保掠食者不會無限加速或停下
-            speeds = torch.norm(self.pred_vel, dim=1, keepdim=True)
-            target_speeds = torch.clamp(speeds, 1.5, 3.5)
-            self.pred_vel = (self.pred_vel / (speeds + 1e-6)) * target_speeds
-        # 2. 根據速度更新位置
-        self.pred_pos += self.pred_vel
-        # 3. 強力邊界反彈與座標修正 (防止掠食者卡在牆外)
-        hit_left   = self.pred_pos[:, 0] < 0
-        hit_right  = self.pred_pos[:, 0] > SCREEN_W
-        hit_top    = self.pred_pos[:, 1] < 0
-        hit_bottom = self.pred_pos[:, 1] > SCREEN_H
-        if hit_left.any():
-            self.pred_vel[hit_left, 0] *= -1.0
-            self.pred_pos[hit_left, 0] = 1.0
-        if hit_right.any():
-            self.pred_vel[hit_right, 0] *= -1.0
-            self.pred_pos[hit_right, 0] = SCREEN_W - 1.0
-        if hit_top.any():
-            self.pred_vel[hit_top, 1] *= -1.0
-            self.pred_pos[hit_top, 1] = 1.0
-        if hit_bottom.any():
-            self.pred_vel[hit_bottom, 1] *= -1.0
-            self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
+        if PREDATOR_SIZE > 0:
+            # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
+            num_preds = self.pred_pos.shape[0]
+            change_mask = torch.rand(num_preds, device=DEVICE) < 0.05
+            if change_mask.any():
+                # 產生隨機加速度擾動
+                random_noise = (torch.rand(int(change_mask.sum()), 2, device=DEVICE) - 0.5) * 1.8
+                self.pred_vel[change_mask] += random_noise
+                
+                # 重新標準化速度，確保掠食者不會無限加速或停下
+                speeds = torch.norm(self.pred_vel, dim=1, keepdim=True)
+                target_speeds = torch.clamp(speeds, 1.5, 3.5)
+                self.pred_vel = (self.pred_vel / (speeds + 1e-6)) * target_speeds
+
+            # 2. 根據速度更新位置
+            self.pred_pos += self.pred_vel
+            # 3. 強力邊界反彈與座標修正 (防止掠食者卡在牆外)
+            hit_left   = self.pred_pos[:, 0] < 0
+            hit_right  = self.pred_pos[:, 0] > SCREEN_W
+            hit_top    = self.pred_pos[:, 1] < 0
+            hit_bottom = self.pred_pos[:, 1] > SCREEN_H
+            if hit_left.any():
+                self.pred_vel[hit_left, 0] *= -1.0
+                self.pred_pos[hit_left, 0] = 1.0
+            if hit_right.any():
+                self.pred_vel[hit_right, 0] *= -1.0
+                self.pred_pos[hit_right, 0] = SCREEN_W - 1.0
+            if hit_top.any():
+                self.pred_vel[hit_top, 1] *= -1.0
+                self.pred_pos[hit_top, 1] = 1.0
+            if hit_bottom.any():
+                self.pred_vel[hit_bottom, 1] *= -1.0
+                self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
 
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
@@ -463,19 +505,22 @@ class RLSimulation:
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2, device=DEVICE) * self.screen_size
             
         # 掠食者碰撞
-        dist_p = torch.cdist(self.pos, self.pred_pos)
-        min_dist_p, _ = torch.min(dist_p, dim=1)
-        # 只有還活著且進入警戒區的才扣分
-        danger_mask = (min_dist_p < ALERT_RADIUS) & self.alive
-        if danger_mask.any():
-            # 懲罰函數：距離越近扣越多
-            danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
-            rewards[danger_mask] -= danger_penalty
+        if PREDATOR_SIZE > 0:
+            dist_p = torch.cdist(self.pos, self.pred_pos)
+            min_dist_p, _ = torch.min(dist_p, dim=1)
+            # 只有還活著且進入警戒區的才扣分
+            danger_mask = (min_dist_p < ALERT_RADIUS) & self.alive
+            if danger_mask.any():
+                # 懲罰函數：距離越近扣越多
+                danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
+                rewards[danger_mask] -= danger_penalty
 
-        # 區分死因的獎勵邏輯
-        hits_p = (dist_p < 22.0).any(dim=1) & self.alive
+            hits_p = (dist_p < 22.0).any(dim=1) & self.alive
+            rewards[hits_p] -= 10  # 被殺死
+        else:
+            hits_p = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
+
         starved = (self.energy <= 0) & self.alive
-        rewards[hits_p] -= 10  # 被殺死
         rewards[starved] -= -8 # 餓死
 
         dead_mask = hits_p | starved
@@ -500,7 +545,7 @@ class RLSimulation:
                 dead_mask[i]
             )
 
-        if self.steps % 5 == 0:
+        if self.steps % 2 == 0:
             self.optimize_model()
 
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
@@ -559,15 +604,17 @@ class RLSimulation:
         samples = torch.empty((5, 2), device=DEVICE)
         samples[:, 0].uniform_(pad, SCREEN_W - pad)
         samples[:, 1].uniform_(pad, SCREEN_H - pad)
-        dists = torch.cdist(samples, self.pred_pos)
-        min_dists = torch.min(dists, dim=1).values
-        best_idx = torch.argmax(min_dists)
-        return samples[best_idx]
+
+        if PREDATOR_SIZE > 0:
+            dists = torch.cdist(samples, self.pred_pos)
+            min_dists = torch.min(dists, dim=1).values
+            best_idx = torch.argmax(min_dists)
+            return samples[best_idx]
+        else:
+            return samples[0]
 
     def save_state(self):
         torch.save({
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
             'eps': self.epsilon,
             'steps': self.steps,
             'pos': self.pos,
@@ -584,17 +631,13 @@ class RLSimulation:
         torch.save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict()
-        }, BRAIN_PATH)
+        }, self.brain_path)
         print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.dead}, Starved: {self.starved}.")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
-                self.actor.load_state_dict(state['actor'])
-                self.actor_target.load_state_dict(self.actor.state_dict())
-                self.critic.load_state_dict(state['critic'])
-                self.critic_target.load_state_dict(self.critic.state_dict())
                 self.epsilon = state['eps']
                 self.steps = state['steps']
                 self.pos = state['pos']
@@ -608,18 +651,17 @@ class RLSimulation:
                 self.dead = state['dead']
                 self.starved = state['starved']
                 print(f"--- [Loaded] Steps {self.steps:,} ---")
-                return
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
 
-        if os.path.exists(BRAIN_PATH):
+        if os.path.exists(self.brain_path):
             try:
-                brain_state = torch.load(BRAIN_PATH, map_location=DEVICE)
+                brain_state = torch.load(self.brain_path, map_location=DEVICE)
                 self.actor.load_state_dict(brain_state['actor'])
                 self.actor_target.load_state_dict(self.actor.state_dict())
                 self.critic.load_state_dict(brain_state['critic'])
                 self.critic_target.load_state_dict(self.critic.state_dict())
-                print(f"--- [Loaded] Brain weights only. Experience transfered. ---")
+                print(f"--- [Loaded] Brain weights {self.brain_path} ---")
                 return True
             except Exception as e:
                 print(f"--- [Error] Brain loading failed: {e} ---")
@@ -714,6 +756,13 @@ class RLSimulation:
                         self.update_caption()
                     elif event.key == pygame.K_r:
                         self.reset_env()
+                    # 檢查 大寫 R (Shift + R)
+                    if event.key == pygame.K_r and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                        self.reset_weights()
+                        self.steps = 0
+                        self.rewards = 0.0
+                        self.dead = 0
+                        self.starved = 0
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
                     elif event.key == pygame.K_h:
