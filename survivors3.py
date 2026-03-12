@@ -245,6 +245,9 @@ class RLSimulation:
         self.steps = 0
         self.a_loss_val = 0.0
         self.c_loss_val = 0.0
+        self.rewards = 0.0
+        self.dead = 0
+        self.starved = 0
         self.reset_env()
         self.load_state()
 
@@ -391,7 +394,7 @@ class RLSimulation:
 
         # 區分死因的獎勵邏輯
         hits_p = (dist_p < 22.0).any(dim=1) & self.alive
-        starved = (self.energy <= 0) & self.alive        
+        starved = (self.energy <= 0) & self.alive
         rewards[hits_p] -= 10  # 被殺死
         rewards[starved] -= -8 # 餓死
 
@@ -425,6 +428,9 @@ class RLSimulation:
 
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
         self.steps += 1
+        self.rewards = self.rewards * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
+        self.dead += hits_p.sum().item()
+        self.starved += starved.sum().item()
 
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
@@ -490,13 +496,16 @@ class RLSimulation:
             'alive': self.alive,
             'respawn_timer': self.respawn_timer,
             'food_pos': self.food_pos,
-            'pred_pos': self.pred_pos
+            'pred_pos': self.pred_pos,
+            'rewards': self.rewards,
+            'dead': self.dead,
+            'starved': self.starved
         }, SAVE_PATH)
         torch.save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict()
         }, BRAIN_PATH)
-        print(f"--- [Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f} ---")
+        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.dead}, Starved: {self.starved}.")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -515,6 +524,9 @@ class RLSimulation:
                 self.respawn_timer = state['respawn_timer']
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
+                self.rewards = state['rewards']
+                self.dead = state['dead']
+                self.starved = state['starved']
                 print(f"--- [Loaded] Steps {self.steps:,} ---")
                 return
             except Exception as e:
@@ -585,6 +597,9 @@ class RLSimulation:
             (f"Steps: {self.steps:,}", (0, 255, 255), False),
             (f"A-Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
             (f"C-Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
+            (f"Rewards: {self.rewards:.3f}", (255, 100, 100), False),
+            (f"Dead: {self.dead}", (255, 100, 100), False),
+            (f"Starved: {self.starved}", (255, 100, 100), False),
             (f"Alive: {int(self.alive.sum())}/{POP_SIZE}", (100, 255, 100), False)
         ]
         for i, (text, color, bold) in enumerate(ui_labels):
@@ -596,7 +611,6 @@ class RLSimulation:
 
     def run(self):
         running = True
-        draw_ui = True
         is_paused = False
         draw_alert = False
         label_only = False
@@ -608,8 +622,6 @@ class RLSimulation:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_t:
-                        draw_ui = not draw_ui
                     elif event.key == pygame.K_a:
                         draw_alert = not draw_alert
                     elif event.key == pygame.K_h:
@@ -629,13 +641,12 @@ class RLSimulation:
                 self.update()
                 if self.steps % 5000 == 0:
                     self.save_state()
-                
-            if draw_ui:
-                self.draw(label_only, draw_alert)
-            else:
-                if not is_paused and self.steps % 1000 == 0:
-                    print(f"Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}")
-                    
+
+            self.draw(label_only, draw_alert)
+
+            if self.steps == 50000:
+                running = False
+
         self.save_state()
         pygame.quit()
 
