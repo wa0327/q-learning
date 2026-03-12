@@ -439,8 +439,16 @@ class RLSimulation:
                 print(f"--- [Error] Brain loading failed: {e} ---")
 
 
-    def draw(self, draw_alert):
+    def draw(self, fps_only, draw_alert):
         self.screen.fill((20, 20, 25))
+
+        if fps_only:
+            surf = self.big_font.render(f"FPS: {int(self.clock.get_fps())}", True, (255, 255, 255))
+            self.screen.blit(surf, (20, 20))
+            pygame.display.flip()
+            self.clock.tick(self.fps)
+            return
+
         for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
         for p in self.pred_pos.cpu().numpy(): 
             pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 20, 1)
@@ -491,6 +499,7 @@ class RLSimulation:
         for i, (text, color, bold) in enumerate(ui_labels):
             surf = (self.big_font if bold else self.font).render(text, True, color)
             self.screen.blit(surf, (20, 20 + i*30))
+
         pygame.display.flip()
         self.clock.tick(self.fps)
 
@@ -499,6 +508,7 @@ class RLSimulation:
         draw_ui = True
         is_paused = False
         draw_alert = False
+        fps_only = False
 
         while running:
             for event in pygame.event.get():
@@ -511,6 +521,8 @@ class RLSimulation:
                         draw_ui = not draw_ui
                     elif event.key == pygame.K_a:
                         draw_alert = not draw_alert
+                    elif event.key == pygame.K_f:
+                        fps_only = not fps_only
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
                     elif event.key == pygame.K_UP:
@@ -526,7 +538,7 @@ class RLSimulation:
                     self.save_state()
                 
             if draw_ui:
-                self.draw(draw_alert)
+                self.draw(fps_only, draw_alert)
             else:
                 if not is_paused and self.steps_done % 1000 == 0:
                     print(f"Steps: {self.steps_done}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}")
