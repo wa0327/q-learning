@@ -36,7 +36,7 @@ FOOD_ENERGY = 5.0
 ENERGY_DECAY = 0.033
 PERCEPTION_RADIUS = 200 # 視野感知半徑
 ALERT_RADIUS = 100      # 敵方懲罰半徑
-TEAM_RADIUS = 50        # 友方懲罰半徑
+TEAM_RADIUS = 20        # 友方懲罰半徑
 
 # --- DDPG 網路架構 ---
 
@@ -262,15 +262,8 @@ class RLSimulation:
         self.update_caption()
         
         # 初始化 DDPG 網路
-        self.actor = ActorAttentionPooling().to(DEVICE)
-        self.actor_target = ActorAttentionPooling().to(DEVICE)
+        self.init_network(ActorTransformer, Critic)
         self.brain_path = f"{self.actor.__class__.__name__}.pt"
-        self.critic = Critic().to(DEVICE)
-        self.critic_target = Critic().to(DEVICE)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
         self.memory = ReplayMemory(MEMORY_SIZE)
         self.ou_noise = OUNoise(2) # 2 個動作維度
@@ -287,6 +280,23 @@ class RLSimulation:
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
+    def init_network(self, actor=None, critic=None):
+        if actor is None:
+            actor = self.actor.__class__
+        if critic is None:
+            critic = self.critic.__class__
+        self.actor = actor().to(DEVICE)
+        self.actor_target = actor().to(DEVICE)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
+
+        self.critic = critic().to(DEVICE)
+        self.critic_target = critic().to(DEVICE)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
+
+        print(f"[{self.actor.__class__.__name__}] Network & Optimizer init complete.")
+        
     def reset_env(self):
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)   
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
@@ -300,40 +310,6 @@ class RLSimulation:
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
-    def reset_weights(self):
-        @torch.no_grad()
-        def init_weights(m):
-            # 1. 處理線性層 (Linear) 和 卷積層 (Conv1d)
-            if isinstance(m, (nn.Linear, nn.Conv1d)):
-                # 使用 Xavier 初始化，這對 ReLU 和 Tanh 混合的網路效果很好
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            
-            # 2. 針對 Transformer 內部的 LayerNorm 做特殊處理（如果有用到）
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-                
-            # 3. 針對 Transformer 內部的 Embedding（如果你之後有用到 nn.Embedding）
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0, std=0.02)
-
-        # 執行重置
-        self.actor.apply(init_weights)
-        self.critic.apply(init_weights)
-        
-        # 同步 Target Networks (這步非常重要，否則 Target 會停在舊權重)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        
-        # 徹底重置優化器 (Optimizer)
-        # 必須重新建立，因為 Adam 內部的 exp_avg (動量) 必須歸零
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
-
-        print(f"[{self.actor.__class__.__name__}] Network & Optimizer Reset complete.")
-        
     def get_states(self):
         # 取得視野內的食物
         dist_food = torch.cdist(self.pos, self.food_pos)
@@ -615,8 +591,6 @@ class RLSimulation:
 
     def save_state(self):
         torch.save({
-            'eps': self.epsilon,
-            'steps': self.steps,
             'pos': self.pos,
             'last_actions': self.last_actions,
             'energy': self.energy,
@@ -630,7 +604,9 @@ class RLSimulation:
         }, SAVE_PATH)
         torch.save({
             'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict()
+            'critic': self.critic.state_dict(),
+            'steps': self.steps,
+            'eps': self.epsilon
         }, self.brain_path)
         print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.dead}, Starved: {self.starved}.")
 
@@ -638,8 +614,6 @@ class RLSimulation:
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
-                self.epsilon = state['eps']
-                self.steps = state['steps']
                 self.pos = state['pos']
                 self.last_actions = state['last_actions']
                 self.energy = state['energy']
@@ -650,7 +624,7 @@ class RLSimulation:
                 self.rewards = state['rewards']
                 self.dead = state['dead']
                 self.starved = state['starved']
-                print(f"--- [Loaded] Steps {self.steps:,} ---")
+                print(f"--- [Loaded] Load completed ---")
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
 
@@ -661,10 +635,12 @@ class RLSimulation:
                 self.actor_target.load_state_dict(self.actor.state_dict())
                 self.critic.load_state_dict(brain_state['critic'])
                 self.critic_target.load_state_dict(self.critic.state_dict())
-                print(f"--- [Loaded] Brain weights {self.brain_path} ---")
+                self.steps = brain_state['steps']
+                self.epsilon = brain_state['eps']
+                print(f"--- [Loaded] brain weights {self.brain_path}, steps {self.steps:,} ---")
                 return True
             except Exception as e:
-                print(f"--- [Error] Brain loading failed: {e} ---")
+                print(f"--- [Error] brain weights loading failed: {e} ---")
 
 
     def draw(self, label_only, draw_perception, draw_alert):
@@ -716,6 +692,7 @@ class RLSimulation:
                 # 畫出警戒範圍
                 if draw_alert:
                     pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
+                    pygame.draw.circle(self.screen, color, pos_tuple, TEAM_RADIUS, 1)
 
         ui_labels = [
             (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), True),
@@ -758,7 +735,7 @@ class RLSimulation:
                         self.reset_env()
                     # 檢查 大寫 R (Shift + R)
                     if event.key == pygame.K_r and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
-                        self.reset_weights()
+                        self.init_network()
                         self.steps = 0
                         self.rewards = 0.0
                         self.dead = 0
