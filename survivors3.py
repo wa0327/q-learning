@@ -31,11 +31,11 @@ DIST_FOOD = 5
 DIST_PRED = 5
 
 # 環境參數
-FOOD_SIZE = POP_SIZE * 2
+FOOD_SIZE = POP_SIZE
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
-ENERGY_DECAY = 0.08
+ENERGY_DECAY = 0.05
 ALERT_RADIUS = 100 # 定義警戒半徑
 
 # --- DDPG 網路架構 ---
@@ -261,10 +261,10 @@ class RLSimulation:
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
-        screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
-        self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * screen_size
-        self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * screen_size
-        self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * screen_size
+        self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+        self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
+        self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * self.screen_size
+        self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
     def get_states(self):
@@ -305,7 +305,7 @@ class RLSimulation:
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
             
-        rewards = torch.full((POP_SIZE,), 0.05, device=DEVICE) # 給予微小存活獎勵
+        rewards = torch.full((POP_SIZE,), 0.01, device=DEVICE) # 給予微小存活獎勵
         
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -327,6 +327,8 @@ class RLSimulation:
             speed_val = torch.norm(self.vel[i])
             if speed_val > 0.5:
                 rewards[i] += 0.05
+            else:
+                rewards[i] -= 0.05
 
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] < 0) | (self.pos[:, 0] > SCREEN_W)
@@ -373,13 +375,36 @@ class RLSimulation:
 
         # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
-        hits_f = (dist_f < 15.0) & self.alive.unsqueeze(1)
+        hits_f = (dist_f < 10.0) & self.alive.unsqueeze(1)
         if hits_f.any():
-            a_idx, f_idx = torch.where(hits_f)
-            rewards[a_idx] += 5.0
-            self.energy[a_idx] = torch.clamp(self.energy[a_idx] + FOOD_ENERGY, max=MAX_ENERGY)
-            self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
-
+            # 1. 建立遮罩距離矩陣：把「沒碰到」或「已死亡」的距離變成無限大 (inf)
+            masked_dist = torch.where(hits_f, dist_f, torch.tensor(float('inf'), device=DEVICE))
+            
+            # 2. 沿著 Agent 維度 (dim=0) 找最小值
+            # min_dists: 每個食物被碰到的最短距離 (沒被碰到的會是 inf)
+            # closest_a_idx: 每個食物對應距離最近的 Agent 索引
+            min_dists, closest_a_idx = torch.min(masked_dist, dim=0)
+            
+            # 3. 過濾出「真正有被吃到」的食物 (距離不是 inf 的)
+            valid_eaten_mask = min_dists != float('inf')
+            
+            # 取出最終要結算的 食物索引 與 Agent 索引
+            f_idx = torch.where(valid_eaten_mask)[0] 
+            a_idx = closest_a_idx[valid_eaten_mask]
+            
+            # 4. 處理獎勵與能量 (安全累加)
+            # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
+            reward_increment = torch.full((len(a_idx),), 5.0, device=DEVICE)
+            rewards.index_add_(0, a_idx, reward_increment)
+            energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
+            self.energy.index_add_(0, a_idx, energy_increment)
+            self.energy = torch.clamp(self.energy, max=MAX_ENERGY)
+            
+            # 5. 重生食物
+            # 注意：這裡的 f_idx 保證是不重複的 (因為每個食物只會選出一個最近的 Agent)
+            # 所以直接用 f_idx 即可，不需要再做 unique
+            self.food_pos[f_idx] = torch.rand(len(f_idx), 2, device=DEVICE) * self.screen_size
+            
         # 掠食者碰撞
         dist_p = torch.cdist(self.pos, self.pred_pos)
         min_dist_p, _ = torch.min(dist_p, dim=1)
@@ -389,7 +414,7 @@ class RLSimulation:
             # 懲罰函數：距離越近扣越多
             # 當距離=22(碰撞邊緣)時，大約扣 0.4
             # 當距離=100時，扣 0.1
-            danger_penalty = 0.5 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
+            danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
             rewards[danger_mask] -= danger_penalty
 
         # 區分死因的獎勵邏輯
@@ -643,9 +668,6 @@ class RLSimulation:
                     self.save_state()
 
             self.draw(label_only, draw_alert)
-
-            if self.steps == 50000:
-                running = False
 
         self.save_state()
         pygame.quit()
