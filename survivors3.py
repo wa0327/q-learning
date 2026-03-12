@@ -27,26 +27,25 @@ BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY = 0.9995
-DIST_FOOD = 5
-DIST_PRED = 5
+OBSERVE_COUNT = 5
 
 # 環境參數
 FOOD_SIZE = POP_SIZE
 PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
-ENERGY_DECAY = 0.05
-ALERT_RADIUS = 100 # 定義警戒半徑
+ENERGY_DECAY = 0.025
+PERCEPTION_RADIUS = 200 # 視野半徑
+ALERT_RADIUS = 100 # 警戒半徑
+TEAM_RADIUS = 50 # 隊友保持半徑
 
 # --- DDPG 網路架構 ---
 
 # --- Actor 網路：策略決策者 ---
 class Actor(nn.Module):
     def __init__(self):
-        super(Actor, self).__init__()# 6 個輸入通道：
-        # [0:2] 食物角度(cos, sin), [2] 食物距離
-        # [3:5] 掠食者角度(cos, sin), [5] 掠食者威脅度
-        self.conv = nn.Conv1d(6, 32, 1) 
+        super(Actor, self).__init__()
+        self.conv = nn.Conv1d(9, 32, 1) 
         self.fc = nn.Sequential(
             # 32 (卷積特徵) + 3 (自身狀態: 速度, 0, 能量) = 35
             nn.Linear(35, 64),
@@ -60,9 +59,8 @@ class Actor(nn.Module):
     def forward(self, m_in, s_in):
         """
         輸入:
-        m_in: Tensor [Batch, 6, 5] -> 6個特徵，探測周圍最近的 5 個物體，這裡的 '5' 指的是 DIST_FOOD (5個) 與 DIST_PRED (5個) 對齊後的物體槽位
+        m_in: Tensor [Batch, 9, 5] -> 9個特徵，探測周圍最近的 OBSERVE_COUNT 個物體
         s_in: Tensor [Batch, 3]    -> 自身狀態 (Speed, Constant_0, Energy)
-        
         輸出:
         actions: Tensor [Batch, 2] -> 每個 Agent 的 [轉向, 加速] 連續值
         """
@@ -79,7 +77,7 @@ class Actor(nn.Module):
 class ActorPlus(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = nn.Conv1d(6, 32, 1) 
+        self.conv = nn.Conv1d(9, 32, 1) 
         # 維度：32(Max) + 32(Mean) + 3(Self) = 67
         self.fc = nn.Sequential(
             nn.Linear(67, 64),
@@ -101,7 +99,7 @@ class ActorPlus(nn.Module):
 class ActorAttentionPooling(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = nn.Conv1d(6, 32, 1)
+        self.conv = nn.Conv1d(9, 32, 1)
         # 學習如何幫 5 個物體打分數
         self.attn_weights = nn.Linear(32, 1) 
         self.fc = nn.Sequential(
@@ -117,7 +115,7 @@ class ActorAttentionPooling(nn.Module):
         
         # 計算每個物體的注意得分
         weights = F.softmax(self.attn_weights(feat), dim=1) # [Batch, 5, 1]
-        # 加權總和：將 5 個物體融合成 1 個特徵向量
+        # 加權總和：將所有物體融合成 1 個全局特徵向量
         x_attn = torch.sum(feat * weights, dim=1)           # [Batch, 32]
         
         combined = torch.cat([x_attn, s_in], dim=1)
@@ -127,7 +125,7 @@ class ActorTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         # 將輸入 6 維映射到 Transformer 的維度 (例如 32)
-        self.embedding = nn.Linear(6, 32)
+        self.embedding = nn.Linear(9, 32)
         
         # Transformer 層：專門處理物體間的關係
         encoder_layer = nn.TransformerEncoderLayer(
@@ -143,7 +141,7 @@ class ActorTransformer(nn.Module):
         )
 
     def forward(self, m_in, s_in):
-        # m_in: [Batch, 6, 5] -> transpose -> [Batch, 5, 6]
+        # m_in: [Batch, 9, 5] -> transpose -> [Batch, 5, 9]
         x = m_in.transpose(1, 2)
         x = self.embedding(x)               # [Batch, 5, 32]
         
@@ -160,7 +158,7 @@ class ActorTransformer(nn.Module):
 class Critic(nn.Module):
     def __init__(self):
         super(Critic, self).__init__()
-        self.conv = nn.Conv1d(6, 32, 1)
+        self.conv = nn.Conv1d(9, 32, 1)
         self.fc = nn.Sequential(
             # 32 (感應特徵) + 3 (自身狀態) + 2 (動作) = 37
             nn.Linear(35 + 2, 64), 
@@ -173,7 +171,7 @@ class Critic(nn.Module):
     def forward(self, m_in, s_in, action):
         """
         輸入:
-        m_in: Tensor [Batch, 6, 5]
+        m_in: Tensor [Batch, 9, 5]
         s_in: Tensor [Batch, 3]
         action: Tensor [Batch, 2] -> 來自 Actor 預測或 Memory 紀錄的動作
         
@@ -191,12 +189,49 @@ class Critic(nn.Module):
     
 class ReplayMemory:
     def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-    def push(self, s, a, r, ns, d):
-        self.buffer.append((s, a, r, ns, d))
+        self.capacity = capacity
+        # 預分配空間 (根據你的 Actor 輸入維度)
+        # s1: mixed_in [6, 5], s2: self_in [3]
+        self.m_states = np.zeros((capacity, 9, 5), dtype=np.float32)
+        self.s_states = np.zeros((capacity, 3), dtype=np.float32)
+        self.next_m_states = np.zeros((capacity, 9, 5), dtype=np.float32)
+        self.next_s_states = np.zeros((capacity, 3), dtype=np.float32)
+        self.actions = np.zeros((capacity, 2), dtype=np.float32)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        
+        self.idx = 0
+        self.size = 0
+
+    def push(self, m_s, s_s, action, reward, n_m_s, n_s_s, done):
+        # 存入時強制轉為 CPU 上的 NumPy 陣列，切斷梯度
+        self.m_states[self.idx] = m_s.detach().cpu().numpy()
+        self.s_states[self.idx] = s_s.detach().cpu().numpy()
+        self.next_m_states[self.idx] = n_m_s.detach().cpu().numpy()
+        self.next_s_states[self.idx] = n_s_s.detach().cpu().numpy()
+        self.actions[self.idx] = action.detach().cpu().numpy()
+        self.rewards[self.idx] = reward.item()
+        self.dones[self.idx] = done.item()
+        
+        self.idx = (self.idx + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
     def sample(self, batch_size):
-        return random.sample(self.buffer, batch_size)
-    def __len__(self): return len(self.buffer)
+        indices = np.random.randint(0, self.size, size=batch_size)
+        
+        # 轉回 Torch Tensor 並送往 GPU (一次性處理一個 Batch，效率最高)
+        return (
+            torch.from_numpy(self.m_states[indices]).to(DEVICE),
+            torch.from_numpy(self.s_states[indices]).to(DEVICE),
+            torch.from_numpy(self.actions[indices]).to(DEVICE),
+            torch.from_numpy(self.rewards[indices]).to(DEVICE),
+            torch.from_numpy(self.next_m_states[indices]).to(DEVICE),
+            torch.from_numpy(self.next_s_states[indices]).to(DEVICE),
+            torch.from_numpy(self.dones[indices]).to(DEVICE)
+        )
+
+    def __len__(self):
+        return self.size
 
 class OUNoise:
     def __init__(self, action_dimension, mu=0, theta=0.15, sigma=0.2):
@@ -268,23 +303,38 @@ class RLSimulation:
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
     def get_states(self):
+        # 取得視野內的食物
         dist_food = torch.cdist(self.pos, self.food_pos)
-        dist_pred = torch.cdist(self.pos, self.pred_pos)
-        _, f_idx = torch.topk(dist_food, DIST_FOOD, largest=False)
-        _, p_idx = torch.topk(dist_pred, DIST_PRED, largest=False)
-
+        val_f, f_idx = torch.topk(dist_food, OBSERVE_COUNT, largest=False)
         f_diff = self.food_pos[f_idx] - self.pos.unsqueeze(1)
         f_dist = torch.norm(f_diff, dim=2)
         f_ang = torch.atan2(f_diff[:,:,1], f_diff[:,:,0]) - self.angle.unsqueeze(1)
-        food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), f_dist/1000.0], dim=1)
+        food_dist = f_dist/1000.0
+        food_mask = (val_f < PERCEPTION_RADIUS).unsqueeze(1)
+        food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=1) * food_mask
 
+        # 取得視野內的威脅
+        dist_pred = torch.cdist(self.pos, self.pred_pos)
+        val_p, p_idx = torch.topk(dist_pred, OBSERVE_COUNT, largest=False)
         p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
         p_dist = torch.norm(p_diff, dim=2)
         p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
-        threat_score = 100.0 / ((p_dist / 10.0)**2 + 1)
-        pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), threat_score], dim=1)
-
-        mixed_in = torch.cat([food_in, pred_in], dim=1)
+        pred_threat = 100.0 / ((p_dist / 10.0)**2 + 1)
+        pred_mask = (val_p < PERCEPTION_RADIUS).unsqueeze(1)
+        pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=1) * pred_mask
+        
+        # 取得視野內的隊友
+        dist_agents = torch.cdist(self.pos, self.pos)
+        dist_agents.fill_diagonal_(999.0) # 排除自己
+        val_t, t_idx = torch.topk(dist_agents, OBSERVE_COUNT, largest=False)
+        t_diff = self.pos[t_idx] - self.pos.unsqueeze(1)
+        t_dist = torch.norm(t_diff, dim=2)
+        t_ang = torch.atan2(t_diff[:,:,1], t_diff[:,:,0]) - self.angle.unsqueeze(1)
+        team_threat = 1.0 / (t_dist + 1.0) # 隊友威脅度可以定義為距離的反比，方便 Agent 學習避開
+        team_mask = (val_t < PERCEPTION_RADIUS).float().unsqueeze(1)
+        team_in = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_threat], dim=1) * team_mask
+        
+        mixed_in = torch.cat([food_in, pred_in, team_in], dim=1)
         speed = torch.norm(self.vel, dim=1) / 10.0
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy/MAX_ENERGY], dim=1)
@@ -373,6 +423,13 @@ class RLSimulation:
             self.pred_vel[hit_bottom, 1] *= -1.0
             self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
 
+        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
+        dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
+        min_dist_to_friend, _ = torch.min(dist_agents, dim=1)
+        # 如果靠太近，給予懲罰
+        team_mask = (min_dist_to_friend < TEAM_RADIUS) & self.alive
+        rewards[team_mask] -= 0.1
+
         # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
         hits_f = (dist_f < 10.0) & self.alive.unsqueeze(1)
@@ -433,11 +490,18 @@ class RLSimulation:
         for i in range(POP_SIZE):
             if not was_alive[i]: 
                 continue # 忽略死屍的經驗
-            s_i = (current_states[0][i:i+1], current_states[1][i:i+1])
-            ns_i = (next_states[0][i:i+1], next_states[1][i:i+1])
-            self.memory.push(s_i, actions[i].unsqueeze(0), rewards[i].unsqueeze(0), ns_i, dead_mask[i].unsqueeze(0))
+            self.memory.push(
+                current_states[0][i],
+                current_states[1][i],
+                actions[i], 
+                rewards[i], 
+                next_states[0][i], 
+                next_states[1][i], 
+                dead_mask[i]
+            )
 
-        self.optimize_model()
+        if self.steps % 5 == 0:
+            self.optimize_model()
 
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
         if ready_to_respawn.any():
@@ -459,14 +523,7 @@ class RLSimulation:
         if len(self.memory) < BATCH_SIZE:
             return
         
-        batch = self.memory.sample(BATCH_SIZE)
-        m_b = torch.cat([x[0][0] for x in batch])
-        s_b = torch.cat([x[0][1] for x in batch])
-        a_b = torch.cat([x[1] for x in batch])
-        r_b = torch.cat([x[2] for x in batch])
-        nm_b = torch.cat([x[3][0] for x in batch])
-        ns_b = torch.cat([x[3][1] for x in batch])
-        d_b = torch.cat([x[4] for x in batch])
+        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample(BATCH_SIZE)
 
         # --- 更新 Critic ---
         with torch.no_grad():
@@ -568,7 +625,7 @@ class RLSimulation:
                 print(f"--- [Error] Brain loading failed: {e} ---")
 
 
-    def draw(self, label_only, draw_alert):
+    def draw(self, label_only, draw_perception, draw_alert):
         self.screen.fill((20, 20, 25))
 
         if not label_only:
@@ -611,6 +668,9 @@ class RLSimulation:
                 end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
                 pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
 
+                # 畫出視野範圍
+                if draw_perception:
+                    pygame.draw.circle(self.screen, color, pos_tuple, PERCEPTION_RADIUS, 1)
                 # 畫出警戒範圍
                 if draw_alert:
                     pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
@@ -635,8 +695,9 @@ class RLSimulation:
     def run(self):
         running = True
         is_paused = False
-        draw_alert = False
         label_only = False
+        draw_alert = False
+        draw_perception = False
 
         while running:
             for event in pygame.event.get():
@@ -645,27 +706,29 @@ class RLSimulation:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_a:
-                        draw_alert = not draw_alert
-                    elif event.key == pygame.K_h:
-                        label_only = not label_only
-                    elif event.key == pygame.K_r:
-                        self.reset_env()
-                    elif event.key == pygame.K_SPACE:
-                        is_paused = not is_paused
                     elif event.key == pygame.K_UP:
                         self.fps += 5
                         self.update_caption()
                     elif event.key == pygame.K_DOWN:
                         self.fps -= 5
                         self.update_caption()
+                    elif event.key == pygame.K_r:
+                        self.reset_env()
+                    elif event.key == pygame.K_SPACE:
+                        is_paused = not is_paused
+                    elif event.key == pygame.K_h:
+                        label_only = not label_only
+                    elif event.key == pygame.K_a:
+                        draw_alert = not draw_alert
+                    elif event.key == pygame.K_p:
+                        draw_perception = not draw_perception
 
             if not is_paused:
                 self.update()
                 if self.steps % 5000 == 0:
                     self.save_state()
 
-            self.draw(label_only, draw_alert)
+            self.draw(label_only, draw_perception, draw_alert)
 
         self.save_state()
         pygame.quit()
