@@ -36,6 +36,7 @@ PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 5.0
 ENERGY_DECAY = 0.08
+ALERT_RADIUS = 100 # 定義警戒半徑
 
 # --- DDPG 網路架構 ---
 # --- Actor 網路：策略決策者 ---
@@ -197,7 +198,7 @@ class RLSimulation:
         p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
         p_dist = torch.norm(p_diff, dim=2)
         p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
-        threat_score = 10.0 / (p_dist / 10.0 + 1) # 距離0時=10, 距離10時=5, 距離90時=1
+        threat_score = 100.0 / ((p_dist / 10.0)**2 + 1)
         pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), threat_score], dim=1)
 
         mixed_in = torch.cat([food_in, pred_in], dim=1)
@@ -233,7 +234,8 @@ class RLSimulation:
         
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
-            if not self.alive[i]: continue
+            if not self.alive[i]:
+                continue
             
             # Action[0] 為轉向 (-1 到 1 映射至 -0.15 到 0.15 弧度)
             steer = actions[i][0] * 0.15
@@ -302,8 +304,19 @@ class RLSimulation:
             self.energy[a_idx] = torch.clamp(self.energy[a_idx] + FOOD_ENERGY, max=MAX_ENERGY)
             self.food_pos[f_idx] = torch.rand(len(f_idx), 2).to(DEVICE) * torch.tensor([SCREEN_W, SCREEN_H]).to(DEVICE)
 
-        # 區分死因的獎勵邏輯
+        # 掠食者碰撞
         dist_p = torch.cdist(self.pos, self.pred_pos)
+        min_dist_p, _ = torch.min(dist_p, dim=1)
+        # 只有還活著且進入警戒區的才扣分
+        danger_mask = (min_dist_p < ALERT_RADIUS) & self.alive
+        if danger_mask.any():
+            # 懲罰函數：距離越近扣越多
+            # 當距離=22(碰撞邊緣)時，大約扣 0.4
+            # 當距離=100時，扣 0.1
+            danger_penalty = 0.5 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
+            rewards[danger_mask] -= danger_penalty
+
+        # 區分死因的獎勵邏輯
         hits_p = (dist_p < 22.0).any(dim=1) & self.alive
         starved = (self.energy <= 0) & self.alive        
         rewards[hits_p] -= 10  # 被殺死
@@ -427,7 +440,7 @@ class RLSimulation:
                 print(f"--- [Error] Brain loading failed: {e} ---")
 
 
-    def draw(self):
+    def draw(self, draw_alert):
         self.screen.fill((20, 20, 25))
         for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
         for p in self.pred_pos.cpu().numpy(): 
@@ -443,6 +456,7 @@ class RLSimulation:
                 dead_color = (60, 60, 60) if e_np[i] <= 0 else (120, 0, 0)
                 pygame.draw.circle(self.screen, dead_color, p.astype(int), 3)
                 continue
+
             pos_tuple = (int(p[0]), int(p[1]))
             en_ratio = e_np[i] / MAX_ENERGY
             r = int(255 * en_ratio)          # 越飽越紅
@@ -451,6 +465,7 @@ class RLSimulation:
             color = (r, g, b)
             radius = int(4 + 4 * en_ratio)
             pygame.draw.circle(self.screen, color, pos_tuple, radius)
+
             # --- 顯示能量數值 ---
             energy_text = f"{e_np[i]:.0f}" 
             text_surface = self.font.render(energy_text, True, (255, 255, 255)) # 白色文字
@@ -461,6 +476,10 @@ class RLSimulation:
             angle = self.angle[i].cpu().item()
             end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
             pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
+
+            # 畫出警戒範圍
+            if draw_alert:
+                pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
 
         ui_labels = [
             (f"FPS: {int(self.clock.get_fps())}", (0, 255, 0), False),
@@ -478,7 +497,10 @@ class RLSimulation:
 
     def run(self):
         running = True
-        show_gui = True
+        draw_ui = True
+        is_paused = False
+        draw_alert = False
+
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -487,21 +509,27 @@ class RLSimulation:
                     if event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_t:
-                        show_gui = not show_gui
+                        draw_ui = not draw_ui
+                    elif event.key == pygame.K_a:
+                        draw_alert = not draw_alert
+                    elif event.key == pygame.K_SPACE:
+                        is_paused = not is_paused
                     elif event.key == pygame.K_UP:
                         self.fps += 5
                         self.update_caption()
                     elif event.key == pygame.K_DOWN:
                         self.fps -= 5
                         self.update_caption()
-            self.update()
-            if self.steps_done % 5000 == 0:
-                self.save_state()
+
+            if not is_paused:
+                self.update()
+                if self.steps_done % 5000 == 0:
+                    self.save_state()
                 
-            if show_gui:
-                self.draw()
+            if draw_ui:
+                self.draw(draw_alert)
             else:
-                if self.steps_done % 1000 == 0:
+                if not is_paused and self.steps_done % 1000 == 0:
                     print(f"Steps: {self.steps_done}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}")
                     
         self.save_state()
