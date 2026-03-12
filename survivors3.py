@@ -311,44 +311,62 @@ class RLSimulation:
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
     def get_states(self):
-        # 取得視野內的食物
+        # 1. 取得視野內的食物
         dist_food = torch.cdist(self.pos, self.food_pos)
-        val_f, f_idx = torch.topk(dist_food, OBSERVE_COUNT, largest=False)
-        f_diff = self.food_pos[f_idx] - self.pos.unsqueeze(1)
-        f_dist = torch.norm(f_diff, dim=2)
-        f_ang = torch.atan2(f_diff[:,:,1], f_diff[:,:,0]) - self.angle.unsqueeze(1)
-        food_dist = f_dist/1000.0
-        food_mask = (val_f < PERCEPTION_RADIUS).unsqueeze(1)
-        food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=1) * food_mask
+        k_f = min(OBSERVE_COUNT, FOOD_SIZE) # 取實際數量與觀察上限的最小值
+        if k_f > 0:
+            val_f, f_idx = torch.topk(dist_food, k_f, largest=False)
+            f_diff = self.food_pos[f_idx] - self.pos.unsqueeze(1)
+            f_dist = torch.norm(f_diff, dim=2)
+            f_ang = torch.atan2(f_diff[:,:,1], f_diff[:,:,0]) - self.angle.unsqueeze(1)
+            food_dist = f_dist/1000.0
+            food_mask = (val_f < PERCEPTION_RADIUS).unsqueeze(1)
+            food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=1) * food_mask
+            
+            # 若食物數量小於觀察數量，用零補齊 Tensor 維度
+            if k_f < OBSERVE_COUNT:
+                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_f), device=DEVICE)
+                food_in = torch.cat([food_in, padding], dim=2)
+        else:
+            food_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
 
-        # 取得視野內的威脅
+        # 2. 取得視野內的威脅
         if self.pred_pos.shape[0] > 0:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
-            k = min(OBSERVE_COUNT, self.pred_pos.shape[0])
-            val_p, p_idx = torch.topk(dist_pred, k, largest=False)
+            k_p = min(OBSERVE_COUNT, self.pred_pos.shape[0])
+            val_p, p_idx = torch.topk(dist_pred, k_p, largest=False)
             p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
             p_dist = torch.norm(p_diff, dim=2)
             p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
             pred_threat = 100.0 / ((p_dist / 10.0)**2 + 1)
             pred_mask = (val_p < PERCEPTION_RADIUS).unsqueeze(1)
             pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=1) * pred_mask
-            if k < OBSERVE_COUNT:
-                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k), device=DEVICE)
+            if k_p < OBSERVE_COUNT:
+                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_p), device=DEVICE)
                 pred_in = torch.cat([pred_in, padding], dim=2)
         else:
             pred_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
 
-        # 取得視野內的隊友
-        dist_agents = torch.cdist(self.pos, self.pos)
-        dist_agents.fill_diagonal_(999.0) # 排除自己
-        val_t, t_idx = torch.topk(dist_agents, OBSERVE_COUNT, largest=False)
-        t_diff = self.pos[t_idx] - self.pos.unsqueeze(1)
-        t_dist = torch.norm(t_diff, dim=2)
-        t_ang = torch.atan2(t_diff[:,:,1], t_diff[:,:,0]) - self.angle.unsqueeze(1)
-        team_threat = 1.0 / (t_dist + 1.0) # 隊友威脅度可以定義為距離的反比，方便 Agent 學習避開
-        team_mask = (val_t < PERCEPTION_RADIUS).float().unsqueeze(1)
-        team_in = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_threat], dim=1) * team_mask
+        # 3. 取得視野內的隊友
+        if POP_SIZE > 1:
+            dist_agents = torch.cdist(self.pos, self.pos)
+            dist_agents.fill_diagonal_(999.0) # 排除自己
+            k_t = min(OBSERVE_COUNT, POP_SIZE - 1) # 隊友最多只有 POP_SIZE - 1 個
+            val_t, t_idx = torch.topk(dist_agents, k_t, largest=False)
+            t_diff = self.pos[t_idx] - self.pos.unsqueeze(1)
+            t_dist = torch.norm(t_diff, dim=2)
+            t_ang = torch.atan2(t_diff[:,:,1], t_diff[:,:,0]) - self.angle.unsqueeze(1)
+            team_threat = 1.0 / (t_dist + 1.0) # 隊友威脅度可以定義為距離的反比，方便 Agent 學習避開
+            team_mask = (val_t < PERCEPTION_RADIUS).float().unsqueeze(1)
+            team_in = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_threat], dim=1) * team_mask
+            
+            if k_t < OBSERVE_COUNT:
+                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_t), device=DEVICE)
+                team_in = torch.cat([team_in, padding], dim=2)
+        else:
+            team_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
         
+        # 組合輸入
         mixed_in = torch.cat([food_in, pred_in, team_in], dim=1)
         speed = torch.norm(self.vel, dim=1) / 10.0
         last_steer = self.last_actions[:, 0]
