@@ -13,6 +13,17 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
 
+# 環境參數
+POP_SIZE = 15
+FOOD_SIZE = 30
+PREDATOR_SIZE = 20
+MAX_ENERGY = 100.0
+FOOD_ENERGY = 10.0
+ENERGY_DECAY = 0.03
+PERCEPTION_RADIUS = 200 # 視野感知半徑
+ALERT_RADIUS = 100      # 敵方懲罰半徑
+TEAM_RADIUS = 20        # 友方懲罰半徑
+
 # DDPG 核心參數
 GAMMA = 0.98
 TAU = 0.005 # 軟更新係數
@@ -23,32 +34,19 @@ BATCH_SIZE = 256
 EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY = 0.9995
-OBSERVE_COUNT = 5
-
-# 物理參數設定
-FRICTION = 0.85      # 環境阻力 (0.95-0.98 之間，越高慣性越強)
-BRAKE_POWER = 0.5    # 剎車係數 (按下油門負值時的額外減速)
-
-# 環境參數
-POP_SIZE = 1
-FOOD_SIZE = 8
-PREDATOR_SIZE = 0
-MAX_ENERGY = 100.0
-FOOD_ENERGY = 5.0
-ENERGY_DECAY = 0.0
-PERCEPTION_RADIUS = 200 # 視野感知半徑
-ALERT_RADIUS = 100      # 敵方懲罰半徑
-TEAM_RADIUS = 20        # 友方懲罰半徑
+MAX_OBJ = 20 # 最大環境物件數量
+FEAT_DIM = 7 # 每個物件特微 [cos, sin, score, 牆=1, 隊友=1, 食物=1, 敵人=1]
 
 # --- DDPG 網路架構 ---
 # --- Actor 網路：策略決策者 ---
+# 基礎型
 class Actor(nn.Module):
     def __init__(self):
         super(Actor, self).__init__()
-        self.conv = nn.Conv1d(9, 32, 1) 
+        self.conv = nn.Conv1d(FEAT_DIM, 32, 1) 
         self.fc = nn.Sequential(
-            # 32 (卷積特徵) + 4 (自身狀態: 速度, 轉向, 能量, 牆)
-            nn.Linear(32 + 4, 64),
+            # 32 (卷積特徵) + 3 (自身狀態: 速度, 0, 能量) = 35
+            nn.Linear(35, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -58,144 +56,160 @@ class Actor(nn.Module):
 
     def forward(self, m_in, s_in):
         """
-        輸入:
-        m_in: Tensor [Batch, 9, 5] -> 9個特徵，探測周圍最近的 OBSERVE_COUNT 個物體
-        s_in: Tensor [Batch, 4]    -> 自身狀態 (speed, steer, energy, wall)
-        輸出:
-        actions: Tensor [Batch, 2] -> 每個 Agent 的 [轉向, 加速] 連續值
+        m_in: [Batch, MAX_OBJ, FEAT_DIM]  (MAX_OBJ 個物體)
+        s_in: [Batch, 3]                  (自身狀態)
+        action: [Batch, 2]                (動作)
         """
-        # Conv1d 處理局部感應數據 -> [Batch, 32, 5]
-        # Max 降維取最強特徵 -> [Batch, 32]
-        x = torch.max(F.relu(self.conv(m_in)), dim=2)[0]
-        
-        # 結合感應特徵與自身狀態 -> [Batch, 35]
-        combined = torch.cat([x, s_in], dim=1)
-        
-        # 輸出最終動作
+        x = m_in.transpose(1, 2)
+        feat = F.relu(self.conv(x))
+        feat = torch.max(feat, dim=2)[0]
+        combined = torch.cat([feat, s_in], dim=1)
         return self.fc(combined)
 
+# Max + Mean 混合型
 class ActorPlus(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = nn.Conv1d(9, 32, 1) 
-        # 維度：32(Max) + 32(Mean) + 4(Self)
+        self.conv = nn.Conv1d(FEAT_DIM, 32, 1) 
+        # 維度：32(Max) + 32(Mean) + 3(Self) = 67
         self.fc = nn.Sequential(
-            nn.Linear(32 + 32 + 4, 64),
+            nn.Linear(67, 64),
             nn.ReLU(),
             nn.Linear(64, 2),
             nn.Tanh()
         )
 
     def forward(self, m_in, s_in):
-        feat = F.relu(self.conv(m_in)) # [Batch, 32, 5]
+        """
+        m_in: [Batch, MAX_OBJ, FEAT_DIM]  (MAX_OBJ 個物體)
+        s_in: [Batch, 3]                  (自身狀態)
+        action: [Batch, 2]                (動作)
+        """
+        x = m_in.transpose(1, 2)
+        feat = F.relu(self.conv(x))
         
         # 關鍵差異：同時保留最強威脅與整體分佈
-        x_max = torch.max(feat, dim=2)[0]
-        x_avg = torch.mean(feat, dim=2)
-        
-        combined = torch.cat([x_max, x_avg, s_in], dim=1)
+        feat_max = torch.max(feat, dim=2)[0]
+        feat_avg = torch.mean(feat, dim=2)
+
+        combined = torch.cat([feat_max, feat_avg, s_in], dim=1)
         return self.fc(combined)
-    
+
+# 注意機制型
 class ActorAttentionPooling(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv = nn.Conv1d(9, 32, 1)
-        # 學習如何幫 5 個物體打分數
-        self.attn_weights = nn.Linear(32, 1) 
+        self.obj_enc = nn.Linear(FEAT_DIM, 32)
+        self.self_enc = nn.Linear(3, 32)
+
+        # 使用 MultiheadAttention 讓模型可以同時關注多種目標
+        self.mha = nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+
         self.fc = nn.Sequential(
-            nn.Linear(32 + 4, 64),
+            nn.Linear(32 + 3, 64), # 32(全局特徵) + 3(自身狀態 s_in)
             nn.ReLU(),
             nn.Linear(64, 2),
             nn.Tanh()
         )
 
     def forward(self, m_in, s_in):
-        feat = F.relu(self.conv(m_in)) # [Batch, 32, 5]
-        feat = feat.transpose(1, 2)    # -> [Batch, 5, 32]
+        """
+        m_in: [Batch, MAX_OBJ, FEAT_DIM]  (MAX_OBJ 個物體)
+        s_in: [Batch, 3]                  (自身狀態)
+        action: [Batch, 2]                (動作)
+        """
+        # 1. 編碼物件與自身狀態
+        obj_feat = F.relu(self.obj_enc(m_in))   # [Batch, N, 32]
+        query = self.self_enc(s_in).unsqueeze(1) # [Batch, 1, 32]
         
-        # 計算每個物體的注意得分
-        weights = F.softmax(self.attn_weights(feat), dim=1) # [Batch, 5, 1]
-        # 加權總和：將所有物體融合成 1 個全局特徵向量
-        x_attn = torch.sum(feat * weights, dim=1)           # [Batch, 32]
+        # 2. 以「自身狀態」為 Query，去物件中找尋資訊
+        # attn_out 是加權後的全局特徵
+        attn_out, _ = self.mha(query, obj_feat, obj_feat) 
+        attn_out = attn_out.squeeze(1) # [Batch, 32]
         
-        combined = torch.cat([x_attn, s_in], dim=1)
+        # 3. 結合並輸出
+        combined = torch.cat([attn_out, s_in], dim=1)
         return self.fc(combined)
     
+# Transformer 結構型
 class ActorTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        # 將輸入 6 維映射到 Transformer 的維度 (例如 32)
-        self.embedding = nn.Linear(9, 32)
-        
-        # Transformer 層：專門處理物體間的關係
+        self.embedding = nn.Linear(FEAT_DIM, 32)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=32, nhead=4, dim_feedforward=64, batch_first=True, dropout=0
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
         
         self.fc = nn.Sequential(
-            nn.Linear(32 + 4, 64),
+            nn.Linear(32 + 32 + 3, 64),
             nn.ReLU(),
             nn.Linear(64, 2),
             nn.Tanh()
         )
 
     def forward(self, m_in, s_in):
-        # m_in: [Batch, 9, 5] -> transpose -> [Batch, 5, 9]
-        x = m_in.transpose(1, 2)
-        x = self.embedding(x)               # [Batch, 5, 32]
+        """
+        m_in: [Batch, MAX_OBJ, FEAT_DIM]  (MAX_OBJ 個物體)
+        s_in: [Batch, 3]                  (自身狀態)
+        action: [Batch, 2]                (動作)
+        """
+        x = self.embedding(m_in)
+        x = self.transformer(x)
+
+        # 雙重感知池化
+        x_max = torch.max(x, dim=1)[0]  # 捕捉突出的單一物件 (如近處敵人)
+        x_mean = torch.mean(x, dim=1)   # 捕捉全局分佈 (如食物群落)
         
-        # 關鍵：Transformer 處理 5 個物體之間的包夾、距離、相對速度關係
-        x = self.transformer(x)             # [Batch, 5, 32]
-        
-        # 聚合所有物體的戰略資訊 (這裡用 Mean)
-        x_global = torch.mean(x, dim=1)     # [Batch, 32]
-        
-        combined = torch.cat([x_global, s_in], dim=1)
+        combined = torch.cat([x_max, x_mean, s_in], dim=1)
         return self.fc(combined)
     
 # --- Critic 網路：價值評估者 ---
 class Critic(nn.Module):
     def __init__(self):
         super(Critic, self).__init__()
-        self.conv = nn.Conv1d(9, 32, 1)
+        self.conv = nn.Conv1d(FEAT_DIM, 32, 1)
+        self.attn_weights = nn.Linear(32, 1)
+        
         self.fc = nn.Sequential(
-            # 32 (感應特徵) + 4 (自身狀態) + 2 (動作) = 37
-            nn.Linear(32 + 4 + 2, 64), 
+            # 32 (感應特徵) + 3 (自身狀態) + 2 (動作) = 37
+            nn.Linear(32 + 3 + 2, 64), 
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1)  # 輸出 1: 該 狀態+動作 的預期 Q 值 (分數)
+            nn.Linear(32, 1)
         )
 
     def forward(self, m_in, s_in, action):
         """
-        輸入:
-        m_in: Tensor [Batch, 9, 5]
-        s_in: Tensor [Batch, 4]
-        action: Tensor [Batch, 2] -> 來自 Actor 預測或 Memory 紀錄的動作
-        
-        輸出:
-        q_value: Tensor [Batch, 1] -> 預測的未來總分回報
+        m_in: [Batch, N, FEAT_DIM]  (N 個物體)
+        s_in: [Batch, 3]     (自身狀態)
+        action: [Batch, 2]   (要評估的動作)
         """
-        # 處理感應數據 -> [Batch, 32]
-        x = torch.max(F.relu(self.conv(m_in)), dim=2)[0]
+        # 1. 提取物體特徵: [Batch, FEAT_DIM, N] -> [Batch, 32, N]
+        x = m_in.transpose(1, 2)
+        feat = F.relu(self.conv(x))
         
-        # 結合特徵、自身狀態與動作數據 -> [Batch, 37]
-        combined = torch.cat([x, s_in, action], dim=1)
+        # 2. Attention 權重計算: [Batch, N, 32]
+        feat = feat.transpose(1, 2)
+        weights = F.softmax(self.attn_weights(feat), dim=1)
         
-        # 評估該動作在該狀態下的價值
+        # 3. 融合為全局特徵: [Batch, 32]
+        x_attn = torch.sum(feat * weights, dim=1)
+        
+        # 4. 結合所有資訊: [Batch, 32 + 3 + 2] = [Batch, 37]
+        combined = torch.cat([x_attn, s_in, action], dim=1)
         return self.fc(combined)
     
 class ReplayMemory:
     def __init__(self, capacity):
         self.capacity = capacity
         # 預分配空間 (根據你的 Actor 輸入維度)
-        # s1: mixed_in [6, 5], s2: self_in [4]
-        self.m_states = np.zeros((capacity, 9, 5), dtype=np.float32)
-        self.s_states = np.zeros((capacity, 4), dtype=np.float32)
-        self.next_m_states = np.zeros((capacity, 9, 5), dtype=np.float32)
-        self.next_s_states = np.zeros((capacity, 4), dtype=np.float32)
+        # s1: mixed_in [MAX_OBJ, FEAT_DIM], s2: self_in [3]
+        self.m_states = np.zeros((capacity, MAX_OBJ, FEAT_DIM), dtype=np.float32)
+        self.s_states = np.zeros((capacity, 3), dtype=np.float32)
+        self.next_m_states = np.zeros((capacity, MAX_OBJ, FEAT_DIM), dtype=np.float32)
+        self.next_s_states = np.zeros((capacity, 3), dtype=np.float32)
         self.actions = np.zeros((capacity, 2), dtype=np.float32)
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
@@ -277,6 +291,11 @@ class RLSimulation:
         self.starved = 0
         self.reset_env()
         self.load_state()
+        
+        # 定義四面牆的方位向量, 左牆: (-1, 0), 右牆: (1, 0), 上牆: (0, -1), 下牆: (0, 1)
+        self.wall_normals = torch.tensor([
+            [-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]
+        ], device=DEVICE)
 
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
@@ -313,75 +332,104 @@ class RLSimulation:
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
     def get_states(self):
-        # 1. 取得視野內的食物
-        dist_food = torch.cdist(self.pos, self.food_pos)
-        k_f = min(OBSERVE_COUNT, FOOD_SIZE) # 取實際數量與觀察上限的最小值
-        val_f, f_idx = torch.topk(dist_food, k_f, largest=False)
-        f_diff = self.food_pos[f_idx] - self.pos.unsqueeze(1)
-        f_dist = torch.norm(f_diff, dim=2)
-        f_ang = torch.atan2(f_diff[:,:,1], f_diff[:,:,0]) - self.angle.unsqueeze(1)
-        food_dist = f_dist / 1000.0
-        food_mask = (val_f < PERCEPTION_RADIUS).unsqueeze(1)
-        food_in = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=1) * food_mask
-        # 若食物數量小於觀察數量，用零補齊 Tensor 維度
-        if k_f < OBSERVE_COUNT:
-            padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_f), device=DEVICE)
-            food_in = torch.cat([food_in, padding], dim=2)
+        """
+        將環境觀察值轉換為神經網路輸入張量。
+        輸出:
+            mixed_in: [Batch, MAX_OBJ, FEAT_DIM] -> 環境物體特徵
+            self_in:  [Batch, 3]                 -> 自身狀態特徵
+        """
+        # --- 1. 初始化類別標籤 (One-hot Encoding) ---
+        # 對應維度: [牆, 隊友, 食物, 敵人]
+        tag_wall = torch.tensor([1, 0, 0, 0], device=DEVICE).view(1, 1, 4)
+        tag_team = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 1, 4)
+        tag_food = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 1, 4)
+        tag_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 1, 4)
 
-        # 2. 取得視野內的威脅
-        if self.pred_pos.shape[0] > 0:
-            dist_pred = torch.cdist(self.pos, self.pred_pos)
-            k_p = min(OBSERVE_COUNT, self.pred_pos.shape[0])
-            val_p, p_idx = torch.topk(dist_pred, k_p, largest=False)
-            p_diff = self.pred_pos[p_idx] - self.pos.unsqueeze(1)
-            p_dist = torch.norm(p_diff, dim=2)
-            p_ang = torch.atan2(p_diff[:,:,1], p_diff[:,:,0]) - self.angle.unsqueeze(1)
-            pred_threat = 100.0 / ((p_dist / 10.0)**2 + 1)
-            pred_mask = (val_p < PERCEPTION_RADIUS).unsqueeze(1)
-            pred_in = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=1) * pred_mask
-            if k_p < OBSERVE_COUNT:
-                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_p), device=DEVICE)
-                pred_in = torch.cat([pred_in, padding], dim=2)
-        else:
-            pred_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
+        all_detected_objs = [] # 用於暫存所有類型的物體特徵池
 
-        # 3. 取得視野內的隊友
-        if POP_SIZE > 1:
-            dist_agents = torch.cdist(self.pos, self.pos)
-            dist_agents.fill_diagonal_(999.0) # 排除自己
-            k_t = min(OBSERVE_COUNT, POP_SIZE - 1) # 隊友最多只有 POP_SIZE - 1 個
-            val_t, t_idx = torch.topk(dist_agents, k_t, largest=False)
-            t_diff = self.pos[t_idx] - self.pos.unsqueeze(1)
-            t_dist = torch.norm(t_diff, dim=2)
-            t_ang = torch.atan2(t_diff[:,:,1], t_diff[:,:,0]) - self.angle.unsqueeze(1)
-            team_threat = 1.0 / (t_dist + 1.0) # 隊友威脅度可以定義為距離的反比，方便 Agent 學習避開
-            team_mask = (val_t < PERCEPTION_RADIUS).float().unsqueeze(1)
-            team_in = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_threat], dim=1) * team_mask
-            if k_t < OBSERVE_COUNT:
-                padding = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT - k_t), device=DEVICE)
-                team_in = torch.cat([team_in, padding], dim=2)
-        else:
-            team_in = torch.zeros((POP_SIZE, 3, OBSERVE_COUNT), device=DEVICE)
-        
-        # 牆
+        # --- 2. 處理牆壁 (邊界感應) ---
         d_left = self.pos[:, 0]
         d_right = SCREEN_W - self.pos[:, 0]
         d_top = self.pos[:, 1]
         d_bottom = SCREEN_H - self.pos[:, 1]
-        # 找出離最近牆壁的距離
-        min_wall_dist, _ = torch.min(torch.stack([d_left, d_right, d_top, d_bottom], dim=1), dim=1)
-        # 歸一化：越近數值越大 (0.0 到 1.0)。若在視野外則為 0
-        wall_threat = (1.0 - min_wall_dist / PERCEPTION_RADIUS).clamp(0, 1.0)
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1) 
+        
+        # 僅保留半徑內的牆壁資訊
+        wall_mask = (wall_dists < PERCEPTION_RADIUS).float()
+        wall_angles = torch.atan2(self.wall_normals[:, 1], self.wall_normals[:, 0]).unsqueeze(0) - self.angle.unsqueeze(1)
+        # 評分機制：越近分數越高 (1.0~0.0)，範圍外強制為 0
+        wall_scores = (1.0 - wall_dists / PERCEPTION_RADIUS).clamp(0, 1.0) * wall_mask
+        
+        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_scores], dim=2)
+        wall_in = torch.cat([wall_phys * wall_mask.unsqueeze(-1), 
+                            tag_wall.expand(POP_SIZE, 4, 4) * wall_mask.unsqueeze(-1)], dim=2)
+        all_detected_objs.append(wall_in)
 
-        # 組合輸入
-        mixed_in = torch.cat([food_in, pred_in, team_in], dim=1)
+        # --- 3. 處理食物 (資源感應) ---
+        dist_food = torch.cdist(self.pos, self.food_pos)
+        food_mask = (dist_food < PERCEPTION_RADIUS).float()
+        
+        f_diff = self.food_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+        f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
+        food_scores = torch.pow((1.0 - dist_food / PERCEPTION_RADIUS).clamp(0, 1.0), 2) * food_mask
+        
+        food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_scores], dim=2)
+        food_in = torch.cat([food_phys * food_mask.unsqueeze(-1), 
+                            tag_food.expand(POP_SIZE, food_phys.shape[1], 4) * food_mask.unsqueeze(-1)], dim=2)
+        all_detected_objs.append(food_in)
+
+        # --- 4. 處理隊友 (群體感應) ---
+        if POP_SIZE > 1:
+            dist_agents = torch.cdist(self.pos, self.pos)
+            dist_agents.fill_diagonal_(999.0) # 排除自身
+            team_mask = (dist_agents < PERCEPTION_RADIUS).float()
+            
+            t_diff = self.pos.unsqueeze(0) - self.pos.unsqueeze(1)
+            t_ang = torch.atan2(t_diff[..., 1], t_diff[..., 0]) - self.angle.unsqueeze(1)
+            team_scores = (1.0 - dist_agents / PERCEPTION_RADIUS).clamp(0, 1.0) * team_mask
+            
+            team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_scores], dim=2)
+            team_in = torch.cat([team_phys * team_mask.unsqueeze(-1), 
+                                tag_team.expand(POP_SIZE, team_phys.shape[1], 4) * team_mask.unsqueeze(-1)], dim=2)
+            all_detected_objs.append(team_in)
+
+        # --- 5. 處理敵人 (威脅感應) ---
+        if self.pred_pos.shape[0] > 0:
+            dist_pred = torch.cdist(self.pos, self.pred_pos)
+            pred_mask = (dist_pred < PERCEPTION_RADIUS).float()
+            
+            p_diff = self.pred_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+            p_ang = torch.atan2(p_diff[..., 1], p_diff[..., 0]) - self.angle.unsqueeze(1)
+            # 敵人評分權重加倍 (1.5x)，確保其在 Top-K 篩選中具備更高優先權
+            pred_scores = (1.0 - dist_pred / PERCEPTION_RADIUS).clamp(0, 1.0) * pred_mask * 1.5
+            
+            pred_phys = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_scores], dim=2)
+            pred_in = torch.cat([pred_phys * pred_mask.unsqueeze(-1), 
+                                tag_pred.expand(POP_SIZE, pred_phys.shape[1], 4) * pred_mask.unsqueeze(-1)], dim=2)
+            all_detected_objs.append(pred_in)
+
+        # --- 6. 綜合特徵池化與 Top-K 篩選 ---
+        # 合併所有類型的物體特徵 [Batch, Total_Detected_N, 7]
+        combined_all = torch.cat(all_detected_objs, dim=1)
+        
+        # 根據 score (維度索引 2) 提取前 MAX_OBJ 個最重要物體
+        scores = combined_all[:, :, 2]
+        _, top_indices = torch.topk(scores, MAX_OBJ, dim=1, largest=True)
+        
+        # 根據索引重新聚合特徵，確保輸出 Shape 固定為 [Batch, 20, 7]
+        idx_expanded = top_indices.unsqueeze(-1).expand(-1, -1, 7)
+        mixed_in = torch.gather(combined_all, 1, idx_expanded)
+
+        # --- 7. 處理自身狀態 (Self State) ---
+        # 包含：標準化後的速率、最後一次轉向動作、剩餘能量比例
         speed = torch.norm(self.vel, dim=1) / 10.0
         last_steer = self.last_actions[:, 0]
-        self_in = torch.stack([speed, last_steer, self.energy/MAX_ENERGY, wall_threat], dim=1)
-        
+        energy_ratio = self.energy / MAX_ENERGY
+        self_in = torch.stack([speed, last_steer, energy_ratio], dim=1)
+
         return (mixed_in, self_in)
 
-    def update(self):
+    def update(self, move_predator):
         was_alive = self.alive.clone()
         current_states = self.get_states()
         
@@ -396,9 +444,9 @@ class RLSimulation:
             self.last_actions = actions.detach().clone()
             
         rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
-        # 取得食物距離矩陣 (用於後續獎勵計算)
-        dist_f_all = torch.cdist(self.pos, self.food_pos)
-        min_dist_f, _ = torch.min(dist_f_all, dim=1)
+        # # 取得食物距離矩陣 (用於後續獎勵計算)
+        # dist_f_all = torch.cdist(self.pos, self.food_pos)
+        # min_dist_f, _ = torch.min(dist_f_all, dim=1)
 
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -408,46 +456,42 @@ class RLSimulation:
             # 計算當前速度
             speed_val = torch.norm(self.vel[i])
 
-            # 轉向優化：轉向影響「角度」，而非直接改變速度向量
+            # actions[0] 為轉向 (-1 到 1 映射至 -0.15 到 0.15 弧度)
             # 舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
             steer_power = torch.clamp(speed_val / 2.0, 0, 1.0) 
             steer = actions[i][0] * 0.15 * steer_power
             self.angle[i] += steer
 
-            # 油門與剎車邏輯, 映射 actions[i][1] (-1 to 1) -> (-0.1 to 0.3)
-            throttle = actions[i][1] * 0.2 + 0.1
-            if throttle < 0:
-                self.vel[i] *= (FRICTION * BRAKE_POWER)
-            else:
-                self.vel[i] *= FRICTION
-                # 4. 向量動力學：計算前進方向推力
-                dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-                self.vel[i] += dir_vec * throttle
+            # Action[1] 為油門 (-1 到 1 映射至 0 到 0.3 加速度)
+            throttle = (actions[i][1] + 1.0) * 0.3
+            # 向量動力學：計算前進方向推力
+            dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
+            self.vel[i] = self.vel[i] * 0.85 + dir_vec * throttle
             
             # 更新位置
             self.pos[i] += self.vel[i]
             
-            # --- 精準進場獎勵 (解決繞圈問題) ---
-            if min_dist_f[i] < 50.0:
-                # 獎勵低速接近：鼓勵精準對準食物
-                if speed_val < 1.2:
-                    rewards[i] += 0.15
-                # 懲罰高速衝過頭：防止因轉彎半徑太大繞圈
-                elif speed_val > 2.2:
-                    rewards[i] -= 0.1
-            else:
-                # 遠處時，鼓勵直線加速前進
-                forward_bonus = (speed_val / 10.0) * (1.0 - torch.abs(actions[i][0]))
-                rewards[i] += forward_bonus * 0.1  # 這會鼓勵直線衝刺
+            # # --- 精準進場獎勵 (解決繞圈問題) ---
+            # if min_dist_f[i] < 50.0:
+            #     # 獎勵低速接近：鼓勵精準對準食物
+            #     if speed_val < 1.2:
+            #         rewards[i] += 0.15
+            #     # 懲罰高速衝過頭：防止因轉彎半徑太大繞圈
+            #     elif speed_val > 2.2:
+            #         rewards[i] -= 0.1
+            # else:
+            #     # 遠處時，鼓勵直線加速前進
+            #     forward_bonus = (speed_val / 10.0) * (1.0 - torch.abs(actions[i][0]))
+            #     rewards[i] += forward_bonus * 0.1  # 這會鼓勵直線衝刺
 
         # 邊界碰撞處理 (反彈)
-        hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W)
-        hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H)
-        rewards[hit_w_x | hit_w_y] -= 0.2        
+        hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
+        hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
+        rewards[hit_w_x | hit_w_y] -= 0.5
         self.vel[hit_w_x, 0] *= -0.5
         self.vel[hit_w_y, 1] *= -0.5
-        self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W)
-        self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H)
+        self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
+        self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
 
         # 移動距離獎懲
         displacement = torch.norm(self.pos - self.prev_pos, dim=1)
@@ -456,25 +500,27 @@ class RLSimulation:
             if not self.alive[i]:
                 continue
             
+            self.energy[i] -= displacement[i] * 0.05
+
             # 只有當位移大於一定程度（代表真的在移動，不是微小震動或繞圈）才給分
             if displacement[i] > 2.0:
                 steer_val = torch.abs(actions[i][0])
-                move_reward = 0.15 * (1.0 - steer_val * 1.5) # 轉向超過 0.66 就會變負分
+                move_reward = 0.2 * (1.0 - steer_val * 1.5) # 轉向超過 0.66 就會變負分
                 rewards[i] += move_reward
             else:
                 rewards[i] -= 0.2
 
-            # 額外懲罰：如果視覺完全沒東西（空曠區）卻還在轉彎
-            vision_sum = torch.sum(torch.abs(current_states[0][i]))
-            if vision_sum < 0.01 and torch.abs(actions[i][0]) > 0.3:
-                # 空曠地區轉向懲罰
-                rewards[i] -= torch.abs(actions[i][0]) * 0.1
+            # # 額外懲罰：如果視覺完全沒東西（空曠區）卻還在轉彎
+            # vision_sum = torch.sum(torch.abs(current_states[0][i]))
+            # if vision_sum < 0.01 and torch.abs(actions[i][0]) > 0.3:
+            #     # 空曠地區轉向懲罰
+            #     rewards[i] -= torch.abs(actions[i][0]) * 0.1
 
-        self.energy[self.alive] -= ENERGY_DECAY
+        # self.energy[self.alive] -= ENERGY_DECAY
         self.respawn_timer[~self.alive] -= 1
 
         # 掠食者移動
-        if PREDATOR_SIZE > 0:
+        if PREDATOR_SIZE > 0 and move_predator:
             # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
             num_preds = self.pred_pos.shape[0]
             change_mask = torch.rand(num_preds, device=DEVICE) < 0.05
@@ -491,22 +537,22 @@ class RLSimulation:
             # 2. 根據速度更新位置
             self.pred_pos += self.pred_vel
             # 3. 強力邊界反彈與座標修正 (防止掠食者卡在牆外)
-            hit_left   = self.pred_pos[:, 0] < 0
-            hit_right  = self.pred_pos[:, 0] > SCREEN_W
-            hit_top    = self.pred_pos[:, 1] < 0
-            hit_bottom = self.pred_pos[:, 1] > SCREEN_H
+            hit_left   = self.pred_pos[:, 0] <= 0
+            hit_right  = self.pred_pos[:, 0] >= SCREEN_W - 1
+            hit_top    = self.pred_pos[:, 1] <= 0
+            hit_bottom = self.pred_pos[:, 1] >= SCREEN_H - 1
             if hit_left.any():
-                self.pred_vel[hit_left, 0] *= -1.0
-                self.pred_pos[hit_left, 0] = 1.0
+                self.pred_vel[hit_left, 0] *= -1
+                self.pred_pos[hit_left, 0] = 0
             if hit_right.any():
-                self.pred_vel[hit_right, 0] *= -1.0
-                self.pred_pos[hit_right, 0] = SCREEN_W - 1.0
+                self.pred_vel[hit_right, 0] *= -1
+                self.pred_pos[hit_right, 0] = SCREEN_W - 1
             if hit_top.any():
-                self.pred_vel[hit_top, 1] *= -1.0
-                self.pred_pos[hit_top, 1] = 1.0
+                self.pred_vel[hit_top, 1] *= -1
+                self.pred_pos[hit_top, 1] = 0
             if hit_bottom.any():
-                self.pred_vel[hit_bottom, 1] *= -1.0
-                self.pred_pos[hit_bottom, 1] = SCREEN_H - 1.0
+                self.pred_vel[hit_bottom, 1] *= -1
+                self.pred_pos[hit_bottom, 1] = SCREEN_H - 1
 
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         if POP_SIZE > 1:
@@ -537,7 +583,7 @@ class RLSimulation:
             
             # 4. 處理獎勵與能量 (安全累加)
             # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
-            reward_increment = torch.full((len(a_idx),), 5.0, device=DEVICE)
+            reward_increment = torch.full((len(a_idx),), 10.0, device=DEVICE)
             rewards.index_add_(0, a_idx, reward_increment)
             energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
             self.energy.index_add_(0, a_idx, energy_increment)
@@ -785,6 +831,7 @@ class RLSimulation:
         label_only = False
         draw_alert = False
         draw_perception = False
+        move_predator = True
 
         while running:
             for event in pygame.event.get():
@@ -816,9 +863,11 @@ class RLSimulation:
                         draw_alert = not draw_alert
                     elif event.key == pygame.K_p:
                         draw_perception = not draw_perception
+                    elif event.key == pygame.K_m:
+                        move_predator = not move_predator
 
             if not is_paused:
-                self.update()
+                self.update(move_predator)
                 if self.steps % 5000 == 0:
                     self.save_state()
 
