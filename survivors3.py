@@ -286,6 +286,13 @@ class RLSimulation:
         self.hit_pred = 0
         self.hit_wall = 0
         self.starved = 0
+
+        # 對應維度: [牆, 隊友, 食物, 敵人]
+        self.tag_wall = torch.tensor([1, 0, 0, 0], device=DEVICE).view(1, 1, 4)
+        self.tag_team = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 1, 4)
+        self.tag_food = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 1, 4)
+        self.tag_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 1, 4)
+
         self.reset_env()
         self.load_state()
         
@@ -335,14 +342,24 @@ class RLSimulation:
             mixed_in: [Batch, MAX_OBJ, FEAT_DIM] -> 環境物體特徵
             self_in:  [Batch, 3]                 -> 自身狀態特徵
         """
-        # --- 1. 初始化類別標籤 (One-hot Encoding) ---
-        # 對應維度: [牆, 隊友, 食物, 敵人]
-        tag_wall = torch.tensor([1, 0, 0, 0], device=DEVICE).view(1, 1, 4)
-        tag_team = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 1, 4)
-        tag_food = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 1, 4)
-        tag_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 1, 4)
+        # --- 1. 預分配輸出的特徵池 (固定 Shape [Batch, MAX_OBJ, 7]) ---
+        # 預先填充 0，這樣就自動處理了 Padding 邏輯
+        mixed_in = torch.zeros((POP_SIZE, MAX_OBJ, 7), device=DEVICE, dtype=torch.float32)
+        # 用於追踪當前 buffer 填到了哪個位置
+        current_idx = 0
 
-        all_detected_objs = [] # 用於暫存所有類型的物體特徵池
+        # ---------------------------------------------------------
+        # 定義內部函數：將處理好的特徵填入 mixed_in
+        # ---------------------------------------------------------
+        def fill_buffer(features):
+            num_new = features.shape[1]
+            space_left = MAX_OBJ - current_idx
+            if space_left <= 0:
+                return current_idx
+            
+            actual_add = min(num_new, space_left)
+            mixed_in[:, current_idx : current_idx + actual_add, :] = features[:, :actual_add, :]
+            return current_idx + actual_add
 
         # --- 2. 處理牆壁 (邊界感應) ---
         d_left = self.pos[:, 0]
@@ -358,27 +375,31 @@ class RLSimulation:
         wall_scores = (1.0 - wall_dists / PERCEPTION_RADIUS).clamp(0, 1.0) * wall_mask
         
         wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_scores], dim=2)
-        wall_in = torch.cat([wall_phys * wall_mask.unsqueeze(-1), 
-                            tag_wall.expand(POP_SIZE, 4, 4) * wall_mask.unsqueeze(-1)], dim=2)
-        all_detected_objs.append(wall_in)
+        # 組合物理特徵與 Tag [Batch, 4, 7]
+        wall_in = torch.cat([wall_phys, self.tag_wall.expand(POP_SIZE, 4, 4)], dim=2)
+        wall_in = wall_in * wall_mask.unsqueeze(-1) # 遮罩掉範圍外的
+        
+        current_idx = fill_buffer(wall_in)
 
         # --- 3. 處理食物 (資源感應) ---
-        dist_food = torch.cdist(self.pos, self.food_pos)
-        food_mask = (dist_food < PERCEPTION_RADIUS).float()
-        
-        f_diff = self.food_pos.unsqueeze(0) - self.pos.unsqueeze(1)
-        f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
-        food_scores = torch.pow((1.0 - dist_food / PERCEPTION_RADIUS).clamp(0, 1.0), 2) * food_mask
-        
-        food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_scores], dim=2)
-        food_in = torch.cat([food_phys * food_mask.unsqueeze(-1), 
-                            tag_food.expand(POP_SIZE, food_phys.shape[1], 4) * food_mask.unsqueeze(-1)], dim=2)
-        all_detected_objs.append(food_in)
+        if current_idx < MAX_OBJ:
+            dist_food = torch.cdist(self.pos, self.food_pos)
+            food_mask = (dist_food < PERCEPTION_RADIUS).float()
+            
+            f_diff = self.food_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+            f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
+            food_scores = torch.pow((1.0 - dist_food / PERCEPTION_RADIUS).clamp(0, 1.0), 2) * food_mask
+            
+            food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_scores], dim=2)
+            food_in = torch.cat([food_phys, self.tag_food.expand(POP_SIZE, food_phys.shape[1], 4)], dim=2)
+            food_in = food_in * food_mask.unsqueeze(-1)
+            
+            current_idx = fill_buffer(food_in)
 
         # --- 4. 處理隊友 (群體感應) ---
-        if POP_SIZE > 1:
+        if current_idx < MAX_OBJ and POP_SIZE > 1:
             dist_agents = torch.cdist(self.pos, self.pos)
-            dist_agents.fill_diagonal_(999.0) # 排除自身
+            dist_agents.fill_diagonal_(999.0)
             team_mask = (dist_agents < PERCEPTION_RADIUS).float()
             
             t_diff = self.pos.unsqueeze(0) - self.pos.unsqueeze(1)
@@ -386,40 +407,29 @@ class RLSimulation:
             team_scores = (1.0 - dist_agents / PERCEPTION_RADIUS).clamp(0, 1.0) * team_mask
             
             team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_scores], dim=2)
-            team_in = torch.cat([team_phys * team_mask.unsqueeze(-1), 
-                                tag_team.expand(POP_SIZE, team_phys.shape[1], 4) * team_mask.unsqueeze(-1)], dim=2)
-            all_detected_objs.append(team_in)
+            team_in = torch.cat([team_phys, self.tag_team.expand(POP_SIZE, team_phys.shape[1], 4)], dim=2)
+            team_in = team_in * team_mask.unsqueeze(-1)
+            
+            current_idx = fill_buffer(team_in)
 
         # --- 5. 處理敵人 (威脅感應) ---
-        if self.pred_pos.shape[0] > 0:
+        if current_idx < MAX_OBJ and self.pred_pos.shape[0] > 0:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
             pred_mask = (dist_pred < PERCEPTION_RADIUS).float()
             
             p_diff = self.pred_pos.unsqueeze(0) - self.pos.unsqueeze(1)
             p_ang = torch.atan2(p_diff[..., 1], p_diff[..., 0]) - self.angle.unsqueeze(1)
-            # 敵人評分權重加倍 (1.5x)，確保其在 Top-K 篩選中具備更高優先權
             pred_scores = (1.0 - dist_pred / PERCEPTION_RADIUS).clamp(0, 1.0) * pred_mask * 1.5
             
             pred_phys = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_scores], dim=2)
-            pred_in = torch.cat([pred_phys * pred_mask.unsqueeze(-1), 
-                                tag_pred.expand(POP_SIZE, pred_phys.shape[1], 4) * pred_mask.unsqueeze(-1)], dim=2)
-            all_detected_objs.append(pred_in)
-
-        # --- 6. 綜合特徵池化與 Top-K 篩選 ---
-        # 合併所有類型的物體特徵 [Batch, Total_Detected_N, 7]
-        combined_all = torch.cat(all_detected_objs, dim=1)
-        
-        # 根據 score (維度索引 2) 提取前 MAX_OBJ 個最重要物體
-        scores = combined_all[:, :, 2]
-        _, top_indices = torch.topk(scores, MAX_OBJ, dim=1, largest=True)
-        
-        # 根據索引重新聚合特徵，確保輸出 Shape 固定為 [Batch, 20, 7]
-        idx_expanded = top_indices.unsqueeze(-1).expand(-1, -1, 7)
-        mixed_in = torch.gather(combined_all, 1, idx_expanded)
+            pred_in = torch.cat([pred_phys, self.tag_pred.expand(POP_SIZE, pred_phys.shape[1], 4)], dim=2)
+            pred_in = pred_in * pred_mask.unsqueeze(-1)
+            
+            current_idx = fill_buffer(pred_in)
 
         # --- 7. 處理自身狀態 (Self State) ---
         # 包含：標準化後的速率、最後一次轉向動作、剩餘能量比例
-        speed = torch.norm(self.vel, dim=1) / 10.0
+        speed = torch.norm(self.vel, dim=1) / 4.0
         last_steer = self.last_actions[:, 0]
         energy_ratio = self.energy / MAX_ENERGY
         self_in = torch.stack([speed, last_steer, energy_ratio], dim=1)
@@ -440,7 +450,7 @@ class RLSimulation:
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
 
-        rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
+        rewards = torch.full((POP_SIZE,), 0.0, device=DEVICE)
             
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -457,32 +467,45 @@ class RLSimulation:
 
             # Action[1] 為油門 (-1 到 1 映射至 0 到 0.3 加速度)
             throttle = (throttle_val + 1.0) * 0.3
-            # 向量動力學：計算前進方向推力
-            vel = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-            thrust = vel * throttle
+            # 向量動力學：計算當前車頭朝向單位向量
+            forward_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
+            # 推力 = 向量 X 油門
+            thrust = forward_vec * throttle
             self.vel[i] = self.vel[i] * 0.85 + thrust
             
             # 更新位置
             self.pos[i] += self.vel[i]
-            
-            # 1. 基礎移動獎勵：與速度成正比，但不給太多
-            base_move = speed_val * 0.05 
-            # 2. 轉向懲罰：改為「縮減」移動獎勵，而不是直接變負分
-            abs_steer = torch.abs(steer_val)
-            if abs_steer <= 0.5:
-                steer_efficiency = 2.55 - abs_steer * 3 # 即使全舵，也只是獎勵減半，不會倒扣
-            else:
-                steer_efficiency = 1.0
-            # 3. 靜止懲罰：只有當速度真的極低時，才給予微小的負值（惰性懲罰）
-            lazy_penalty = -0.1 if speed_val < 0.5 else 0.0
-            # 4. 高速懲罰
+
+            # --- 移動獎勵
+            # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
+            # 這是最重要的指標：只有往正前方跑才給高分
+            forward_speed = torch.dot(self.vel[i], forward_vec)
+
+            # 2. 基礎移動獎勵：改用 forward_speed
+            # 只有 forward_speed > 0 時才給分，徹底封殺原地打轉和倒車刷分
+            move_gain = torch.clamp(forward_speed, min=0.0) * 0.25
+
+            # 3. 嚴格的轉向懲罰：使用平方係數
+            # 當 steer_val 為 0 時，效率 1.0；當 steer_val 為 1.0 時，效率直接降為 0
+            # 這樣 AI 發現大角度轉向會讓 move_gain 歸零，它會學會非必要不打死舵
+            steer_efficiency = torch.pow(1.0 - torch.abs(steer_val), 2)
+
+            # 3. 靜止/低效懲罰 (Lazy Penalty)
+            # 如果有效前進速度太低，就給予負分，逼它動起來
+            lazy_penalty = -0.15 if forward_speed < 0.4 else 0.0
+
+            # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
-            if speed_val >= 3:
-                # 使用平方讓 1.0 的懲罰遠大於 0.8
-                throttle_penalty = 0.5 * torch.pow((speed_val - 3) / 0.2, 2) 
-            # 5. 最終獎勵
-            move_reward = (base_move * steer_efficiency) + lazy_penalty - throttle_penalty
-            rewards[i] += move_reward
+            if speed_val > 3.5:
+                throttle_penalty = 0.6 * torch.pow((speed_val - 3.5) / 0.5, 2)
+
+            # 5. 最終移動獎勵整合
+            # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
+            rewards[i] += (move_gain * steer_efficiency) + lazy_penalty - throttle_penalty
+
+            # 額外小技巧：鼓勵「踩油門」與「方向正」的組合
+            if throttle_val > 0.5 and torch.abs(steer_val) < 0.1:
+                rewards[i] += 0.05 # 這是「直線衝刺」額外獎勵
 
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
@@ -532,7 +555,7 @@ class RLSimulation:
             
             # 4. 處理獎勵與能量 (安全累加)
             # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
-            reward_increment = torch.full((len(a_idx),), 10.0, device=DEVICE)
+            reward_increment = torch.full((len(a_idx),), 5.0, device=DEVICE)
             rewards.index_add_(0, a_idx, reward_increment)
             energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
             self.energy.index_add_(0, a_idx, energy_increment)
@@ -566,7 +589,7 @@ class RLSimulation:
             rewards[dead_mask] -= 10
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
-            self.respawn_timer[dead_mask] = torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
+            self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
         
         next_states = self.get_states()
         
@@ -714,7 +737,7 @@ class RLSimulation:
             'steps': self.steps,
             'eps': self.epsilon
         }, self.brain_path)
-        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards-Avg: {self.rewards_avg:.4f}, Dead: {self.hit_pred}, Starved: {self.starved}.")
+        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards-Avg: {self.rewards_avg:.4f}, Hit_Pred: {self.hit_pred}, Hit_Wall: {self.hit_wall}, Starved: {self.starved}.")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -750,7 +773,7 @@ class RLSimulation:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
 
-    def draw(self, label_only, draw_perception, draw_alert):
+    def draw(self, label_only, draw_perception, draw_alert, verbose):
         self.screen.fill((20, 20, 25))
 
         if not label_only:
@@ -787,28 +810,31 @@ class RLSimulation:
                 radius = int(4 + 4 * en_ratio)
                 pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
-                # 顯示能量數值
-                energy_text = f"{e_np[i]:.0f}"
-                text_surface = self.font.render(energy_text, True, (255, 255, 255))
-                text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
-                self.screen.blit(text_surface, text_rect)
-
-                # 顯示除錯訊息
                 act = act_np[i]
                 speed = np.linalg.norm(vel_np[i])
-                ctrl_text = f"{act[0]:.2f} {act[1]:.2f} {speed:.2f} {self.rewards[i]:.4f}"
-                ctrl_surface = self.font.render(ctrl_text, True, (255, 255, 255))
-                ctrl_rect = ctrl_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
-                self.screen.blit(ctrl_surface, ctrl_rect)
+
+                # 顯示能量數值
+                if verbose >= 1:
+                    energy_text = f"{e_np[i]:.0f}"
+                    text_surface = self.font.render(energy_text, True, (255, 255, 255))
+                    text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
+                    self.screen.blit(text_surface, text_rect)
+
+                # 顯示除錯訊息
+                if verbose >= 2:
+                    ctrl_text = f"{act[0]:.2f} {act[1]:.2f} {speed:.2f} {self.rewards[i]:.4f}"
+                    ctrl_surface = self.font.render(ctrl_text, True, (255, 255, 255))
+                    ctrl_rect = ctrl_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
+                    self.screen.blit(ctrl_surface, ctrl_rect)
 
                 # 畫出方向指示線
                 throttle = act[1] + 1
                 line_length = 5 + throttle * 10
                 angle = ang_np[i]
                 end_p = (int(p[0] + np.cos(angle) * line_length), int(p[1] + np.sin(angle) * line_length))
-                if throttle < 0.25:
+                if throttle <= 0.5:
                     line_color = (0, 255, 0)
-                elif throttle < 1.5:
+                elif throttle <= 3.5:
                     line_color = (255, 255, 255)
                 else:
                     line_color = (255, 0, 0)
@@ -848,6 +874,7 @@ class RLSimulation:
         draw_perception = False
         move_food = False
         move_predator = True
+        verbose = 0
 
         while running:
             for event in pygame.event.get():
@@ -884,13 +911,15 @@ class RLSimulation:
                         move_food = not move_food
                     elif event.key == pygame.K_m:
                         move_predator = not move_predator
+                    elif event.key == pygame.K_v:
+                        verbose = (verbose + 1) % 3
 
             if not is_paused:
                 self.update(move_food, move_predator)
                 if self.steps % 5000 == 0:
                     self.save_state()
 
-            self.draw(label_only, draw_perception, draw_alert)
+            self.draw(label_only, draw_perception, draw_alert, verbose)
 
         self.save_state()
         pygame.quit()
