@@ -14,9 +14,9 @@ SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
-POP_SIZE = 15
-FOOD_SIZE = 30
-PREDATOR_SIZE = 15
+POP_SIZE = 16
+FOOD_SIZE = 32
+PREDATOR_SIZE = 8
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 10.0
 ENERGY_DECAY = 0.035
@@ -204,46 +204,42 @@ class Critic(nn.Module):
 class ReplayMemory:
     def __init__(self, capacity):
         self.capacity = capacity
-        # 預分配空間 (根據你的 Actor 輸入維度)
-        # s1: mixed_in [MAX_OBJ, FEAT_DIM], s2: self_in [3]
-        self.m_states = np.zeros((capacity, MAX_OBJ, FEAT_DIM), dtype=np.float32)
-        self.s_states = np.zeros((capacity, 3), dtype=np.float32)
-        self.next_m_states = np.zeros((capacity, MAX_OBJ, FEAT_DIM), dtype=np.float32)
-        self.next_s_states = np.zeros((capacity, 3), dtype=np.float32)
-        self.actions = np.zeros((capacity, 2), dtype=np.float32)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.dones = np.zeros(capacity, dtype=np.float32)
+        
+        self.m_states = torch.zeros((capacity, MAX_OBJ, FEAT_DIM), device=DEVICE)
+        self.s_states = torch.zeros((capacity, 3), device=DEVICE)
+        self.next_m_states = torch.zeros((capacity, MAX_OBJ, FEAT_DIM), device=DEVICE)
+        self.next_s_states = torch.zeros((capacity, 3), device=DEVICE)
+        self.actions = torch.zeros((capacity, 2), device=DEVICE)
+        self.rewards = torch.zeros(capacity, device=DEVICE)
+        self.dones = torch.zeros(capacity, device=DEVICE)
         
         self.idx = 0
         self.size = 0
 
     def push(self, m_s, s_s, action, reward, n_m_s, n_s_s, done):
-        # 存入時強制轉為 CPU 上的 NumPy 陣列，切斷梯度
-        self.m_states[self.idx] = m_s.detach().cpu().numpy()
-        self.s_states[self.idx] = s_s.detach().cpu().numpy()
-        self.next_m_states[self.idx] = n_m_s.detach().cpu().numpy()
-        self.next_s_states[self.idx] = n_s_s.detach().cpu().numpy()
-        self.actions[self.idx] = action.detach().cpu().numpy()
-        self.rewards[self.idx] = reward.item()
-        self.dones[self.idx] = done.item()
+        self.m_states[self.idx].copy_(m_s)
+        self.s_states[self.idx].copy_(s_s)
+        self.next_m_states[self.idx].copy_(n_m_s)
+        self.next_s_states[self.idx].copy_(n_s_s)
+        self.actions[self.idx].copy_(action)
+        self.rewards[self.idx] = reward
+        self.dones[self.idx] = done
         
         self.idx = (self.idx + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size):
-        indices = np.random.randint(0, self.size, size=batch_size)
-        
-        # 轉回 Torch Tensor 並送往 GPU (一次性處理一個 Batch，效率最高)
+        indices = torch.randint(0, self.size, (batch_size,), device=DEVICE)
         return (
-            torch.from_numpy(self.m_states[indices]).to(DEVICE),
-            torch.from_numpy(self.s_states[indices]).to(DEVICE),
-            torch.from_numpy(self.actions[indices]).to(DEVICE),
-            torch.from_numpy(self.rewards[indices]).to(DEVICE),
-            torch.from_numpy(self.next_m_states[indices]).to(DEVICE),
-            torch.from_numpy(self.next_s_states[indices]).to(DEVICE),
-            torch.from_numpy(self.dones[indices]).to(DEVICE)
+            self.m_states[indices],
+            self.s_states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_m_states[indices],
+            self.next_s_states[indices],
+            self.dones[indices]
         )
-
+    
     def __len__(self):
         return self.size
 
@@ -327,7 +323,6 @@ class RLSimulation:
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
         self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
-        self.prev_pos = self.pos.clone()
         self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * self.screen_size
         self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
