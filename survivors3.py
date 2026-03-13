@@ -328,6 +328,7 @@ class RLSimulation:
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
         self.prev_pos = self.pos.clone()
         self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * self.screen_size
+        self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
 
@@ -429,7 +430,7 @@ class RLSimulation:
 
         return (mixed_in, self_in)
 
-    def update(self, move_predator):
+    def update(self, move_food, move_predator):
         was_alive = self.alive.clone()
         current_states = self.get_states()
         
@@ -500,7 +501,7 @@ class RLSimulation:
             if not self.alive[i]:
                 continue
             
-            self.energy[i] -= displacement[i] * 0.05
+            # self.energy[i] -= displacement[i] * 0.05
 
             # 只有當位移大於一定程度（代表真的在移動，不是微小震動或繞圈）才給分
             if displacement[i] > 2.0:
@@ -516,43 +517,8 @@ class RLSimulation:
             #     # 空曠地區轉向懲罰
             #     rewards[i] -= torch.abs(actions[i][0]) * 0.1
 
-        # self.energy[self.alive] -= ENERGY_DECAY
+        self.energy[self.alive] -= ENERGY_DECAY
         self.respawn_timer[~self.alive] -= 1
-
-        # 掠食者移動
-        if PREDATOR_SIZE > 0 and move_predator:
-            # 1. 隨機擾動：增加掠食者轉向的變幻莫測感
-            num_preds = self.pred_pos.shape[0]
-            change_mask = torch.rand(num_preds, device=DEVICE) < 0.05
-            if change_mask.any():
-                # 產生隨機加速度擾動
-                random_noise = (torch.rand(int(change_mask.sum()), 2, device=DEVICE) - 0.5) * 1.8
-                self.pred_vel[change_mask] += random_noise
-                
-                # 重新標準化速度，確保掠食者不會無限加速或停下
-                speeds = torch.norm(self.pred_vel, dim=1, keepdim=True)
-                target_speeds = torch.clamp(speeds, 1.5, 3.5)
-                self.pred_vel = (self.pred_vel / (speeds + 1e-6)) * target_speeds
-
-            # 2. 根據速度更新位置
-            self.pred_pos += self.pred_vel
-            # 3. 強力邊界反彈與座標修正 (防止掠食者卡在牆外)
-            hit_left   = self.pred_pos[:, 0] <= 0
-            hit_right  = self.pred_pos[:, 0] >= SCREEN_W - 1
-            hit_top    = self.pred_pos[:, 1] <= 0
-            hit_bottom = self.pred_pos[:, 1] >= SCREEN_H - 1
-            if hit_left.any():
-                self.pred_vel[hit_left, 0] *= -1
-                self.pred_pos[hit_left, 0] = 0
-            if hit_right.any():
-                self.pred_vel[hit_right, 0] *= -1
-                self.pred_pos[hit_right, 0] = SCREEN_W - 1
-            if hit_top.any():
-                self.pred_vel[hit_top, 1] *= -1
-                self.pred_pos[hit_top, 1] = 0
-            if hit_bottom.any():
-                self.pred_vel[hit_bottom, 1] *= -1
-                self.pred_pos[hit_bottom, 1] = SCREEN_H - 1
 
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         if POP_SIZE > 1:
@@ -562,6 +528,18 @@ class RLSimulation:
             team_mask = (min_dist_to_friend < TEAM_RADIUS) & self.alive
             rewards[team_mask] -= 0.1
 
+        # 更新掠食者 (Predators)
+        if PREDATOR_SIZE > 0 and move_predator:
+            self.pred_pos, self.pred_vel = self.update_entities(
+                self.pred_pos, self.pred_vel, min_speed=1.5, max_speed=3.5
+            )
+
+        # 更新食物 (Food) - 假設食物也會移動
+        if FOOD_SIZE > 0 and move_food:
+            self.food_pos, self.food_vel = self.update_entities(
+                self.food_pos, self.food_vel, min_speed=0.5, max_speed=1.0
+            )
+            
         # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
         hits_f = (dist_f < 10.0) & self.alive.unsqueeze(1)
@@ -703,6 +681,46 @@ class RLSimulation:
         else:
             return samples[0]
 
+    def update_entities(self, pos, vel, min_speed, max_speed, jitter_chance=0.05):
+        """
+        高度優化的移動邏輯：完全向量化，無須 CPU 同步判斷。
+        """
+        num_entities = pos.shape[0]
+
+        # 1. 向量化隨機擾動
+        # 直接生成全體的擾動，再用 mask 決定誰要套用，避免 if change_mask.any()
+        change_mask = torch.rand(num_entities, 1, device=DEVICE) < jitter_chance
+        random_noise = (torch.rand(num_entities, 2, device=DEVICE) - 0.5) * 1.8
+        vel += random_noise * change_mask # 只有被選中的會加上噪音
+
+        # 2. 速度約束 (Speed Clamping) - 向量化實作
+        speeds = torch.norm(vel, dim=1, keepdim=True)
+        target_speeds = torch.clamp(speeds, min_speed, max_speed)
+        vel = (vel / (speeds + 1e-6)) * target_speeds
+
+        # 3. 更新位置
+        pos += vel
+
+        # 4. 向量化邊界處理 (Vectorized Boundary Handling)
+        # 取得螢幕寬高，轉換為 Tensor 以進行快速廣播運算
+        # 假設 self.screen_size 為 [W, H]
+        bounds = self.screen_size - 1.0 
+
+        # 檢查左/上邊界 ( < 0 )
+        hit_min = pos < 0
+        vel[hit_min] *= -1
+        pos[hit_min] = 0
+
+        # 檢查右/下邊界 ( > bounds )
+        hit_max = pos > bounds
+        vel[hit_max] *= -1
+        pos[hit_max] = bounds[hit_max % 2].expand_as(pos)[hit_max] 
+        # 註：上方 pos[hit_max] 賦值為了處理 X, Y 不同邊界，更簡單寫法如下：
+        pos[:, 0] = torch.clamp(pos[:, 0], 0, bounds[0])
+        pos[:, 1] = torch.clamp(pos[:, 1], 0, bounds[1])
+
+        return pos, vel
+
     def save_state(self):
         torch.save({
             'pos': self.pos,
@@ -831,6 +849,7 @@ class RLSimulation:
         label_only = False
         draw_alert = False
         draw_perception = False
+        move_food = False
         move_predator = True
 
         while running:
@@ -863,11 +882,13 @@ class RLSimulation:
                         draw_alert = not draw_alert
                     elif event.key == pygame.K_p:
                         draw_perception = not draw_perception
+                    elif event.key == pygame.K_f:
+                        move_food = not move_food
                     elif event.key == pygame.K_m:
                         move_predator = not move_predator
 
             if not is_paused:
-                self.update(move_predator)
+                self.update(move_food, move_predator)
                 if self.steps % 5000 == 0:
                     self.save_state()
 
