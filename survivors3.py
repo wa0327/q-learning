@@ -450,7 +450,7 @@ class RLSimulation:
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
 
-        rewards = torch.full((POP_SIZE,), 0.0, device=DEVICE)
+        rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
             
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -483,7 +483,7 @@ class RLSimulation:
 
             # 2. 基礎移動獎勵：改用 forward_speed
             # 只有 forward_speed > 0 時才給分，徹底封殺原地打轉和倒車刷分
-            move_gain = torch.clamp(forward_speed, min=0.0) * 0.25
+            move_reward = torch.clamp(forward_speed, min=0.0) * 0.05 * torch.pow(1.0 - torch.abs(steer_val), 2)
 
             # 3. 嚴格的轉向懲罰：使用平方係數
             # 當 steer_val 為 0 時，效率 1.0；當 steer_val 為 1.0 時，效率直接降為 0
@@ -501,7 +501,7 @@ class RLSimulation:
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
-            rewards[i] += (move_gain * steer_efficiency) + lazy_penalty - throttle_penalty
+            rewards[i] += (move_reward * steer_efficiency) + lazy_penalty - throttle_penalty
 
             # 額外小技巧：鼓勵「踩油門」與「方向正」的組合
             if throttle_val > 0.5 and torch.abs(steer_val) < 0.1:
@@ -512,7 +512,15 @@ class RLSimulation:
         hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
         hit_wall = (hit_w_x | hit_w_y) & self.alive
 
-        self.respawn_timer[~self.alive] -= 1
+        d_left = self.pos[:, 0]
+        d_right = SCREEN_W - self.pos[:, 0]
+        d_top = self.pos[:, 1]
+        d_bottom = SCREEN_H - self.pos[:, 1]
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
+        wall_ratio_all = (1.0 - wall_dists / PERCEPTION_RADIUS).clamp(0, 1.0)
+        wall_ratio, _ = torch.max(wall_ratio_all, dim=1)
+        wall_penalty = 4.0 * torch.pow(wall_ratio, 2)
+        rewards -= (wall_penalty * self.alive.float())
 
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         if POP_SIZE > 1:
@@ -555,7 +563,7 @@ class RLSimulation:
             
             # 4. 處理獎勵與能量 (安全累加)
             # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
-            reward_increment = torch.full((len(a_idx),), 5.0, device=DEVICE)
+            reward_increment = torch.full((len(a_idx),), 10.0, device=DEVICE)
             rewards.index_add_(0, a_idx, reward_increment)
             energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
             self.energy.index_add_(0, a_idx, energy_increment)
@@ -574,7 +582,8 @@ class RLSimulation:
             danger_mask = (min_dist_p < ALERT_RADIUS) & self.alive
             if danger_mask.any():
                 # 懲罰函數：距離越近扣越多
-                danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
+                danger_ratio = 1.0 - min_dist_p[danger_mask] / ALERT_RADIUS
+                danger_penalty = 8.0 * torch.pow(danger_ratio, 3)
                 rewards[danger_mask] -= danger_penalty
 
             hit_pred = (dist_p < 22.0).any(dim=1) & self.alive
@@ -586,7 +595,7 @@ class RLSimulation:
 
         dead_mask = hit_wall | hit_pred | starved
         if dead_mask.any():
-            rewards[dead_mask] -= 10
+            rewards[dead_mask] -= 15
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
@@ -620,6 +629,7 @@ class RLSimulation:
                 self.energy[idx] = MAX_ENERGY
                 self.vel[idx] = 0.0
 
+        self.respawn_timer[~self.alive] -= 1
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
         self.steps += 1
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
@@ -832,9 +842,9 @@ class RLSimulation:
                 line_length = 5 + throttle * 10
                 angle = ang_np[i]
                 end_p = (int(p[0] + np.cos(angle) * line_length), int(p[1] + np.sin(angle) * line_length))
-                if throttle <= 0.5:
+                if throttle <= 1.0:
                     line_color = (0, 255, 0)
-                elif throttle <= 3.5:
+                elif throttle <= 1.75:
                     line_color = (255, 255, 255)
                 else:
                     line_color = (255, 0, 0)
