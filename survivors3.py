@@ -27,7 +27,7 @@ TEAM_RADIUS = 20        # 友方懲罰半徑
 # DDPG 核心參數
 GAMMA = 0.98
 TAU = 0.005 # 軟更新係數
-LR_ACTOR = 0.003
+LR_ACTOR = 0.0003
 LR_CRITIC = 0.001
 MEMORY_SIZE = 500000
 BATCH_SIZE = 256
@@ -99,37 +99,89 @@ class ActorPlus(nn.Module):
 class ActorAttentionPooling(nn.Module):
     def __init__(self):
         super().__init__()
-        self.obj_enc = nn.Linear(FEAT_DIM, 32)
-        self.self_enc = nn.Linear(3, 32)
-
-        # 使用 MultiheadAttention 讓模型可以同時關注多種目標
-        self.mha = nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
-
+        self.conv = nn.Conv1d(FEAT_DIM, 32, 1)
+        self.attn_weights = nn.Linear(32, 1) 
         self.fc = nn.Sequential(
-            nn.Linear(32 + 3, 64), # 32(全局特徵) + 3(自身狀態 s_in)
+            nn.Linear(32 + 3, 64),
             nn.ReLU(),
             nn.Linear(64, 2),
             nn.Tanh()
         )
 
     def forward(self, m_in, s_in):
-        """
-        m_in: [Batch, MAX_OBJ, FEAT_DIM]  (MAX_OBJ 個物體)
-        s_in: [Batch, 3]                  (自身狀態)
-        action: [Batch, 2]                (動作)
-        """
-        # 1. 編碼物件與自身狀態
-        obj_feat = F.relu(self.obj_enc(m_in))   # [Batch, N, 32]
-        query = self.self_enc(s_in).unsqueeze(1) # [Batch, 1, 32]
-        
-        # 2. 以「自身狀態」為 Query，去物件中找尋資訊
-        # attn_out 是加權後的全局特徵
-        attn_out, _ = self.mha(query, obj_feat, obj_feat) 
-        attn_out = attn_out.squeeze(1) # [Batch, 32]
-        
-        # 3. 結合並輸出
-        combined = torch.cat([attn_out, s_in], dim=1)
+        x = m_in.transpose(1, 2)
+        feat = F.relu(self.conv(x))
+        feat = feat.transpose(1, 2)
+        weights = F.softmax(self.attn_weights(feat), dim=1)
+        x_attn = torch.sum(feat * weights, dim=1)
+        combined = torch.cat([x_attn, s_in], dim=1)
         return self.fc(combined)
+    
+class ActorAttentionPooling2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # 1. 特徵編碼層
+        self.obj_enc = nn.Linear(FEAT_DIM, 64)
+        self.self_enc = nn.Linear(3, 64)
+        
+        # 2. 多頭注意力機制
+        # batch_first=True 讓輸入格式維持 [Batch, Seq, Feature]
+        self.mha = nn.MultiheadAttention(
+            embed_dim=64, 
+            num_heads=4, 
+            batch_first=True
+        )
+        
+        # 3. 穩定機制：LayerNorm 幫助處理不同量級的特徵 (如距離 vs 角度)
+        self.norm = nn.LayerNorm(64)
+        
+        # 4. 決策層 (MLP)
+        self.fc = nn.Sequential(
+            nn.Linear(64 + 3, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 2),
+            nn.Tanh() # 輸出控制在 [-1, 1]，適合轉向與加速
+        )
+
+    def forward(self, m_in, s_in):
+        """
+        m_in: [Batch, MAX_OBJ, FEAT_DIM] - 周遭物體資訊
+        s_in: [Batch, 3]                - 自身狀態 (如: 血量, 速度, 能量)
+        """
+        # --- 步驟 1: 編碼 ---
+        # 提取物體特徵: [Batch, N, 32]
+        obj_feat = F.relu(self.obj_enc(m_in))   
+        
+        # 提取自身狀態作為 Query: [Batch, 1, 32]
+        query = self.self_enc(s_in).unsqueeze(1) 
+        
+        # --- 步驟 2: 注意力檢索 ---
+        # 以自身狀態 (query) 去對物體 (key/value) 做詢問
+        # attn_out 代表「我現在最該關注的環境特徵總和」
+        attn_out, weights = self.mha(query, obj_feat, obj_feat)
+        
+        # --- 步驟 3: 殘差與歸一化 ---
+        # 將「搜尋結果」與「原始意圖 (query)」相加，確保模型不會忘記自己是誰
+        x = self.norm(attn_out + query) 
+        x = x.squeeze(1) # [Batch, 32]
+        
+        # --- 步驟 4: 結合與輸出 ---
+        # 將環境特徵與原始狀態拼接，進行動作決策
+        combined = torch.cat([x, s_in], dim=1) # [Batch, 35]
+        return self.fc(combined)
+
+    def get_attention_map(self, m_in, s_in):
+        """
+        額外功能：回傳注意力權重，讓你可以視覺化 Agent 正在「看」哪顆食物
+        """
+        with torch.no_grad():
+            obj_feat = F.relu(self.obj_enc(m_in))
+            query = self.self_enc(s_in).unsqueeze(1)
+            _, weights = self.mha(query, obj_feat, obj_feat)
+        return weights # [Batch, 1, MAX_OBJ]
     
 # Transformer 結構型
 class ActorTransformer(nn.Module):
@@ -324,7 +376,7 @@ class RLSimulation:
     def reset_env(self):
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
-        self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)        
+        self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
@@ -388,7 +440,7 @@ class RLSimulation:
             
             f_diff = self.food_pos.unsqueeze(0) - self.pos.unsqueeze(1)
             f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
-            food_scores = torch.pow((1.0 - dist_food / PERCEPTION_RADIUS).clamp(0, 1.0), 2) * food_mask
+            food_scores = (dist_food / PERCEPTION_RADIUS).clamp(0, 1.0) * food_mask
             
             food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_scores], dim=2)
             food_in = torch.cat([food_phys, self.tag_food.expand(POP_SIZE, food_phys.shape[1], 4)], dim=2)
@@ -450,7 +502,7 @@ class RLSimulation:
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
 
-        rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
+        rewards = torch.full((POP_SIZE,), 0.0, device=DEVICE)
             
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -482,30 +534,23 @@ class RLSimulation:
             forward_speed = torch.dot(self.vel[i], forward_vec)
 
             # 2. 基礎移動獎勵：改用 forward_speed
-            # 只有 forward_speed > 0 時才給分，徹底封殺原地打轉和倒車刷分
-            move_reward = torch.clamp(forward_speed, min=0.0) * 0.05 * torch.pow(1.0 - torch.abs(steer_val), 2)
+            move_reward = forward_speed * 0.02
 
             # 3. 嚴格的轉向懲罰：使用平方係數
-            # 當 steer_val 為 0 時，效率 1.0；當 steer_val 為 1.0 時，效率直接降為 0
-            # 這樣 AI 發現大角度轉向會讓 move_gain 歸零，它會學會非必要不打死舵
-            steer_efficiency = torch.pow(1.0 - torch.abs(steer_val), 2)
+            steer_penalty = 0.05 * torch.pow(steer_val, 2)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = -0.15 if forward_speed < 0.4 else 0.0
+            lazy_penalty = torch.clamp(0.4 - forward_speed, min=0.0) * 0.2
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
-            if speed_val > 3.5:
-                throttle_penalty = 0.6 * torch.pow((speed_val - 3.5) / 0.5, 2)
+            if speed_val > 3.2:
+                throttle_penalty = 0.6 * torch.pow((speed_val - 3.2) / 0.5, 2) # 3.6|0.04 3.7|0.16 3.75|0.25 3.8|0.36 3.9|0.64 4.0|1.00
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
-            rewards[i] += (move_reward * steer_efficiency) + lazy_penalty - throttle_penalty
-
-            # 額外小技巧：鼓勵「踩油門」與「方向正」的組合
-            if throttle_val > 0.5 and torch.abs(steer_val) < 0.1:
-                rewards[i] += 0.05 # 這是「直線衝刺」額外獎勵
+            rewards[i] += move_reward - steer_penalty - lazy_penalty - throttle_penalty
 
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
@@ -595,7 +640,7 @@ class RLSimulation:
 
         dead_mask = hit_wall | hit_pred | starved
         if dead_mask.any():
-            rewards[dead_mask] -= 15
+            rewards[dead_mask] -= 10
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
@@ -821,7 +866,9 @@ class RLSimulation:
                 pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
                 act = act_np[i]
-                speed = np.linalg.norm(vel_np[i])
+                throttle = act[1] + 1
+                vel = vel_np[i]
+                speed = np.linalg.norm(vel)
 
                 # 顯示能量數值
                 if verbose >= 1:
@@ -832,23 +879,37 @@ class RLSimulation:
 
                 # 顯示除錯訊息
                 if verbose >= 2:
-                    ctrl_text = f"{act[0]:.2f} {act[1]:.2f} {speed:.2f} {self.rewards[i]:.4f}"
+                    ctrl_text = f"{act[0]:.2f} {throttle:.2f} {speed:.2f} {self.rewards[i]:.4f}"
                     ctrl_surface = self.font.render(ctrl_text, True, (255, 255, 255))
                     ctrl_rect = ctrl_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
                     self.screen.blit(ctrl_surface, ctrl_rect)
 
-                # 畫出方向指示線
-                throttle = act[1] + 1
-                line_length = 5 + throttle * 10
-                angle = ang_np[i]
-                end_p = (int(p[0] + np.cos(angle) * line_length), int(p[1] + np.sin(angle) * line_length))
-                if throttle <= 1.0:
-                    line_color = (0, 255, 0)
-                elif throttle <= 1.75:
-                    line_color = (255, 255, 255)
-                else:
-                    line_color = (255, 0, 0)
-                pygame.draw.line(self.screen, line_color, pos_tuple, end_p, 2)
+                # 繪製慣性方向
+                if speed > 0:
+                    v_line_length = 2 + speed * 1.1
+                    # 終點座標 = 當前位置 + 速度向量 * 縮放係數
+                    vel_end_p = (
+                        int(p[0] + vel[0] * v_line_length), 
+                        int(p[1] + vel[1] * v_line_length)
+                    )
+                    inertia_color = (0, 191, 255) # 深天藍色
+                    pygame.draw.line(self.screen, inertia_color, pos_tuple, vel_end_p, 3)
+                    
+                # 繪製方向及油門指示線
+                if throttle > 0:
+                    line_length = 5 + throttle * 10
+                    angle = ang_np[i]
+                    end_p = (
+                        int(p[0] + np.cos(angle) * line_length),
+                        int(p[1] + np.sin(angle) * line_length)
+                    )
+                    if throttle <= 1.0:
+                        line_color = (0, 255, 0)
+                    elif throttle <= 1.75:
+                        line_color = (255, 255, 255)
+                    else:
+                        line_color = (255, 0, 0)
+                    pygame.draw.line(self.screen, line_color, pos_tuple, end_p, 1)
 
                 # 畫出視野範圍
                 if draw_perception:
@@ -898,6 +959,12 @@ class RLSimulation:
                         self.update_caption()
                     elif event.key == pygame.K_DOWN:
                         self.fps -= 5
+                        self.update_caption()
+                    elif event.key == pygame.K_EQUALS:
+                        self.fps = 240
+                        self.update_caption()
+                    elif event.key == pygame.K_MINUS:
+                        self.fps = 5
                         self.update_caption()
                     elif event.key == pygame.K_r:
                         self.reset_env()
