@@ -14,12 +14,12 @@ SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
-POP_SIZE = 20
-FOOD_SIZE = 40
-PREDATOR_SIZE = 40
+POP_SIZE = 15
+FOOD_SIZE = 30
+PREDATOR_SIZE = 15
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 10.0
-ENERGY_DECAY = 0.03
+ENERGY_DECAY = 0.035
 PERCEPTION_RADIUS = 200 # 視野感知半徑
 ALERT_RADIUS = 100      # 敵方懲罰半徑
 TEAM_RADIUS = 20        # 友方懲罰半徑
@@ -286,7 +286,7 @@ class RLSimulation:
         self.steps = 0
         self.a_loss_val = 0.0
         self.c_loss_val = 0.0
-        self.rewards = 0.0
+        self.rewards_avg = 0.0
         self.hit_pred = 0
         self.hit_wall = 0
         self.starved = 0
@@ -319,7 +319,7 @@ class RLSimulation:
         print(f"[{self.actor.__class__.__name__}] Network & Optimizer init complete.")
         
     def reset_env(self):
-        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)   
+        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)        
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
@@ -452,17 +452,16 @@ class RLSimulation:
             if not self.alive[i]:
                 continue
             
-            # 計算當前速度
             speed_val = torch.norm(self.vel[i])
+            steer_val = actions[i][0]     # -1 ~ 1
+            throttle_val = actions[i][1]  # -1 ~ 1
 
-            # actions[0] 為轉向 (-1 到 1 映射至 -0.15 到 0.15 弧度)
-            # 舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
-            steer_power = torch.clamp(speed_val / 2.0, 0, 1.0) 
-            steer = actions[i][0] * 0.15 * steer_power
+            # 映射至 -0.15 到 0.15 弧度，舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
+            steer = steer_val * 0.15 * torch.clamp(speed_val / 2.0, 0, 1.0) 
             self.angle[i] += steer
 
             # Action[1] 為油門 (-1 到 1 映射至 0 到 0.3 加速度)
-            throttle = (actions[i][1] + 1.0) * 0.3
+            throttle = (throttle_val + 1.0) * 0.3
             # 向量動力學：計算前進方向推力
             dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
             self.vel[i] = self.vel[i] * 0.85 + dir_vec * throttle
@@ -470,44 +469,29 @@ class RLSimulation:
             # 更新位置
             self.pos[i] += self.vel[i]
             
-            # # --- 精準進場獎勵 (解決繞圈問題) ---
-            # if min_dist_f[i] < 50.0:
-            #     # 獎勵低速接近：鼓勵精準對準食物
-            #     if speed_val < 1.2:
-            #         rewards[i] += 0.15
-            #     # 懲罰高速衝過頭：防止因轉彎半徑太大繞圈
-            #     elif speed_val > 2.2:
-            #         rewards[i] -= 0.1
-            # else:
-            #     # 遠處時，鼓勵直線加速前進
-            #     forward_bonus = (speed_val / 10.0) * (1.0 - torch.abs(actions[i][0]))
-            #     rewards[i] += forward_bonus * 0.1  # 這會鼓勵直線衝刺
+            # 1. 基礎移動獎勵：與速度成正比，但不給太多
+            base_move = speed_val * 0.05 
+            # 2. 轉向懲罰：改為「縮減」移動獎勵，而不是直接變負分
+            abs_steer = torch.abs(steer_val)
+            if abs_steer <= 0.5:
+                steer_efficiency = 2.55 - abs_steer * 3 # 即使全舵，也只是獎勵減半，不會倒扣
+            else:
+                steer_efficiency = 1.0
+            # 3. 靜止懲罰：只有當速度真的極低時，才給予微小的負值（惰性懲罰）
+            lazy_penalty = -0.1 if speed_val < 0.5 else 0.0
+            # 4. 高速懲罰
+            throttle_penalty = 0.0
+            if speed_val >= 3:
+                # 使用平方讓 1.0 的懲罰遠大於 0.8
+                throttle_penalty = 0.5 * torch.pow((speed_val - 3) / 0.2, 2) 
+            # 5. 最終獎勵
+            move_reward = (base_move * steer_efficiency) + lazy_penalty - throttle_penalty
+            rewards[i] += move_reward
 
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
         hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
         hit_wall = (hit_w_x | hit_w_y) & self.alive
-
-        # 移動距離獎懲
-        displacement = torch.norm(self.pos - self.prev_pos, dim=1)
-        self.prev_pos = self.pos.clone()
-        for i in range(POP_SIZE):
-            if not self.alive[i]:
-                continue
-            
-            # 只有當位移大於一定程度（代表真的在移動，不是微小震動或繞圈）才給分
-            if displacement[i] > 2.0:
-                steer_val = torch.abs(actions[i][0])
-                move_reward = 0.2 * (1.0 - steer_val * 1.5) # 轉向超過 0.66 就會變負分
-                rewards[i] += move_reward
-            else:
-                rewards[i] -= 0.2
-
-            # # 額外懲罰：如果視覺完全沒東西（空曠區）卻還在轉彎
-            # vision_sum = torch.sum(torch.abs(current_states[0][i]))
-            # if vision_sum < 0.01 and torch.abs(actions[i][0]) > 0.3:
-            #     # 空曠地區轉向懲罰
-            #     rewards[i] -= torch.abs(actions[i][0]) * 0.1
 
         self.respawn_timer[~self.alive] -= 1
 
@@ -619,10 +603,11 @@ class RLSimulation:
 
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
         self.steps += 1
-        self.rewards = self.rewards * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
+        self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
         self.hit_pred += hit_pred.sum().item()
         self.hit_wall += hit_wall.sum().item()
         self.starved += starved.sum().item()
+        self.rewards = rewards.detach().cpu().numpy()
 
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
@@ -722,7 +707,7 @@ class RLSimulation:
             'respawn_timer': self.respawn_timer,
             'food_pos': self.food_pos,
             'pred_pos': self.pred_pos,
-            'rewards': self.rewards,
+            'rewards_avg': self.rewards_avg,
             'hit_pred': self.hit_pred,
             'hit_wall': self.hit_wall,
             'starved': self.starved
@@ -733,7 +718,7 @@ class RLSimulation:
             'steps': self.steps,
             'eps': self.epsilon
         }, self.brain_path)
-        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.hit_pred}, Starved: {self.starved}.")
+        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards-Avg: {self.rewards_avg:.4f}, Dead: {self.hit_pred}, Starved: {self.starved}.")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -746,7 +731,7 @@ class RLSimulation:
                 self.respawn_timer = state['respawn_timer']
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
-                self.rewards = state['rewards']
+                self.rewards_avg = state['rewards_avg']
                 self.hit_pred = state['hit_pred']
                 self.hit_wall = state['hit_wall']
                 self.starved = state['starved']
@@ -773,7 +758,9 @@ class RLSimulation:
         self.screen.fill((20, 20, 25))
 
         if not label_only:
-            for f in self.food_pos.cpu().numpy(): pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
+            for f in self.food_pos.cpu().numpy():
+                pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
+
             for p in self.pred_pos.cpu().numpy(): 
                 pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 20, 1)
                 pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 4)
@@ -782,6 +769,9 @@ class RLSimulation:
             a_np = self.alive.cpu().numpy()
             e_np = self.energy.cpu().numpy()
             t_np = self.respawn_timer.cpu().numpy()
+            act_np = self.last_actions.cpu().numpy()
+            vel_np = self.vel.cpu().numpy()
+            ang_np = self.angle.cpu().numpy()
 
             for i, p in enumerate(p_np):
                 if not a_np[i]:
@@ -801,16 +791,31 @@ class RLSimulation:
                 radius = int(4 + 4 * en_ratio)
                 pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
-                # --- 顯示能量數值 ---
-                energy_text = f"{e_np[i]:.0f}" 
-                text_surface = self.font.render(energy_text, True, (255, 255, 255)) # 白色文字
+                # 顯示能量數值
+                energy_text = f"{e_np[i]:.0f}"
+                text_surface = self.font.render(energy_text, True, (255, 255, 255))
                 text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
                 self.screen.blit(text_surface, text_rect)
 
+                # 顯示除錯訊息
+                act = act_np[i]
+                speed = np.linalg.norm(vel_np[i])
+                ctrl_text = f"{act[0]:.2f} {act[1]:.2f} {speed:.2f} {self.rewards[i]:.4f}"
+                ctrl_surface = self.font.render(ctrl_text, True, (255, 255, 255))
+                ctrl_rect = ctrl_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
+                self.screen.blit(ctrl_surface, ctrl_rect)
+
                 # 畫出方向指示線
-                angle = self.angle[i].cpu().item()
-                end_p = (int(p[0] + np.cos(angle)*12), int(p[1] + np.sin(angle)*12))
-                pygame.draw.line(self.screen, (255, 255, 255), pos_tuple, end_p, 2)
+                line_length = 5 + speed * 8
+                angle = ang_np[i]
+                end_p = (int(p[0] + np.cos(angle) * line_length), int(p[1] + np.sin(angle) * line_length))
+                if speed < 1.0:
+                    line_color = (0, 255, 0)
+                elif speed < 3.0:
+                    line_color = (255, 255, 255)
+                else:
+                    line_color = (255, 0, 0)
+                pygame.draw.line(self.screen, line_color, pos_tuple, end_p, 2)
 
                 # 畫出視野範圍
                 if draw_perception:
@@ -825,7 +830,7 @@ class RLSimulation:
             (f"Steps: {self.steps:,}", (0, 255, 255), False),
             (f"A-Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
             (f"C-Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
-            (f"Rewards: {self.rewards:.3f}", (255, 100, 100), False),
+            (f"Rewards: {self.rewards_avg:.3f}", (255, 100, 100), False),
             (f"Hit Pred: {self.hit_pred}", (255, 100, 100), False),
             (f"Hit Wall: {self.hit_wall}", (255, 100, 100), False),
             (f"Starved: {self.starved}", (255, 100, 100), False),
@@ -866,7 +871,7 @@ class RLSimulation:
                     if event.key == pygame.K_r and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
                         self.init_network()
                         self.steps = 0
-                        self.rewards = 0.0
+                        self.rewards_avg = 0.0
                         self.hit_pred = 0
                         self.hit_wall = 0
                         self.starved = 0
