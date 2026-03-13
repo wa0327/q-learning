@@ -463,8 +463,9 @@ class RLSimulation:
             # Action[1] 為油門 (-1 到 1 映射至 0 到 0.3 加速度)
             throttle = (throttle_val + 1.0) * 0.3
             # 向量動力學：計算前進方向推力
-            dir_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-            self.vel[i] = self.vel[i] * 0.85 + dir_vec * throttle
+            vel = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
+            thrust = vel * throttle
+            self.vel[i] = self.vel[i] * 0.85 + thrust
             
             # 更新位置
             self.pos[i] += self.vel[i]
@@ -806,12 +807,13 @@ class RLSimulation:
                 self.screen.blit(ctrl_surface, ctrl_rect)
 
                 # 畫出方向指示線
-                line_length = 5 + speed * 8
+                throttle = act[1] + 1
+                line_length = 5 + throttle * 10
                 angle = ang_np[i]
                 end_p = (int(p[0] + np.cos(angle) * line_length), int(p[1] + np.sin(angle) * line_length))
-                if speed < 1.0:
+                if throttle < 0.25:
                     line_color = (0, 255, 0)
-                elif speed < 3.0:
+                elif throttle < 1.5:
                     line_color = (255, 255, 255)
                 else:
                     line_color = (255, 0, 0)
