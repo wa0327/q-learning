@@ -14,9 +14,9 @@ SCREEN_W, SCREEN_H = 900, 700
 SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
-POP_SIZE = 15
-FOOD_SIZE = 30
-PREDATOR_SIZE = 20
+POP_SIZE = 20
+FOOD_SIZE = 40
+PREDATOR_SIZE = 40
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 10.0
 ENERGY_DECAY = 0.03
@@ -287,7 +287,8 @@ class RLSimulation:
         self.a_loss_val = 0.0
         self.c_loss_val = 0.0
         self.rewards = 0.0
-        self.dead = 0
+        self.hit_pred = 0
+        self.hit_wall = 0
         self.starved = 0
         self.reset_env()
         self.load_state()
@@ -443,12 +444,9 @@ class RLSimulation:
             # 包含噪音的實際執行值。
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
-            
-        rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
-        # # 取得食物距離矩陣 (用於後續獎勵計算)
-        # dist_f_all = torch.cdist(self.pos, self.food_pos)
-        # min_dist_f, _ = torch.min(dist_f_all, dim=1)
 
+        rewards = torch.full((POP_SIZE,), -0.01, device=DEVICE)
+            
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
             if not self.alive[i]:
@@ -488,11 +486,7 @@ class RLSimulation:
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
         hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
-        rewards[hit_w_x | hit_w_y] -= 0.5
-        self.vel[hit_w_x, 0] *= -0.5
-        self.vel[hit_w_y, 1] *= -0.5
-        self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
-        self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
+        hit_wall = (hit_w_x | hit_w_y) & self.alive
 
         # 移動距離獎懲
         displacement = torch.norm(self.pos - self.prev_pos, dim=1)
@@ -501,8 +495,6 @@ class RLSimulation:
             if not self.alive[i]:
                 continue
             
-            # self.energy[i] -= displacement[i] * 0.05
-
             # 只有當位移大於一定程度（代表真的在移動，不是微小震動或繞圈）才給分
             if displacement[i] > 2.0:
                 steer_val = torch.abs(actions[i][0])
@@ -517,7 +509,6 @@ class RLSimulation:
             #     # 空曠地區轉向懲罰
             #     rewards[i] -= torch.abs(actions[i][0]) * 0.1
 
-        self.energy[self.alive] -= ENERGY_DECAY
         self.respawn_timer[~self.alive] -= 1
 
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
@@ -583,16 +574,16 @@ class RLSimulation:
                 danger_penalty = 1.0 * (1.0 - min_dist_p[danger_mask] / ALERT_RADIUS)
                 rewards[danger_mask] -= danger_penalty
 
-            hits_p = (dist_p < 22.0).any(dim=1) & self.alive
-            rewards[hits_p] -= 10  # 被殺死
+            hit_pred = (dist_p < 22.0).any(dim=1) & self.alive
         else:
-            hits_p = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
+            hit_pred = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
+        self.energy[self.alive] -= ENERGY_DECAY
         starved = (self.energy <= 0) & self.alive
-        rewards[starved] -= -8 # 餓死
 
-        dead_mask = hits_p | starved
+        dead_mask = hit_wall | hit_pred | starved
         if dead_mask.any():
+            rewards[dead_mask] -= 10
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
@@ -629,7 +620,8 @@ class RLSimulation:
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
         self.steps += 1
         self.rewards = self.rewards * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
-        self.dead += hits_p.sum().item()
+        self.hit_pred += hit_pred.sum().item()
+        self.hit_wall += hit_wall.sum().item()
         self.starved += starved.sum().item()
 
     def optimize_model(self):
@@ -731,7 +723,8 @@ class RLSimulation:
             'food_pos': self.food_pos,
             'pred_pos': self.pred_pos,
             'rewards': self.rewards,
-            'dead': self.dead,
+            'hit_pred': self.hit_pred,
+            'hit_wall': self.hit_wall,
             'starved': self.starved
         }, SAVE_PATH)
         torch.save({
@@ -740,7 +733,7 @@ class RLSimulation:
             'steps': self.steps,
             'eps': self.epsilon
         }, self.brain_path)
-        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.dead}, Starved: {self.starved}.")
+        print(f"[Saved] Steps: {self.steps}, A-Loss: {self.a_loss_val:.4f}, C-Loss: {self.c_loss_val:.4f}, Rewards: {self.rewards:.4f}, Dead: {self.hit_pred}, Starved: {self.starved}.")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -754,7 +747,8 @@ class RLSimulation:
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
                 self.rewards = state['rewards']
-                self.dead = state['dead']
+                self.hit_pred = state['hit_pred']
+                self.hit_wall = state['hit_wall']
                 self.starved = state['starved']
                 print(f"--- [Loaded] Load completed ---")
             except Exception as e:
@@ -832,7 +826,8 @@ class RLSimulation:
             (f"A-Loss: {self.a_loss_val:.3f}", (255, 100, 100), False),
             (f"C-Loss: {self.c_loss_val:.3f}", (255, 100, 100), False),
             (f"Rewards: {self.rewards:.3f}", (255, 100, 100), False),
-            (f"Dead: {self.dead}", (255, 100, 100), False),
+            (f"Hit Pred: {self.hit_pred}", (255, 100, 100), False),
+            (f"Hit Wall: {self.hit_wall}", (255, 100, 100), False),
             (f"Starved: {self.starved}", (255, 100, 100), False),
             (f"Alive: {int(self.alive.sum())}/{POP_SIZE}", (100, 255, 100), False)
         ]
@@ -872,7 +867,8 @@ class RLSimulation:
                         self.init_network()
                         self.steps = 0
                         self.rewards = 0.0
-                        self.dead = 0
+                        self.hit_pred = 0
+                        self.hit_wall = 0
                         self.starved = 0
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
