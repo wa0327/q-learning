@@ -269,7 +269,7 @@ class RLSimulation:
         self.hit_pred = 0
         self.hit_wall = 0
         self.starved = 0
-        self.max_speed = ((1.0 + 1.0) * THROTTLE_FACTOR) / (1 - DAMPING_FACTOR)
+        self.max_speed = THROTTLE_FACTOR / (1 - DAMPING_FACTOR)
         print(f'=== Max speed: {self.max_speed:.2f} ===')
         self.reset_env()
         self.load_state()
