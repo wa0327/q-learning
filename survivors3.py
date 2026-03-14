@@ -16,17 +16,28 @@ SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
 POP_SIZE = 16
-FOOD_SIZE = 32
-PREDATOR_SIZE = 8
+FOOD_SIZE = POP_SIZE * 2
+PREDATOR_SIZE = 3
+PREDATOR_RADIUS = 10.0
+PREDATOR_CIRCLE = 50.0
+PREDATOR_MIN_SPEED = 1.5
+PREDATOR_MAX_SPEED = 2.5
 MAX_ENERGY = 100.0      # 能量最大總值
-FOOD_ENERGY = 50.0      # 食物補充能量
-ENERGY_DECAY = 0.2      # 每步消耗能量
+FOOD_ENERGY = 25.0      # 食物補充能量
+ENERGY_DECAY = FOOD_ENERGY / 250 # 每步消耗能量
 PERCEPTION_RADIUS = 200 # 視野感知半徑
-ALERT_RADIUS = 100      # 敵方懲罰半徑
+ALERT_RADIUS = 100      # 警戒敵人半徑
 WALL_SENSE_RADIUS = 50  # 牆壁感知半徑
-TEAM_RADIUS = 20        # 友方懲罰半徑
-THROTTLE_FACTOR = 0.3
+TEAM_RADIUS = 30        # 友方過近半徑
+THROTTLE_FACTOR = 0.6
 DAMPING_FACTOR = 0.85
+
+# 獎懲設定
+STEP_REWARD = -0.01     # 每步
+FOOD_REWARD = 15.0      # 吃到食物
+PRED_REWARD = -50.0     # 被吃
+WALL_REWARD = -50.0     # 撞牆
+STARVED_REWARD = -35.0  # 餓死
 
 # DDPG 核心參數
 GAMMA = 0.98
@@ -299,6 +310,7 @@ class RLSimulation:
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
         self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+        self.bounds = self.screen_size - 1.0
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
         self.food_pos = torch.rand(FOOD_SIZE, 2, device=DEVICE) * self.screen_size
         self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
@@ -361,22 +373,22 @@ class RLSimulation:
 
         # --- 3. 處理隊友 (Team: Channel 6-8) ---
         team_in = torch.zeros((POP_SIZE, 3, MAX_OBJ), device=DEVICE)
-        # 確保場上有超過一個代理人才計算隊友
-        # if POP_SIZE > 1:
-        #     dist_agents = torch.cdist(self.pos, self.pos)
-        #     dist_agents.fill_diagonal_(999.0)
-        #     k_t = min(MAX_OBJ, POP_SIZE - 1)
-        #     val_t, t_idx = torch.topk(dist_agents, k_t, largest=False)
+        if POP_SIZE > 1:
+            dist_agents = torch.cdist(self.pos, self.pos)
+            dist_agents.fill_diagonal_(999.0)
+            k_t = min(MAX_OBJ, POP_SIZE - 1)
+            val_t, t_idx = torch.topk(dist_agents, k_t, largest=False)
             
-        #     selected_team_pos = self.pos[t_idx]
-        #     t_diff = selected_team_pos - self.pos.unsqueeze(1)
-        #     t_ang = torch.atan2(t_diff[..., 1], t_diff[..., 0]) - self.angle.unsqueeze(1)
+            selected_team_pos = self.pos[t_idx]
+            t_diff = selected_team_pos - self.pos.unsqueeze(1)
+            t_ang = torch.atan2(t_diff[..., 1], t_diff[..., 0]) - self.angle.unsqueeze(1)
             
-        #     team_score = 1.0 - val_t / TEAM_RADIUS
-        #     team_mask = (val_t < PERCEPTION_RADIUS).float()
+            team_presence = 0.1 * (1.0 - val_t / PERCEPTION_RADIUS).clamp(min=0)
+            team_threat = torch.pow((1.0 - val_t / TEAM_RADIUS).clamp(min=0), 2)
+            team_mask = (val_t < PERCEPTION_RADIUS).float()
             
-        #     team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_score], dim=2) * team_mask.unsqueeze(-1)
-        #     team_in[:, :, :k_t] = team_phys.transpose(1, 2)
+            team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), torch.max(team_presence, team_threat)], dim=2) * team_mask.unsqueeze(-1)
+            team_in[:, :, :k_t] = team_phys.transpose(1, 2)
 
         # --- 5. 合併與自身狀態 ---
         mixed_in = torch.cat([wall_in, food_in, team_in, pred_in], dim=1)
@@ -401,7 +413,7 @@ class RLSimulation:
             # 為了讓 Actor 的輸入與 Critic 的評估基準一致，給予「實際執行值」能讓神經網路更快學會「我的行為與環境變化」之間的關聯。
             self.last_actions = actions.detach().clone()
 
-        rewards = torch.full((POP_SIZE,), 0.05, device=DEVICE)
+        rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
         # 物理運算 (載具動力學)
         for i in range(POP_SIZE):
@@ -410,7 +422,7 @@ class RLSimulation:
             
             speed_val = torch.norm(self.vel[i])
             steer_val = actions[i][0]     # -1~1
-            throttle_val = actions[i][1] + 1.0 # -1~1 映射至 0~2
+            throttle_val = actions[i][1]
 
             # 映射至 -0.15 到 0.15 弧度，舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
             # 1. 基礎舵效：隨速度上升 (0 -> 2.0 速度區間)
@@ -422,7 +434,7 @@ class RLSimulation:
             self.angle[i] += steer
 
             # Action[1] 為油門 (-1 到 1 映射至 0 到 THROTTLE_FACTOR 加速度)
-            throttle = throttle_val * THROTTLE_FACTOR
+            throttle = throttle_val * (THROTTLE_FACTOR if throttle_val > 0 else THROTTLE_FACTOR / 3)
             # 向量動力學：計算當前車頭朝向單位向量
             forward_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
             # 推力 = 向量 X 油門
@@ -432,7 +444,7 @@ class RLSimulation:
             # 更新位置
             self.pos[i] += self.vel[i]
             # 能量消耗
-            self.energy[i] -= ENERGY_DECAY * (1.0 + speed_val / self.max_speed)
+            self.energy[i] -= ENERGY_DECAY * torch.abs(throttle_val)
 
             # --- 移動獎勵
             # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
@@ -450,8 +462,9 @@ class RLSimulation:
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
-            # if throttle_val > 1.75:
-            #     throttle_penalty = 0.3 * torch.pow((throttle_val - 1.75) / (2.0 - 1.75), 2)
+            throttle_threshold = 0.875
+            if throttle_val > throttle_threshold:
+                throttle_penalty = 0.5 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
@@ -475,18 +488,10 @@ class RLSimulation:
         wall_penalty = torch.sum(0.2 * wall_ratios, dim=1)
         rewards -= (wall_penalty * self.alive.float())
 
-        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
-        # if POP_SIZE > 1:
-        #     dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
-        #     # 如果靠太近，給予懲罰
-        #     danger_ratio = (1.0 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-        #     danger_penalty = torch.sum(danger_ratio, dim=1)
-        #     rewards -= (danger_penalty * self.alive.float())
-
         # 更新掠食者 (Predators)
         if PREDATOR_SIZE > 0 and move_predator:
             self.pred_pos, self.pred_vel = self.update_entities(
-                self.pred_pos, self.pred_vel, min_speed=1.5, max_speed=3.0
+                self.pred_pos, self.pred_vel, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
             )
 
         # 更新食物 (Food) - 假設食物也會移動
@@ -516,7 +521,7 @@ class RLSimulation:
             
             # 4. 處理獎勵與能量 (安全累加)
             # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
-            reward_increment = torch.full((len(a_idx),), 15.0, device=DEVICE)
+            reward_increment = torch.full((len(a_idx),), FOOD_REWARD, device=DEVICE)
             rewards.index_add_(0, a_idx, reward_increment)
             energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
             self.energy.index_add_(0, a_idx, energy_increment)
@@ -525,8 +530,16 @@ class RLSimulation:
             # 5. 重生食物
             # 注意：這裡的 f_idx 保證是不重複的 (因為每個食物只會選出一個最近的 Agent)
             # 所以直接用 f_idx 即可，不需要再做 unique
-            self.food_pos[f_idx] = self.respawn_food(f_idx, a_idx)
+            self.food_pos[f_idx] = self.get_risky_pos(len(f_idx))
             
+        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
+        if POP_SIZE > 1:
+            dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
+            # 如果靠太近，給予懲罰
+            team_ratio = (1.0 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_penalty = torch.sum(torch.pow(team_ratio, 2), dim=1)
+            rewards -= (team_penalty * self.alive.float())
+
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
             dist_p = torch.cdist(self.pos, self.pred_pos)
@@ -534,7 +547,7 @@ class RLSimulation:
             danger_penalty = torch.sum(torch.pow(danger_ratio, 2), dim=1)
             rewards -= (danger_penalty * self.alive.float())
             
-            hit_pred = (dist_p < 22.0).any(dim=1) & self.alive
+            hit_pred = (dist_p < PREDATOR_CIRCLE).any(dim=1) & self.alive
         else:
             hit_pred = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
@@ -543,15 +556,15 @@ class RLSimulation:
         dead_mask = hit_wall | hit_pred | starved
         if dead_mask.any():
             remaining_dead = dead_mask.clone()
-            rewards[hit_pred] -= 50
+            rewards[hit_pred] += PRED_REWARD
             remaining_dead &= ~hit_pred
 
             wall_mask = remaining_dead & hit_wall
-            rewards[wall_mask] -= 50
+            rewards[wall_mask] += WALL_REWARD
             remaining_dead &= ~wall_mask
 
             starve_mask = remaining_dead & starved
-            rewards[starve_mask] -= 40
+            rewards[starve_mask] += STARVED_REWARD
 
             self.alive[dead_mask] = False
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
@@ -579,12 +592,10 @@ class RLSimulation:
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
         if ready_to_respawn.any():
             indices = torch.where(ready_to_respawn)[0]
-            for idx in indices:
-                safe_pos = self.get_safest_pos()
-                self.pos[idx] = safe_pos
-                self.alive[idx] = True
-                self.energy[idx] = MAX_ENERGY
-                self.vel[idx] = 0.0
+            self.pos[indices] = self.get_saftest_pos(len(indices))
+            self.alive[indices] = True
+            self.energy[indices] = MAX_ENERGY
+            self.vel[indices] = 0.0
 
         self.respawn_timer[~self.alive] -= 1
         self.epsilon = max(EPSILON_END, self.epsilon * EPSILON_DECAY)
@@ -630,54 +641,96 @@ class RLSimulation:
         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
 
-    def get_safest_pos(self):
+    def get_saftest_pos(self, n):
+        """
+        一次為 n 個實體尋找安全位置。
+        n: 需要生成的點數量。
+        """
         pad = 10.0
-        samples = torch.empty((5, 2), device=DEVICE)
+        # 候選樣本數
+        num_samples = max(n * 10, PREDATOR_SIZE)
+        samples = torch.empty((num_samples, 2), device=DEVICE)
         samples[:, 0].uniform_(pad, SCREEN_W - pad)
         samples[:, 1].uniform_(pad, SCREEN_H - pad)
 
+        # 如果有掠食者，進行距離篩選
         if PREDATOR_SIZE > 0:
+            # 計算矩陣：(候選點數, 掠食者數)
             dists = torch.cdist(samples, self.pred_pos)
-            min_dists = torch.min(dists, dim=1).values
-            best_idx = torch.argmax(min_dists)
-            return samples[best_idx]
+            
+            # 找到每個候選點離「最近掠食者」的距離
+            min_dists = dists.min(dim=1).values
+            
+            # 從中選出最遠（最安全）的前 n 個點
+            _, top_indices = torch.topk(min_dists, k=n)
+            
+            # 如果需要的 n 比 top_indices 多（雖然機率極低），用 repeat 補齊
+            return samples[top_indices]
         else:
-            return samples[0]
+            # 無掠食者時，直接隨機回傳 n 個點
+            return samples[:n]
 
+    def get_risky_pos(self, n):
+        """
+        找尋離掠食者最近，但距離至少大於 min_threshold 的位置。
+        """
+        if n <= 0: return torch.empty((0, 2), device=DEVICE)
+
+        pad = 10.0
+        # 增加樣本數
+        num_samples = max(n * 20, PREDATOR_SIZE) 
+        samples = torch.empty((num_samples, 2), device=DEVICE)
+        samples[:, 0].uniform_(pad, SCREEN_W - pad)
+        samples[:, 1].uniform_(pad, SCREEN_H - pad)
+
+        if PREDATOR_SIZE:
+            # 1. 計算所有樣本到掠食者的最近距離
+            dists = torch.cdist(samples, self.pred_pos)
+            min_dists = dists.min(dim=1).values
+            
+            # 2. 建立遮罩：找出符合「距離 > 50」條件的點
+            valid_mask = min_dists >= 50.0
+
+            # 3. 處理符合條件的樣本
+            if valid_mask.any():
+                valid_min_dists = min_dists[valid_mask]
+                valid_samples = samples[valid_mask]
+                
+                # 4. 反向找「最近」: largest=False
+                # 這會回傳 valid_min_dists 中數值最小的前 k 個
+                _, top_indices = torch.topk(valid_min_dists, k=n, largest=False)
+                return valid_samples[top_indices]
+            else:
+                # 如果全部點都離掠食者太近 (極端情況)，退而求其次回傳最遠的點
+                _, top_indices = torch.topk(min_dists, k=n, largest=True)
+                return samples[top_indices]
+        else:
+            # 無掠食者時，隨機回傳
+            return samples[:n]
+        
     def update_entities(self, pos, vel, min_speed, max_speed, jitter_chance=0.05):
-        num_entities = pos.shape[0]
+        # 1. 向量化隨機擾動 (使用雜湊式隨機避免 if 分支)
+        change_mask = torch.rand(pos.shape[0], 1, device=DEVICE) < jitter_chance
+        # 直接在原位修改 vel，減少記憶體配置
+        vel.add_((torch.rand_like(vel) - 0.5) * (1.8 * change_mask))
 
-        # 1. 向量化隨機擾動
-        # 直接生成全體的擾動，再用 mask 決定誰要套用，避免 if change_mask.any()
-        change_mask = torch.rand(num_entities, 1, device=DEVICE) < jitter_chance
-        random_noise = (torch.rand(num_entities, 2, device=DEVICE) - 0.5) * 1.8
-        vel += random_noise * change_mask # 只有被選中的會加上噪音
-
-        # 2. 速度約束 (Speed Clamping) - 向量化實作
+        # 2. 速度約束 (In-place 操作優化)
         speeds = torch.norm(vel, dim=1, keepdim=True)
-        target_speeds = torch.clamp(speeds, min_speed, max_speed)
-        vel = (vel / (speeds + 1e-6)) * target_speeds
+        # 使用 clamp_ 進行原位限制，並處理除以零
+        new_speeds = torch.clamp(speeds, min_speed, max_speed)
+        vel.mul_(new_speeds / (speeds + 1e-6))
 
         # 3. 更新位置
-        pos += vel
+        pos.add_(vel)
 
-        # 4. 向量化邊界處理 (Vectorized Boundary Handling)
-        # 取得螢幕寬高，轉換為 Tensor 以進行快速廣播運算
-        # 假設 self.screen_size 為 [W, H]
-        bounds = self.screen_size - 1.0 
-
-        # 檢查左/上邊界 ( < 0 )
-        hit_min = pos < 0
-        vel[hit_min] *= -0.5
-        pos[hit_min] = 0
-
-        # 檢查右/下邊界 ( > bounds )
-        hit_max = pos > bounds
-        vel[hit_max] *= -0.5
-        pos[hit_max] = bounds[hit_max % 2].expand_as(pos)[hit_max] 
-        # 註：上方 pos[hit_max] 賦值為了處理 X, Y 不同邊界，更簡單寫法如下：
-        pos[:, 0] = torch.clamp(pos[:, 0], 0, bounds[0])
-        pos[:, 1] = torch.clamp(pos[:, 1], 0, bounds[1])
+        # 4. 高效邊界處理 (使用 torch.abs_ 搭配 clamp_)
+        # 檢查是否超出邊界：若超出，速度反向
+        # 邏輯：如果 pos < 0 或 pos > bounds，速度就乘上 -1
+        out_of_bounds = (pos < 0) | (pos > self.bounds)
+        vel[out_of_bounds] *= -1.0
+        
+        # 將位置限制在畫布內
+        pos.clamp_(torch.zeros_like(self.bounds), self.bounds)
 
         return pos, vel
 
@@ -785,8 +838,8 @@ class RLSimulation:
                 pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
 
             for p in self.pred_pos.cpu().numpy(): 
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 20, 1)
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), 4)
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_CIRCLE, 1)
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS)
 
             p_np = self.pos.cpu().numpy()
             a_np = self.alive.cpu().numpy()
@@ -816,7 +869,7 @@ class RLSimulation:
                 pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
                 act = act_np[i]
-                throttle = act[1] + 1
+                throttle = act[1]
                 vel = vel_np[i]
                 speed = np.linalg.norm(vel)
 
@@ -845,20 +898,29 @@ class RLSimulation:
                     pygame.draw.line(self.screen, inertia_color, pos_tuple, vel_end_p, 3)
                     
                 # 繪製方向及油門指示線
-                if throttle > 0:
-                    line_length = 5 + throttle * 10
+                if throttle != 0:
+                    power = abs(throttle)
                     angle = ang_np[i]
+                    if throttle > 0:
+                        line_width = 1
+                        if power <= 0.5:
+                            line_color = (0, 255, 0)
+                        elif power <= 0.875:
+                            line_color = (255, 255, 255)
+                        else:
+                            line_color = (255, 0, 0)
+                    else:
+                        power /= 3
+                        angle += np.pi
+                        line_width = 5
+                        line_color = (255, 255, 0)
+
+                    line_length = 25 * power
                     end_p = (
                         int(p[0] + np.cos(angle) * line_length),
                         int(p[1] + np.sin(angle) * line_length)
                     )
-                    if throttle <= 1.0:
-                        line_color = (0, 255, 0)
-                    elif throttle <= 1.75:
-                        line_color = (255, 255, 255)
-                    else:
-                        line_color = (255, 0, 0)
-                    pygame.draw.line(self.screen, line_color, pos_tuple, end_p, 1)
+                    pygame.draw.line(self.screen, line_color, pos_tuple, end_p, line_width)
 
                 # 畫出視野範圍
                 if draw_perception:
