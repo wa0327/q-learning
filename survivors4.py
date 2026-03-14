@@ -35,11 +35,11 @@ THROTTLE_FACTOR = 0.6
 DAMPING_FACTOR = 0.85
 
 # 獎懲設定
-STEP_REWARD = -0.01    # 每步
-FOOD_REWARD = 10.0     # 吃到食物
-KILLED_REWARD = -5.0   # 被殺
-COLLIDED_REWARD = -5.0 # 撞死
-STARVED_REWARD = -3.0  # 餓死
+STEP_REWARD = -0.005   # 每步
+FOOD_REWARD = 1.0      # 吃到食物
+KILLED_REWARD = -1.0   # 被殺
+COLLIDED_REWARD = -0.8 # 撞死
+STARVED_REWARD = -0.9  # 餓死
 
 # 模型核心參數
 GAMMA = 0.99
@@ -53,6 +53,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
+MIN_ALPHA = 0.05
 MAX_OBJ = 5     # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -207,8 +208,6 @@ class RLSimulation:
         # 初始化神經網路
         self.init_network(Actor, Critic)
         self.brain_path = f"{script_name}_{self.actor.__class__.__name__}.pt"
-        
-        self.memory = ReplayMemory(MEMORY_SIZE)
         self.max_speed = THROTTLE_FACTOR / (1 - DAMPING_FACTOR)
         print(f'=== Max speed: {self.max_speed:.2f} ===')
         self.reset_env()
@@ -247,6 +246,8 @@ class RLSimulation:
         if critic is None:
             critic = self.critic.__class__
 
+        self.steps = 0
+        
         self.actor = actor().to(DEVICE)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
 
@@ -260,7 +261,8 @@ class RLSimulation:
         self.log_alpha = torch.tensor([math.log(INIT_ALPHA)], requires_grad=True, device=DEVICE)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=LR_ACTOR)
 
-        self.steps = 0
+        self.memory = ReplayMemory(MEMORY_SIZE)
+
         self.last_info = {
             "alpha": 0.0,
             "q_val": 0.0,
@@ -280,6 +282,7 @@ class RLSimulation:
         d_b = d_b.unsqueeze(1)
 
         alpha = self.log_alpha.exp().detach() # 當前熵係數
+        alpha = torch.clamp(alpha, min=MIN_ALPHA)
 
         # --- 更新 Critic ---
         with torch.no_grad():
@@ -453,7 +456,7 @@ class RLSimulation:
             
             # 更新位置
             self.pos[i] += self.vel[i]
-            
+
             # 能量消耗
             static_cost = 0.2 * ENERGY_DECAY                                          # 基礎消耗 (0.02)
             dynamic_cost = 0.8 * ENERGY_DECAY * torch.pow(torch.abs(throttle_val), 2) # 動態消耗 (最大 0.08)
@@ -471,7 +474,7 @@ class RLSimulation:
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = 0.1 * torch.clamp(0.4 - forward_speed, min=0.0)
+            lazy_penalty = 0.03 * torch.clamp(0.4 - forward_speed, min=0.0)
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
@@ -492,6 +495,7 @@ class RLSimulation:
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
 
+        # 近牆痛覺
         d_left = self.pos[:, 0]
         d_right = (SCREEN_W - 1) - self.pos[:, 0]
         d_top = self.pos[:, 1]
@@ -765,10 +769,14 @@ class RLSimulation:
             'starved': self.starved
         }, SAVE_PATH)
         torch.save({
+            'steps': self.steps,
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
-            'steps': self.steps,
-            'info': self.last_info
+            'critic_target': self.critic_target.state_dict(),
+            'log_alpha': self.log_alpha,
+            'actor_opt': self.actor_opt.state_dict(),
+            'critic_opt': self.critic_opt.state_dict(),
+            'alpha_opt': self.alpha_opt.state_dict(),
         }, self.brain_path)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
@@ -796,11 +804,15 @@ class RLSimulation:
         if os.path.exists(self.brain_path):
             try:
                 brain_state = torch.load(self.brain_path, map_location=DEVICE)
+                self.steps = brain_state['steps']
                 self.actor.load_state_dict(brain_state['actor'])
                 self.critic.load_state_dict(brain_state['critic'])
-                self.critic_target.load_state_dict(self.critic.state_dict())
-                self.steps = brain_state['steps']
-                self.last_info = brain_state['info']
+                self.critic_target.load_state_dict(brain_state['critic_target'])
+                with torch.no_grad():
+                    self.log_alpha.copy_(brain_state['log_alpha'])
+                self.actor_opt.load_state_dict(brain_state['actor_opt'])
+                self.critic_opt.load_state_dict(brain_state['critic_opt'])
+                self.alpha_opt.load_state_dict(brain_state['alpha_opt'])
                 print(f"--- [Loaded] brain weights {self.brain_path}, steps {self.steps:,} ---")
                 return True
             except Exception as e:
