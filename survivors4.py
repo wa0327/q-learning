@@ -325,10 +325,10 @@ class RLSimulation:
 
         self.last_info = {
             "alpha": alpha.item(),
-            "q_val": torch.min(q1_current, q2_current).mean().item(),
             "entropy": -log_probs.mean().item(),
-            "a_loss": actor_loss.item(),
-            "c_loss": critic_loss.item()
+            "q_val": torch.min(q1_current, q2_current).mean().item(),
+            "c_loss": critic_loss.item(),
+            "a_loss": actor_loss.item()
         }
 
     def get_states(self):
@@ -453,8 +453,11 @@ class RLSimulation:
             
             # 更新位置
             self.pos[i] += self.vel[i]
+            
             # 能量消耗
-            self.energy[i] -= ENERGY_DECAY * torch.abs(throttle_val)
+            static_cost = 0.2 * ENERGY_DECAY                                          # 基礎消耗 (0.02)
+            dynamic_cost = 0.8 * ENERGY_DECAY * torch.pow(torch.abs(throttle_val), 2) # 動態消耗 (最大 0.08)
+            self.energy[i] -= static_cost + dynamic_cost
 
             # --- 移動獎勵
             # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
@@ -540,7 +543,7 @@ class RLSimulation:
             # 5. 重生食物
             # 注意：這裡的 f_idx 保證是不重複的 (因為每個食物只會選出一個最近的 Agent)
             # 所以直接用 f_idx 即可，不需要再做 unique
-            self.food_pos[f_idx] = self.get_risky_pos(len(f_idx))
+            self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
             
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         if POP_SIZE > 1:
@@ -644,7 +647,7 @@ class RLSimulation:
             # 無掠食者時，直接隨機回傳 n 個點
             return samples[:n]
 
-    def get_risky_pos(self, n):
+    def get_risky_pos(self, n, min_dist=50.0):
         """
         找尋離掠食者最近，但距離至少大於 min_threshold 的位置。
         """
@@ -663,7 +666,7 @@ class RLSimulation:
             min_dists = dists.min(dim=1).values
             
             # 2. 建立遮罩：找出符合「距離 > 50」條件的點
-            valid_mask = min_dists >= 50.0
+            valid_mask = min_dists >= min_dist
 
             # 3. 處理符合條件的樣本
             if valid_mask.any():
@@ -769,7 +772,7 @@ class RLSimulation:
         }, self.brain_path)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
-        print(f"[{now}][Save] Steps:{self.steps} Alpha:{info['alpha']:.4f} Q-Val:{info['q_val']:.4f} Entropy:{info['entropy']:.4f} A-Loss:{info['a_loss']:.4f} C-Loss:{info['c_loss']:.4f} Rewards-Avg:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
+        print(f"[{now}][Save] Steps:{self.steps} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -855,7 +858,7 @@ class RLSimulation:
 
                 # 顯示除錯訊息
                 if verbose >= 2:
-                    dbg_text = f"{throttle:.2f} {self.rewards[i]:.4f}"
+                    dbg_text = f"{throttle:.2f} {speed:.2f} {self.rewards[i]:.4f}"
                     dbg_surface = self.font.render(dbg_text, True, (255, 255, 255))
                     dbg_rect = dbg_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
                     self.screen.blit(dbg_surface, dbg_rect)
@@ -915,11 +918,12 @@ class RLSimulation:
         info = self.last_info
         left_labels = [
             ("Steps:", f"{self.steps:,}", THEME["perf"], True),
-            ("Alpha:", f"{info['alpha']:.4f}", THEME["param"], False),
-            ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
+            ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
+            ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
             ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
-            ("A-Loss:", f"{info['a_loss']:.4f}", THEME["loss"], False),
-            ("C-Loss:", f"{info['c_loss']:.4f}", THEME["loss"], False),
+            ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
+            ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
+            ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
             ("Rewards:", f"{self.rewards_avg:.3f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
             ("Killed:", f"{self.killed:,}", THEME["loss"], False),
             ("Collided:", f"{self.collided:,}", THEME["loss"], False),
