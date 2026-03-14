@@ -18,10 +18,11 @@ SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
 POP_SIZE = 16
+POP_RADIUS = 4
 FOOD_SIZE = POP_SIZE * 2
+FOOD_RADIUS = 3
 PREDATOR_SIZE = 3
-PREDATOR_RADIUS = 10.0
-PREDATOR_CIRCLE = 50.0
+PREDATOR_RADIUS = 20.0
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
 MAX_ENERGY = 100.0      # 能量最大總值
@@ -467,20 +468,20 @@ class RLSimulation:
             forward_speed = torch.dot(self.vel[i], forward_vec)
 
             # 2. 基礎移動獎勵：改用 forward_speed
-            move_reward = forward_speed * 0.1
+            move_reward = forward_speed * 0.01250
 
             # 3. 嚴格的轉向懲罰
-            steer_penalty = 0.01 * torch.pow(steer_val, 2) * (speed_val / self.max_speed)
+            steer_penalty = 0.00125 * torch.pow(steer_val, 2) * (speed_val / self.max_speed)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = 0.03 * torch.clamp(0.4 - forward_speed, min=0.0)
+            lazy_penalty = 0.00375 * torch.clamp(0.4 - forward_speed, min=0.0)
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
             throttle_threshold = 0.875
             if throttle_val > throttle_threshold:
-                throttle_penalty = 0.05 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
+                throttle_penalty = 0.00625 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
@@ -502,19 +503,19 @@ class RLSimulation:
         d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
         wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
         wall_ratios = (1.0 - wall_dists / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
-        wall_penalty = torch.sum(0.05 * wall_ratios, dim=1)
+        wall_penalty = torch.sum(0.015 * wall_ratios, dim=1)
         rewards -= (wall_penalty * self.alive.float())
 
         # 更新掠食者 (Predators)
         if PREDATOR_SIZE > 0 and move_predator:
             self.pred_pos, self.pred_vel = self.update_entities(
-                self.pred_pos, self.pred_vel, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
+                self.pred_pos, self.pred_vel, PREDATOR_RADIUS, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
             )
 
         # 更新食物 (Food) - 假設食物也會移動
         if FOOD_SIZE > 0 and move_food:
             self.food_pos, self.food_vel = self.update_entities(
-                self.food_pos, self.food_vel, min_speed=0.5, max_speed=1.0
+                self.food_pos, self.food_vel, 2, min_speed=0.5, max_speed=1.0
             )
             
         # 食物碰撞
@@ -553,18 +554,18 @@ class RLSimulation:
         if POP_SIZE > 1:
             dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
             # 如果靠太近，給予懲罰
-            team_ratio = (0.02 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-            team_penalty = torch.mean(torch.pow(team_ratio, 2), dim=1)
+            team_ratio = (0.002 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_penalty = torch.sum(torch.pow(team_ratio, 2), dim=1)
             rewards -= (team_penalty * self.alive.float())
 
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
             dist_p = torch.cdist(self.pos, self.pred_pos)
             danger_ratio = (0.5 - dist_p / ALERT_RADIUS).clamp(min=0.0, max=1.0)
-            danger_penalty, _ = torch.max(torch.pow(danger_ratio, 2), dim=1)
+            danger_penalty = torch.sum(0.015 * danger_ratio, dim=1)
             rewards -= (danger_penalty * self.alive.float())
             
-            killed = (dist_p < PREDATOR_CIRCLE).any(dim=1) & self.alive
+            killed = (dist_p < PREDATOR_RADIUS).any(dim=1) & self.alive
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
@@ -688,33 +689,32 @@ class RLSimulation:
         else:
             # 無掠食者時，隨機回傳
             return samples[:n]
-        
-    def update_entities(self, pos, vel, min_speed, max_speed, jitter_chance=0.05):
-        # 1. 向量化隨機擾動 (使用雜湊式隨機避免 if 分支)
+       
+    def update_entities(self, pos, vel, radius, min_speed, max_speed, jitter_chance=0.05):
+        # 1. 向量化隨機擾動
         change_mask = torch.rand(pos.shape[0], 1, device=DEVICE) < jitter_chance
-        # 直接在原位修改 vel，減少記憶體配置
         vel.add_((torch.rand_like(vel) - 0.5) * (1.8 * change_mask))
 
-        # 2. 速度約束 (In-place 操作優化)
+        # 2. 速度約束
         speeds = torch.norm(vel, dim=1, keepdim=True)
-        # 使用 clamp_ 進行原位限制，並處理除以零
         new_speeds = torch.clamp(speeds, min_speed, max_speed)
         vel.mul_(new_speeds / (speeds + 1e-6))
 
         # 3. 更新位置
         pos.add_(vel)
 
-        # 4. 高效邊界處理 (使用 torch.abs_ 搭配 clamp_)
-        # 檢查是否超出邊界：若超出，速度反向
-        # 邏輯：如果 pos < 0 或 pos > bounds，速度就乘上 -1
-        out_of_bounds = (pos < 0) | (pos > self.bounds)
+        # 4. 高效邊界處理 (考慮半徑)
+        min_bound = torch.full_like(self.bounds, radius)
+        max_bound = self.bounds - radius
+        out_of_bounds = (pos < min_bound) | (pos > max_bound)
         vel[out_of_bounds] *= -1.0
         
-        # 將位置限制在畫布內
-        pos.clamp_(torch.zeros_like(self.bounds), self.bounds)
+        # 修正位置：確保物體不會卡在牆外
+        # 使用 clamp_ 將座標限制在 [radius, bounds - radius] 之間
+        pos.clamp_(min_bound, max_bound)
 
         return pos, vel
-
+    
     def respawn_food(self, f_idx, a_idx):
         num_to_respawn = len(f_idx)
         pad = 10.0  # 避免生在牆縫裡，Agent 很難吃到
@@ -818,17 +818,16 @@ class RLSimulation:
             except Exception as e:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
-
     def draw(self, label_only, draw_perception, draw_alert, verbose):
         self.screen.fill((20, 20, 25))
 
         if not label_only:
             for f in self.food_pos.cpu().numpy():
-                pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), 3)
+                pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), FOOD_RADIUS)
 
             for p in self.pred_pos.cpu().numpy(): 
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_CIRCLE, 1)
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS)
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS, 1)
+                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS * 0.25)
 
             p_np = self.pos.cpu().numpy()
             a_np = self.alive.cpu().numpy()
@@ -854,7 +853,7 @@ class RLSimulation:
                 g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
                 b = int(255 * (1 - en_ratio))    # 越餓越藍
                 color = (r, g, b)
-                radius = int(4 + 4 * en_ratio)
+                radius = int(POP_RADIUS + 4 * en_ratio)
                 pygame.draw.circle(self.screen, color, pos_tuple, radius)
 
                 act = act_np[i]
@@ -936,7 +935,7 @@ class RLSimulation:
             ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
             ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
             ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
-            ("Rewards:", f"{self.rewards_avg:.3f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
+            ("Rewards:", f"{self.rewards_avg:.4f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
             ("Killed:", f"{self.killed:,}", THEME["loss"], False),
             ("Collided:", f"{self.collided:,}", THEME["loss"], False),
             ("Starved:", f"{self.starved:,}", THEME["loss"], False),
