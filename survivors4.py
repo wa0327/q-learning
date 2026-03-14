@@ -35,11 +35,11 @@ THROTTLE_FACTOR = 0.6
 DAMPING_FACTOR = 0.85
 
 # 獎懲設定
-STEP_REWARD = 0.01     # 每步
-FOOD_REWARD = 1.5      # 吃到食物
-PRED_REWARD = -5.0     # 被吃
-WALL_REWARD = -5.0     # 撞牆
-STARVED_REWARD = -5.0  # 餓死
+STEP_REWARD = -0.01    # 每步
+FOOD_REWARD = 10.0     # 吃到食物
+KILLED_REWARD = -5.0   # 被殺
+COLLIDED_REWARD = -5.0 # 撞死
+STARVED_REWARD = -3.0  # 餓死
 
 # 模型核心參數
 GAMMA = 0.99
@@ -48,14 +48,12 @@ LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
 MEMORY_SIZE = 100000
 BATCH_SIZE = 256
-MAX_OBJ = 5     # 最大環境物件數量
 FEAT_DIM = 12   # 每個物件特微 [cos, sin, score] x 四種類型
 STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
-# 1.0 (log_alpha = 0.0)：適合剛開始訓練時環境完全陌生的情況，Agent 會非常隨機。
-# 0.2 (log_alpha = -1.6)：適合你已經有一套不錯的獎勵機制，希望 Agent 稍微穩定一點的情況。
-INIT_ALPHA = 0.2
+INIT_ALPHA = 1.0
+MAX_OBJ = 5     # 最大環境物件數量
 
 # --- SAC 網路架構 ---
 class Actor(nn.Module):
@@ -226,8 +224,8 @@ class RLSimulation:
 
     def reset_env(self):
         self.rewards_avg = 0.0
-        self.hit_pred = 0
-        self.hit_wall = 0
+        self.killed = 0
+        self.collided = 0
         self.starved = 0
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
@@ -485,7 +483,7 @@ class RLSimulation:
         # 邊界碰撞處理 (反彈)
         hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
         hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
-        hit_wall = (hit_w_x | hit_w_y) & self.alive
+        collided = (hit_w_x | hit_w_y) & self.alive
         self.vel[hit_w_x, 0] *= -0.5
         self.vel[hit_w_y, 1] *= -0.5
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
@@ -559,20 +557,20 @@ class RLSimulation:
             danger_penalty, _ = torch.max(torch.pow(danger_ratio, 2), dim=1)
             rewards -= (danger_penalty * self.alive.float())
             
-            hit_pred = (dist_p < PREDATOR_CIRCLE).any(dim=1) & self.alive
+            killed = (dist_p < PREDATOR_CIRCLE).any(dim=1) & self.alive
         else:
-            hit_pred = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
+            killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
         starved = (self.energy <= 0) & self.alive
 
-        dead_mask = hit_wall | hit_pred | starved
+        dead_mask = collided | killed | starved
         if dead_mask.any():
             remaining_dead = dead_mask.clone()
-            rewards[hit_pred] += PRED_REWARD
-            remaining_dead &= ~hit_pred
+            rewards[killed] += KILLED_REWARD
+            remaining_dead &= ~killed
 
-            wall_mask = remaining_dead & hit_wall
-            rewards[wall_mask] += WALL_REWARD
+            wall_mask = remaining_dead & collided
+            rewards[wall_mask] += COLLIDED_REWARD
             remaining_dead &= ~wall_mask
 
             starve_mask = remaining_dead & starved
@@ -612,8 +610,8 @@ class RLSimulation:
         self.respawn_timer[~self.alive] -= 1
         self.steps += 1
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
-        self.hit_pred += hit_pred.sum().item()
-        self.hit_wall += hit_wall.sum().item()
+        self.killed += killed.sum().item()
+        self.collided += collided.sum().item()
         self.starved += starved.sum().item()
         self.rewards = rewards.detach().cpu().numpy()
 
@@ -759,8 +757,8 @@ class RLSimulation:
             'food_pos': self.food_pos,
             'pred_pos': self.pred_pos,
             'rewards_avg': self.rewards_avg,
-            'hit_pred': self.hit_pred,
-            'hit_wall': self.hit_wall,
+            'killed': self.killed,
+            'collided': self.collided,
             'starved': self.starved
         }, SAVE_PATH)
         torch.save({
@@ -771,7 +769,7 @@ class RLSimulation:
         }, self.brain_path)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
-        print(f"[{now}][Save] Steps:{self.steps} Alpha:{info['alpha']:.4f} Q-Val:{info['q_val']:.4f} Entropy:{info['entropy']:.4f} A-Loss:{info['a_loss']:.4f} C-Loss:{info['c_loss']:.4f} Rewards-Avg:{self.rewards_avg:.4f} Hit_Pred:{self.hit_pred} Hit_Wall:{self.hit_wall} Starved:{self.starved}")
+        print(f"[{now}][Save] Steps:{self.steps} Alpha:{info['alpha']:.4f} Q-Val:{info['q_val']:.4f} Entropy:{info['entropy']:.4f} A-Loss:{info['a_loss']:.4f} C-Loss:{info['c_loss']:.4f} Rewards-Avg:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -785,8 +783,8 @@ class RLSimulation:
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
                 self.rewards_avg = state['rewards_avg']
-                self.hit_pred = state['hit_pred']
-                self.hit_wall = state['hit_wall']
+                self.killed = state['killed']
+                self.collided = state['collided']
                 self.starved = state['starved']
                 print(f"--- [Loaded] Load completed ---")
             except Exception as e:
@@ -915,36 +913,53 @@ class RLSimulation:
             "success": (120, 255, 120)   # 翠綠色 (獎勵/存活)
         }
         info = self.last_info
-        ui_labels = [
+        left_labels = [
             ("Steps:", f"{self.steps:,}", THEME["perf"], True),
-            ("FPS:", f"{int(self.clock.get_fps())}", THEME["perf"], False),
             ("Alpha:", f"{info['alpha']:.4f}", THEME["param"], False),
             ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
             ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
             ("A-Loss:", f"{info['a_loss']:.4f}", THEME["loss"], False),
             ("C-Loss:", f"{info['c_loss']:.4f}", THEME["loss"], False),
             ("Rewards:", f"{self.rewards_avg:.3f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
-            ("Hit Pred:", f"{self.hit_pred:,}", THEME["loss"], False),
-            ("Hit Wall:", f"{self.hit_wall:,}", THEME["loss"], False),
+            ("Killed:", f"{self.killed:,}", THEME["loss"], False),
+            ("Collided:", f"{self.collided:,}", THEME["loss"], False),
             ("Starved:", f"{self.starved:,}", THEME["loss"], False),
             ("Alive:", f"{int(self.alive.sum())}/{POP_SIZE}", THEME["success"], False)
         ]
-        current_y = 10     # 起始高度
-        col_1_x = 10   # Label 開始位置
-        col_2_x = 200  # Value 結束位置 (右對齊線)
-        for i, (text, val, val_color, bold) in enumerate(ui_labels):
-            font = self.big_font if bold else self.font
-            
-            lbl_surf = font.render(text, True, THEME["label"])
-            lbl_rect = lbl_surf.get_rect(topleft=(col_1_x, current_y))
-            val_surf = font.render(val, True, val_color)
-            val_rect = val_surf.get_rect(topright=(col_2_x, current_y))
-            
-            self.screen.blit(lbl_surf, lbl_rect)
-            self.screen.blit(val_surf, val_rect)
+        right_labels = [
+            ("FPS:", f"{int(self.clock.get_fps())}", THEME["perf"], False)
+        ]
 
-            line_height = max(lbl_rect.height, val_rect.height)
-            current_y += line_height + 4
+        def render_label_column(labels, label_x, value_anchor_x, start_y=10, padding=4):
+            """
+            通用標籤列繪製方法
+            :param labels: 標籤資料列表
+            :param label_x: 標籤 (Label) 的左側起始 X 座標
+            :param value_anchor_x: 數值 (Value) 的右側對齊 X 座標
+            """
+            current_y = start_y
+            
+            for text, val, val_color, bold in labels:
+                font = self.big_font if bold else self.font
+                
+                # 1. 渲染 Label (固定左對齊)
+                lbl_surf = font.render(text, True, THEME["label"])
+                lbl_rect = lbl_surf.get_rect(topleft=(label_x, current_y))
+                
+                # 2. 渲染 Value (固定右對齊到錨點)
+                val_surf = font.render(val, True, val_color)
+                val_rect = val_surf.get_rect(topright=(value_anchor_x, current_y))
+                
+                # 3. 繪製到螢幕
+                self.screen.blit(lbl_surf, lbl_rect)
+                self.screen.blit(val_surf, val_rect)
+
+                # 更新下一行高度
+                line_height = max(lbl_rect.height, val_rect.height)
+                current_y += line_height + padding
+
+        render_label_column(left_labels, label_x=10, value_anchor_x=200)
+        render_label_column(right_labels, label_x=SCREEN_W - 70, value_anchor_x=SCREEN_W - 10)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
