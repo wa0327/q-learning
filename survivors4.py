@@ -37,7 +37,7 @@ TEAM_RADIUS = 30        # 友方過近半徑
 DAMPING_FACTOR = 0.85
 
 # 獎懲設定
-FOOD_REWARD = 10.0     # 吃到食物
+FOOD_REWARD = 15.0     # 吃到食物
 KILLED_REWARD = -15.0  # 被殺
 COLLIDED_REWARD = -8.0 # 撞死
 STARVED_REWARD = -5.0  # 餓死
@@ -770,7 +770,7 @@ class RLSimulation:
         }, self.brain_path)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
-        print(f"[{now}][Save] Steps:{self.steps} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
+        print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -931,7 +931,7 @@ class RLSimulation:
             ("Alive:", f"{int(self.alive.sum())}/{POP_SIZE}", THEME["success"], False)
         ]
         right_labels = [
-            ("FPS:", f"{int(self.clock.get_fps())}", THEME["perf"], False)
+            ("FPS:", f"{self.fps_avg:.2f}", THEME["perf"], False)
         ]
 
         def render_label_column(labels, label_x, value_anchor_x, start_y=10, padding=4):
@@ -963,7 +963,7 @@ class RLSimulation:
                 current_y += line_height + padding
 
         render_label_column(left_labels, label_x=10, value_anchor_x=200)
-        render_label_column(right_labels, label_x=SCREEN_W - 70, value_anchor_x=SCREEN_W - 10)
+        render_label_column(right_labels, label_x=SCREEN_W - 100, value_anchor_x=SCREEN_W - 10)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
@@ -979,6 +979,7 @@ class RLSimulation:
         verbose = 0
 
         self.last_states = self.get_states()
+        self.fps_avg = self.clock.get_fps()
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1023,6 +1024,7 @@ class RLSimulation:
                 if self.steps % 5000 == 0:
                     self.save_state()
 
+            self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(label_only, draw_perception, draw_alert, verbose)
 
         self.save_state()
