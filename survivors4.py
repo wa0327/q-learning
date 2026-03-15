@@ -19,6 +19,7 @@ SAVE_PATH = f"{script_name}.pt"
 # 環境參數
 POP_SIZE = 16
 POP_RADIUS = 4
+POP_MAX_SPEED = 4
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3
 PREDATOR_SIZE = 3
@@ -26,21 +27,24 @@ PREDATOR_RADIUS = 20.0
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
 MAX_ENERGY = 100.0      # 能量最大總值
-FOOD_ENERGY = 25.0      # 食物補充能量
-ENERGY_DECAY = FOOD_ENERGY / 250 # 每步消耗能量
+FOOD_ENERGY = 50.0      # 食物補充能量
+EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
+ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
 PERCEPTION_RADIUS = 200 # 視野感知半徑
 ALERT_RADIUS = 100      # 警戒敵人半徑
 WALL_SENSE_RADIUS = 50  # 牆壁感知半徑
 TEAM_RADIUS = 30        # 友方過近半徑
-THROTTLE_FACTOR = 0.6
 DAMPING_FACTOR = 0.85
 
 # 獎懲設定
-STEP_REWARD = -0.005   # 每步
 FOOD_REWARD = 1.0      # 吃到食物
 KILLED_REWARD = -1.0   # 被殺
 COLLIDED_REWARD = -0.8 # 撞死
 STARVED_REWARD = -0.9  # 餓死
+MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
+MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵，與速度成線性
+TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
+STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
 
 # 模型核心參數
 GAMMA = 0.99
@@ -209,8 +213,7 @@ class RLSimulation:
         # 初始化神經網路
         self.init_network(Actor, Critic)
         self.brain_path = f"{script_name}_{self.actor.__class__.__name__}.pt"
-        self.max_speed = THROTTLE_FACTOR / (1 - DAMPING_FACTOR)
-        print(f'=== Max speed: {self.max_speed:.2f} ===')
+        self.throttle_factor = POP_MAX_SPEED * (1 - DAMPING_FACTOR)
         self.reset_env()
         self.load_state()
         
@@ -346,11 +349,10 @@ class RLSimulation:
         wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1) 
         
         wall_angles = torch.atan2(self.wall_normals[:, 1], self.wall_normals[:, 0]).unsqueeze(0) - self.angle.unsqueeze(1)
-        wall_presence = 0.1 * (1.0 - wall_dists / PERCEPTION_RADIUS).clamp(min=0)
-        wall_threat = torch.pow((1.0 - wall_dists / WALL_SENSE_RADIUS).clamp(min=0), 2)
+        wall_dist = (wall_dists / PERCEPTION_RADIUS).clamp(min=0, max=1)
         wall_mask = (wall_dists < PERCEPTION_RADIUS).float()
         
-        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), torch.max(wall_presence, wall_threat)], dim=2) * wall_mask.unsqueeze(-1)
+        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_dist], dim=2) * wall_mask.unsqueeze(-1)
         wall_in[:, :, :4] = wall_phys.transpose(1, 2)[:, :, :MAX_OBJ]
 
         # --- 2. 處理食物 (Food: Channel 3-5) ---
@@ -363,11 +365,10 @@ class RLSimulation:
             selected_food_pos = self.food_pos[f_idx] 
             f_diff = selected_food_pos - self.pos.unsqueeze(1)
             f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
-            
-            food_score = (1.0 - val_f / PERCEPTION_RADIUS).clamp(min=0) ** 2 # 越靠近值分數越高
+            food_dist = (val_f / PERCEPTION_RADIUS).clamp(min=0, max=1)
             food_mask = (val_f < PERCEPTION_RADIUS).float()
             
-            food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_score], dim=2) * food_mask.unsqueeze(-1)
+            food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=2) * food_mask.unsqueeze(-1)
             food_in[:, :, :k_f] = food_phys.transpose(1, 2)
 
         # --- 4. 處理敵人 (Predator: Channel 9-11) ---
@@ -380,13 +381,10 @@ class RLSimulation:
             selected_pred_pos = self.pred_pos[p_idx]
             p_diff = selected_pred_pos - self.pos.unsqueeze(1)
             p_ang = torch.atan2(p_diff[..., 1], p_diff[..., 0]) - self.angle.unsqueeze(1)
-            
-            midpoint = (ALERT_RADIUS + PERCEPTION_RADIUS) / 2 # 取感知與警戒的中間值，作為威脅感「爆發」的中點。
-            pred_threat = 1.0 / (1.0 + torch.exp((val_p - midpoint) / 15.0))
-            pred_threat = torch.where(val_p <= ALERT_RADIUS, torch.ones_like(pred_threat), pred_threat)
+            pred_dist = (val_p / PERCEPTION_RADIUS).clamp(min=0, max=1)
             pred_mask = (val_p < PERCEPTION_RADIUS).float()
             
-            pred_phys = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_threat], dim=2) * pred_mask.unsqueeze(-1)
+            pred_phys = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_dist], dim=2) * pred_mask.unsqueeze(-1)
             pred_in[:, :, :k_p] = pred_phys.transpose(1, 2)
 
         # --- 3. 處理隊友 (Team: Channel 6-8) ---
@@ -400,12 +398,10 @@ class RLSimulation:
             selected_team_pos = self.pos[t_idx]
             t_diff = selected_team_pos - self.pos.unsqueeze(1)
             t_ang = torch.atan2(t_diff[..., 1], t_diff[..., 0]) - self.angle.unsqueeze(1)
-            
-            team_presence = 0.1 * (1.0 - val_t / PERCEPTION_RADIUS).clamp(min=0)
-            team_threat = torch.pow((1.0 - val_t / TEAM_RADIUS).clamp(min=0), 2)
+            team_dist = (val_t / PERCEPTION_RADIUS).clamp(min=0, max=1)
             team_mask = (val_t < PERCEPTION_RADIUS).float()
             
-            team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), torch.max(team_presence, team_threat)], dim=2) * team_mask.unsqueeze(-1)
+            team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_dist], dim=2) * team_mask.unsqueeze(-1)
             team_in[:, :, :k_t] = team_phys.transpose(1, 2)
 
         # --- 5. 合併與自身狀態 ---
@@ -423,7 +419,7 @@ class RLSimulation:
         
         # 取得連續動作並加入探索噪音
         with torch.no_grad():
-            m, s = current_states
+            m, s = self.last_states
             actions, _ = self.actor(m, s, deterministic=False, with_logprob=False)
             self.last_actions = actions.detach().clone()
 
@@ -448,7 +444,7 @@ class RLSimulation:
             self.angle[i] += steer
 
             # Action[1] 為油門 (-1 到 1 映射至 0 到 THROTTLE_FACTOR 加速度)
-            throttle = throttle_val * (THROTTLE_FACTOR if throttle_val > 0 else THROTTLE_FACTOR / 3)
+            throttle = throttle_val * (self.throttle_factor if throttle_val > 0 else self.throttle_factor / 3)
             # 向量動力學：計算當前車頭朝向單位向量
             forward_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
             # 推力 = 向量 X 油門
@@ -468,20 +464,20 @@ class RLSimulation:
             forward_speed = torch.dot(self.vel[i], forward_vec)
 
             # 2. 基礎移動獎勵：改用 forward_speed
-            move_reward = forward_speed * 0.01250
+            move_reward = forward_speed * MOVE_REWARD
 
             # 3. 嚴格的轉向懲罰
-            steer_penalty = 0.00125 * torch.pow(steer_val, 2) * (speed_val / self.max_speed)
+            steer_penalty = MOVE_REWARD * 0.5 * torch.pow(steer_val, 2) * (speed_val / self.max_speed)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = 0.00375 * torch.clamp(0.4 - forward_speed, min=0.0)
+            lazy_penalty = MOVE_REWARD * 0.5 * torch.clamp(0.4 - forward_speed, min=0.0)
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
             throttle_threshold = 0.875
             if throttle_val > throttle_threshold:
-                throttle_penalty = 0.00625 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
+                throttle_penalty = MOVE_REWARD * 0.5 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
@@ -495,16 +491,6 @@ class RLSimulation:
         self.vel[hit_w_y, 1] *= -0.5
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
-
-        # 近牆痛覺
-        d_left = self.pos[:, 0]
-        d_right = (SCREEN_W - 1) - self.pos[:, 0]
-        d_top = self.pos[:, 1]
-        d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
-        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
-        wall_ratios = (1.0 - wall_dists / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
-        wall_penalty = torch.sum(0.015 * wall_ratios, dim=1)
-        rewards -= (wall_penalty * self.alive.float())
 
         # 更新掠食者 (Predators)
         if PREDATOR_SIZE > 0 and move_predator:
@@ -550,22 +536,30 @@ class RLSimulation:
             # 所以直接用 f_idx 即可，不需要再做 unique
             self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
             
+        # 近牆痛覺
+        d_left = self.pos[:, 0]
+        d_right = (SCREEN_W - 1) - self.pos[:, 0]
+        d_top = self.pos[:, 1]
+        d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
+        wall_ratios = (1.0 - wall_dists / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
+        wall_penalty = torch.sum(STEP_REWARD * 3.0 * wall_ratios, dim=1)
+        rewards += (wall_penalty * self.alive.float())
+
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
         if POP_SIZE > 1:
             dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
-            # 如果靠太近，給予懲罰
-            team_ratio = (0.005 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-            team_penalty = torch.sum(torch.pow(team_ratio, 2), dim=1)
-            rewards -= (team_penalty * self.alive.float())
+            team_ratio = (1.0 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_penalty = torch.sum(STEP_REWARD * 1.5 * torch.pow(team_ratio, 2), dim=1)
+            rewards += (team_penalty * self.alive.float())
 
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
-            dist_p = torch.cdist(self.pos, self.pred_pos)
-            danger_ratio = (0.5 - dist_p / ALERT_RADIUS).clamp(min=0.0, max=1.0)
-            danger_penalty = torch.sum(0.015 * danger_ratio, dim=1)
-            rewards -= (danger_penalty * self.alive.float())
-            
-            killed = (dist_p < PREDATOR_RADIUS).any(dim=1) & self.alive
+            dist_pred = torch.cdist(self.pos, self.pred_pos)
+            danger_ratio = (1.0 - dist_pred / ALERT_RADIUS).clamp(min=0.0, max=1.0)
+            killed = (dist_pred < PREDATOR_RADIUS).any(dim=1) & self.alive
+            danger_penalty = torch.sum(STEP_REWARD * 10.0 * danger_ratio, dim=1)
+            rewards -= (danger_penalty * self.alive.float() * (~killed).float())
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
@@ -588,7 +582,7 @@ class RLSimulation:
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
         
-        next_states = self.get_states()
+        next_states = self.last_states = self.get_states()
         
         # 把經驗推入 Replay Buffer
         for i in range(POP_SIZE):
@@ -757,7 +751,6 @@ class RLSimulation:
     def save_state(self):
         torch.save({
             'pos': self.pos,
-            'last_actions': self.last_actions,
             'energy': self.energy,
             'alive': self.alive,
             'respawn_timer': self.respawn_timer,
@@ -787,7 +780,6 @@ class RLSimulation:
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
                 self.pos = state['pos']
-                self.last_actions = state['last_actions']
                 self.energy = state['energy']
                 self.alive = state['alive']
                 self.respawn_timer = state['respawn_timer']
@@ -989,6 +981,7 @@ class RLSimulation:
         move_predator = True
         verbose = 0
 
+        self.last_states = self.get_states()
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
