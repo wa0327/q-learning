@@ -18,12 +18,12 @@ SAVE_PATH = f"{script_name}.pt"
 
 # 環境參數
 POP_SIZE = 16
-POP_RADIUS = 4
+POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
 FOOD_SIZE = POP_SIZE * 2
-FOOD_RADIUS = 3
+FOOD_RADIUS = 3         # 食物觸碰半徑
 PREDATOR_SIZE = 3
-PREDATOR_RADIUS = 20.0
+PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
 MAX_ENERGY = 100.0      # 能量最大總值
@@ -37,10 +37,10 @@ TEAM_RADIUS = 30        # 友方過近半徑
 DAMPING_FACTOR = 0.85
 
 # 獎懲設定
-FOOD_REWARD = 1.0      # 吃到食物
-KILLED_REWARD = -1.0   # 被殺
-COLLIDED_REWARD = -0.8 # 撞死
-STARVED_REWARD = -0.9  # 餓死
+FOOD_REWARD = 10.0     # 吃到食物
+KILLED_REWARD = -15.0  # 被殺
+COLLIDED_REWARD = -8.0 # 撞死
+STARVED_REWARD = -5.0  # 餓死
 MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵，與速度成線性
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
@@ -492,74 +492,31 @@ class RLSimulation:
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
 
-        # 食物碰撞
-        dist_f = torch.cdist(self.pos, self.food_pos)
-        hits_f = (dist_f < 10.0) & self.alive.unsqueeze(1)
-        if hits_f.any():
-            # 1. 建立遮罩距離矩陣：把「沒碰到」或「已死亡」的距離變成無限大 (inf)
-            masked_dist = torch.where(hits_f, dist_f, torch.tensor(float('inf'), device=DEVICE))
-            
-            # 2. 沿著 Agent 維度 (dim=0) 找最小值
-            # min_dists: 每個食物被碰到的最短距離 (沒被碰到的會是 inf)
-            # closest_a_idx: 每個食物對應距離最近的 Agent 索引
-            min_dists, closest_a_idx = torch.min(masked_dist, dim=0)
-            
-            # 3. 過濾出「真正有被吃到」的食物 (距離不是 inf 的)
-            valid_eaten_mask = min_dists != float('inf')
-            
-            # 取出最終要結算的 食物索引 與 Agent 索引
-            f_idx = torch.where(valid_eaten_mask)[0] 
-            a_idx = closest_a_idx[valid_eaten_mask]
-            
-            # 4. 處理獎勵與能量 (安全累加)
-            # 注意：a_idx 仍可能有重複 (如果同一個 Agent 技壓群雄，同時離 3 個食物最近)
-            reward_increment = torch.full((len(a_idx),), FOOD_REWARD, device=DEVICE)
-            rewards.index_add_(0, a_idx, reward_increment)
-            energy_increment = torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE)
-            self.energy.index_add_(0, a_idx, energy_increment)
-            self.energy = torch.clamp(self.energy, max=MAX_ENERGY)
-            
-            # 5. 重生食物
-            # 注意：這裡的 f_idx 保證是不重複的 (因為每個食物只會選出一個最近的 Agent)
-            # 所以直接用 f_idx 即可，不需要再做 unique
-            self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
-            
-        # 近牆痛覺
-        d_left = self.pos[:, 0]
-        d_right = (SCREEN_W - 1) - self.pos[:, 0]
-        d_top = self.pos[:, 1]
-        d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
-        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
-        wall_ratios = (1.0 - wall_dists / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
-        wall_penalty = torch.sum(STEP_REWARD * 3.0 * wall_ratios, dim=1)
-        rewards += (wall_penalty * self.alive.float())
-
-        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
-        if POP_SIZE > 1:
-            dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
-            team_ratio = (1.0 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-            team_penalty = torch.sum(STEP_REWARD * 1.5 * torch.pow(team_ratio, 2), dim=1)
-            rewards += (team_penalty * self.alive.float())
-
-        # 食物吸引
-        if FOOD_SIZE > 1:
-            dist_food = torch.cdist(self.pos, self.food_pos)
-            food_ratio = (1.0 - dist_food / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
-            food_reward = torch.sum(MOVE_REWARD * 2 * torch.pow(food_ratio, 2), dim=1)
-            rewards += (food_reward * self.alive.float())
+        # 移動掠食者 (Predators)
+        if PREDATOR_SIZE > 0 and move_predator:
+            self.pred_pos, self.pred_vel = self.update_entities(
+                self.pred_pos, self.pred_vel, PREDATOR_RADIUS, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
+            )
+        # 移動食物 (Food)
+        if FOOD_SIZE > 0 and move_food:
+            self.food_pos, self.food_vel = self.update_entities(
+                self.food_pos, self.food_vel, FOOD_RADIUS, min_speed=0.5, max_speed=1.0
+            )
 
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
-            danger_ratio = (1.0 - dist_pred / ALERT_RADIUS).clamp(min=0.0, max=1.0)
-            killed = (dist_pred < PREDATOR_RADIUS).any(dim=1) & self.alive
+            danger_ratio = (1.0 - (dist_pred - POP_RADIUS - PREDATOR_RADIUS) / ALERT_RADIUS).clamp(min=0.0, max=1.0)
+            killed = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=1) & self.alive
             danger_penalty = torch.sum(STEP_REWARD * 10.0 * danger_ratio, dim=1)
             rewards -= (danger_penalty * self.alive.float() * (~killed).float())
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
+        # 能量耗盡
         starved = (self.energy <= 0) & self.alive
 
+        # 死亡判定
         dead_mask = collided | killed | starved
         if dead_mask.any():
             remaining_dead = dead_mask.clone()
@@ -577,17 +534,51 @@ class RLSimulation:
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
         
-        # 移動掠食者 (Predators)
-        if PREDATOR_SIZE > 0 and move_predator:
-            self.pred_pos, self.pred_vel = self.update_entities(
-                self.pred_pos, self.pred_vel, PREDATOR_RADIUS, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
-            )
-        # 移動食物 (Food)
-        if FOOD_SIZE > 0 and move_food:
-            self.food_pos, self.food_vel = self.update_entities(
-                self.food_pos, self.food_vel, 2, min_speed=0.5, max_speed=1.0
-            )
+        # 近牆痛覺
+        d_left = self.pos[:, 0]
+        d_right = (SCREEN_W - 1) - self.pos[:, 0]
+        d_top = self.pos[:, 1]
+        d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
+        wall_ratios = (1.0 - (wall_dists - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
+        wall_penalty = torch.sum(STEP_REWARD * 3.0 * wall_ratios, dim=1)
+        rewards += (wall_penalty * self.alive.float())
+
+        # 食物邏輯
+        # --- 第一階段：食物碰撞與重生 ---
+        dist_food = torch.cdist(self.pos, self.food_pos)
+        hits_food = (dist_food < POP_RADIUS + FOOD_RADIUS) & self.alive.unsqueeze(1)
+        if hits_food.any():
+            # 找出每個食物最近的捕食者
+            masked_dist = torch.where(hits_food, dist_food, torch.tensor(float('inf'), device=DEVICE))
+            min_dists, closest_a_idx = torch.min(masked_dist, dim=0)
+            valid_eaten_mask = min_dists != float('inf')
             
+            f_idx = torch.where(valid_eaten_mask)[0] 
+            a_idx = closest_a_idx[valid_eaten_mask]
+            
+            # 結算碰撞獎勵與能量
+            rewards.index_add_(0, a_idx, torch.full((len(a_idx),), FOOD_REWARD, device=DEVICE))
+            self.energy.index_add_(0, a_idx, torch.full((len(a_idx),), FOOD_ENERGY, device=DEVICE))
+            self.energy = torch.clamp(self.energy, max=MAX_ENERGY)
+            
+            # 【關鍵】立刻重生食物，更新 self.food_pos
+            self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
+
+        # --- 第二階段：食物吸引 (使用重生後的新位置) ---
+        if FOOD_SIZE > 1:
+            dist_food = torch.cdist(self.pos, self.food_pos)            
+            food_ratio = (1.0 - (dist_food - POP_RADIUS - FOOD_RADIUS) / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
+            food_reward_sum = torch.sum(MOVE_REWARD * 2.0 * torch.pow(food_ratio, 2), dim=1)            
+            rewards += (food_reward_sum * self.alive.float())
+            
+        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
+        if POP_SIZE > 1:
+            dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
+            team_ratio = (1.0 - (dist_agents - POP_RADIUS * 2) / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_penalty = torch.sum(STEP_REWARD * 1.5 * torch.pow(team_ratio, 2), dim=1)
+            rewards += (team_penalty * self.alive.float())
+
         next_states = self.last_states = self.get_states()
         
         # 把經驗推入 Replay Buffer
