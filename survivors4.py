@@ -34,17 +34,20 @@ PERCEPTION_RADIUS = 200 # 視野感知半徑
 ALERT_RADIUS = 100      # 警戒敵人半徑
 WALL_SENSE_RADIUS = 50  # 牆壁感知半徑
 TEAM_RADIUS = 30        # 友方過近半徑
-DAMPING_FACTOR = 0.85
+DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
+RND_POS_PADDING = 10    # 隨機取位邊距
 
 # 獎懲設定
 FOOD_REWARD = 15.0     # 吃到食物
 KILLED_REWARD = -15.0  # 被殺
-COLLIDED_REWARD = -8.0 # 撞死
-STARVED_REWARD = -5.0  # 餓死
+COLLIDED_REWARD = -15.0 # 撞死
+STARVED_REWARD = -10.0  # 餓死
 MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵，與速度成線性
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
+WALL_PENALTY = COLLIDED_REWARD * 0.15
+PREDATOR_PENALTY = KILLED_REWARD * 0.05
 
 # 模型核心參數
 GAMMA = 0.99
@@ -100,7 +103,8 @@ class Actor(nn.Module):
         std = torch.exp(log_std)
         
         # 4. 採樣動作 (Reparameterization Trick)
-        dist = Normal(mu, std)
+        if not deterministic or with_logprob:
+            dist = Normal(mu, std)
         if deterministic:
             z = mu
         else:
@@ -156,7 +160,7 @@ class Critic(nn.Module):
         q2 = self.fc2(x2)
         
         return q1, q2
-    
+
 class ReplayMemory:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -508,8 +512,8 @@ class RLSimulation:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
             danger_ratio = (1.0 - (dist_pred - POP_RADIUS - PREDATOR_RADIUS) / ALERT_RADIUS).clamp(min=0.0, max=1.0)
             killed = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=1) & self.alive
-            danger_penalty = torch.sum(STEP_REWARD * 10.0 * danger_ratio, dim=1)
-            rewards -= (danger_penalty * self.alive.float() * (~killed).float())
+            danger_penalty = torch.sum(PREDATOR_PENALTY * danger_ratio, dim=1)
+            rewards += (danger_penalty * self.alive.float() * (~killed).float())
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
@@ -541,7 +545,7 @@ class RLSimulation:
         d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
         wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
         wall_ratios = (1.0 - (wall_dists - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
-        wall_penalty = torch.sum(STEP_REWARD * 3.0 * wall_ratios, dim=1)
+        wall_penalty = torch.sum(WALL_PENALTY * wall_ratios, dim=1)
         rewards += (wall_penalty * self.alive.float())
 
         # 食物邏輯
@@ -569,7 +573,7 @@ class RLSimulation:
         if FOOD_SIZE > 1:
             dist_food = torch.cdist(self.pos, self.food_pos)            
             food_ratio = (1.0 - (dist_food - POP_RADIUS - FOOD_RADIUS) / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
-            food_reward_sum = torch.sum(MOVE_REWARD * 2.0 * torch.pow(food_ratio, 2), dim=1)            
+            food_reward_sum = torch.sum(MOVE_REWARD * 2.0 * food_ratio, dim=1)
             rewards += (food_reward_sum * self.alive.float())
             
         # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
@@ -619,12 +623,11 @@ class RLSimulation:
         一次為 n 個實體尋找安全位置。
         n: 需要生成的點數量。
         """
-        pad = 10.0
         # 候選樣本數
         num_samples = max(n * 10, PREDATOR_SIZE)
         samples = torch.empty((num_samples, 2), device=DEVICE)
-        samples[:, 0].uniform_(pad, SCREEN_W - pad)
-        samples[:, 1].uniform_(pad, SCREEN_H - pad)
+        samples[:, 0].uniform_(RND_POS_PADDING, SCREEN_W - RND_POS_PADDING)
+        samples[:, 1].uniform_(RND_POS_PADDING, SCREEN_H - RND_POS_PADDING)
 
         # 如果有掠食者，進行距離篩選
         if PREDATOR_SIZE > 0:
@@ -649,12 +652,11 @@ class RLSimulation:
         """
         if n <= 0: return torch.empty((0, 2), device=DEVICE)
 
-        pad = 10.0
         # 增加樣本數
         num_samples = max(n * 20, PREDATOR_SIZE) 
         samples = torch.empty((num_samples, 2), device=DEVICE)
-        samples[:, 0].uniform_(pad, SCREEN_W - pad)
-        samples[:, 1].uniform_(pad, SCREEN_H - pad)
+        samples[:, 0].uniform_(RND_POS_PADDING, SCREEN_W - RND_POS_PADDING)
+        samples[:, 1].uniform_(RND_POS_PADDING, SCREEN_H - RND_POS_PADDING)
 
         if PREDATOR_SIZE:
             # 1. 計算所有樣本到掠食者的最近距離
@@ -931,7 +933,7 @@ class RLSimulation:
             ("Alive:", f"{int(self.alive.sum())}/{POP_SIZE}", THEME["success"], False)
         ]
         right_labels = [
-            ("FPS:", f"{self.fps_avg:.2f}", THEME["perf"], False)
+            ("FPS:", f"{self.fps_avg:.0f}", THEME["perf"], False)
         ]
 
         def render_label_column(labels, label_x, value_anchor_x, start_y=10, padding=4):
@@ -963,7 +965,7 @@ class RLSimulation:
                 current_y += line_height + padding
 
         render_label_column(left_labels, label_x=10, value_anchor_x=200)
-        render_label_column(right_labels, label_x=SCREEN_W - 100, value_anchor_x=SCREEN_W - 10)
+        render_label_column(right_labels, label_x=SCREEN_W - 70, value_anchor_x=SCREEN_W - 10)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
