@@ -554,7 +554,7 @@ class RLSimulation:
         if POP_SIZE > 1:
             dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
             # 如果靠太近，給予懲罰
-            team_ratio = (0.002 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_ratio = (0.005 - dist_agents / TEAM_RADIUS).clamp(min=0.0, max=1.0)
             team_penalty = torch.sum(torch.pow(team_ratio, 2), dim=1)
             rewards -= (team_penalty * self.alive.float())
 
