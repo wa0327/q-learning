@@ -467,7 +467,7 @@ class RLSimulation:
             move_reward = forward_speed * MOVE_REWARD
 
             # 3. 嚴格的轉向懲罰
-            steer_penalty = MOVE_REWARD * 0.5 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
+            steer_penalty = MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
@@ -492,18 +492,6 @@ class RLSimulation:
         self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
         self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
 
-        # 更新掠食者 (Predators)
-        if PREDATOR_SIZE > 0 and move_predator:
-            self.pred_pos, self.pred_vel = self.update_entities(
-                self.pred_pos, self.pred_vel, PREDATOR_RADIUS, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
-            )
-
-        # 更新食物 (Food) - 假設食物也會移動
-        if FOOD_SIZE > 0 and move_food:
-            self.food_pos, self.food_vel = self.update_entities(
-                self.food_pos, self.food_vel, 2, min_speed=0.5, max_speed=1.0
-            )
-            
         # 食物碰撞
         dist_f = torch.cdist(self.pos, self.food_pos)
         hits_f = (dist_f < 10.0) & self.alive.unsqueeze(1)
@@ -553,6 +541,13 @@ class RLSimulation:
             team_penalty = torch.sum(STEP_REWARD * 1.5 * torch.pow(team_ratio, 2), dim=1)
             rewards += (team_penalty * self.alive.float())
 
+        # 食物吸引
+        if FOOD_SIZE > 1:
+            dist_food = torch.cdist(self.pos, self.food_pos)
+            food_ratio = (1.0 - dist_food / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
+            food_reward = torch.sum(MOVE_REWARD * 2 * torch.pow(food_ratio, 2), dim=1)
+            rewards += (food_reward * self.alive.float())
+
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
@@ -582,6 +577,17 @@ class RLSimulation:
             self.vel[dead_mask] = 0.0 # 死掉後速度歸零
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
         
+        # 移動掠食者 (Predators)
+        if PREDATOR_SIZE > 0 and move_predator:
+            self.pred_pos, self.pred_vel = self.update_entities(
+                self.pred_pos, self.pred_vel, PREDATOR_RADIUS, min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED
+            )
+        # 移動食物 (Food)
+        if FOOD_SIZE > 0 and move_food:
+            self.food_pos, self.food_vel = self.update_entities(
+                self.food_pos, self.food_vel, 2, min_speed=0.5, max_speed=1.0
+            )
+            
         next_states = self.last_states = self.get_states()
         
         # 把經驗推入 Replay Buffer
