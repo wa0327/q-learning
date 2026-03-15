@@ -407,7 +407,7 @@ class RLSimulation:
         # --- 5. 合併與自身狀態 ---
         mixed_in = torch.cat([wall_in, food_in, team_in, pred_in], dim=1)
         
-        speed = torch.norm(self.vel, dim=1) / self.max_speed
+        speed = torch.norm(self.vel, dim=1) / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy / MAX_ENERGY], dim=1)
 
@@ -439,7 +439,7 @@ class RLSimulation:
             sensitivity = torch.clamp(speed_val / 2.0, min=0.0, max=1.0)
             # 2. 高速衰減：速度過高時，強行降低角速度以增大轉向半徑 (2.0 -> 4.0 速度區間)
             # 當速度從 2.0 升到 4.0，衰減係數從 1.0 降到 0.6
-            high_speed_damping = torch.clamp(1.5 - (speed_val / self.max_speed), min=0.6, max=1.0)
+            high_speed_damping = torch.clamp(1.5 - (speed_val / POP_MAX_SPEED), min=0.6, max=1.0)
             steer = steer_val * 0.15 * sensitivity * high_speed_damping
             self.angle[i] += steer
 
@@ -467,7 +467,7 @@ class RLSimulation:
             move_reward = forward_speed * MOVE_REWARD
 
             # 3. 嚴格的轉向懲罰
-            steer_penalty = MOVE_REWARD * 0.5 * torch.pow(steer_val, 2) * (speed_val / self.max_speed)
+            steer_penalty = MOVE_REWARD * 0.5 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
