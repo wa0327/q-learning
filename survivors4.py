@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import math
 import shutil
+import cv2
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
@@ -48,8 +49,8 @@ MOVE_REWARD_FACTOR = 0.5 # [移動總獎勵]與[最大獎勵]的佔比，數值�
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
-WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.5     # 近牆最大懲罰(實際按距離比例遞減)
-PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.5   # 近敵最大懲罰(實際按距離比例遞減)
+WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.05     # 近牆最大懲罰(實際按距離比例遞減)
+PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.08   # 近敵最大懲罰(實際按距離比例遞減)
 FOOD_NEARBY_REWARD = FOOD_REWARD * 0.01         # 近食最大獎勵(實際按距離比例遞減)
 TEAM_NEARBY_REWARD = STEP_REWARD                # 近隊最大懲罰(實際按距離比例遞減)
 
@@ -65,7 +66,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.05
+MIN_ALPHA = 0.01
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -259,20 +260,6 @@ class RLSimulation:
         # 四邊牆的固定角度
         self.wall_angles = torch.tensor([math.pi, 0.0, -math.pi * 0.5, math.pi * 0.5], device=DEVICE).view(1, 4)
 
-        # 定義牆面
-        ov = torch.tensor([
-            [0.0, 0.0], [SCREEN_W-1, 0.0], [SCREEN_W-1, SCREEN_H-1], [0.0, SCREEN_H-1]
-        ], device=DEVICE)
-        tv = torch.tensor([
-            [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
-        ], device=DEVICE)
-        self.wall_A = torch.cat([ov, tv], dim=0)
-        self.wall_B = torch.cat([
-            torch.roll(ov, -1, 0), 
-            torch.roll(tv, -1, 0)
-        ], dim=0)
-        self.wall_v = [ov.cpu().numpy().tolist(), tv.cpu().numpy().tolist()]
-
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
@@ -434,38 +421,16 @@ class RLSimulation:
             return torch.cat([phys, onehot], dim=1)
 
         # --- 1. 處理牆壁 (Wall) ---
-        p = self.pos.unsqueeze(1)    # (N, 1, 2)
-        a = self.wall_A.unsqueeze(0) # (1, W, 2)
-        b = self.wall_B.unsqueeze(0) # (1, W, 2)
-
-        # 計算投影點 (同之前邏輯)
-        ab = b - a
-        ap = p - a
-        t = (torch.sum(ap * ab, dim=-1) / (torch.sum(ab * ab, dim=-1) + 1e-6)).clamp(0, 1)
-        closest_points = a + t.unsqueeze(-1) * ab # (N, W, 2)
-
-        # 計算相對位移與距離
-        diff_wall = closest_points - p               # (N, W, 2)
-        wall_dist = torch.norm(diff_wall, dim=-1)         # (N, W)
-
-        # 計算相對角度 (相對於 Agent 目前的朝向 angle)
-        abs_ang = torch.atan2(diff_wall[..., 1], diff_wall[..., 0])
-        rel_ang = abs_ang - self.angle.view(POP_SIZE, 1)
-
-        # 正規化距離與遮罩 (只看感知範圍內)
-        wall_dist_norm = ((wall_dist - POP_RADIUS) / PERCEPTION_RADIUS).clamp(0, 1)
-        wall_mask = ((wall_dist - POP_RADIUS) < PERCEPTION_RADIUS).float()
-
-        # 構建物理特徵 (Cos, Sin, Dist)
-        # wall_phys 維度: (POP_SIZE, 3, W)
-        wall_phys = torch.stack([torch.cos(rel_ang), torch.sin(rel_ang), wall_dist_norm], dim=1) * wall_mask.unsqueeze(1)
-
-        # 構建 One-hot Label (假設牆的標籤是 self.l_wall)
-        # wall_in 維度: (POP_SIZE, 7, W)
-        wall_in = torch.cat([
-            wall_phys, 
-            self.l_wall.expand(POP_SIZE, 4, self.wall_A.shape[0])
-        ], dim=1)
+        d_left = self.pos[:, 0]
+        d_right = SCREEN_W - self.pos[:, 0]
+        d_top = self.pos[:, 1]
+        d_bottom = SCREEN_H - self.pos[:, 1]
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1) 
+        wall_dist = ((wall_dists - POP_RADIUS) / PERCEPTION_RADIUS).clamp(min=0, max=1)
+        wall_mask = ((wall_dists - POP_RADIUS) < PERCEPTION_RADIUS).float()
+        wall_angles = self.wall_angles - angel
+        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_dist], dim=1) * wall_mask.unsqueeze(1)
+        wall_in = torch.cat([wall_phys, self.l_wall.expand(POP_SIZE, 4, wall_phys.shape[2])], dim=1)
         fill_buffer(wall_in)
 
         # --- 2. 處理食物 (Food) ---
@@ -556,18 +521,15 @@ class RLSimulation:
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
             rewards[i] += move_reward - steer_penalty - lazy_penalty - throttle_penalty
 
-        # 邊界碰撞處理
-        p = self.pos.unsqueeze(1)
-        a = self.wall_A.unsqueeze(0)
-        b = self.wall_B.unsqueeze(0)
-        ab = b - a
-        ap = p - a
-        t = (torch.sum(ap * ab, dim=-1) / (torch.sum(ab * ab, dim=-1) + 1e-6)).clamp(0, 1)
-        closest_points = a + t.unsqueeze(-1) * ab
-        dist_to_walls = torch.norm(self.pos.unsqueeze(1) - closest_points, dim=-1)
-        hit_walls = dist_to_walls < POP_RADIUS
-        collided = torch.any(hit_walls, dim=1) & self.alive
-        
+        # 邊界碰撞處理 (反彈)
+        hit_w_x = (self.pos[:, 0] <= 0) | (self.pos[:, 0] >= SCREEN_W - 1)
+        hit_w_y = (self.pos[:, 1] <= 0) | (self.pos[:, 1] >= SCREEN_H - 1)
+        collided = (hit_w_x | hit_w_y) & self.alive
+        self.vel[hit_w_x, 0] *= -0.5
+        self.vel[hit_w_y, 1] *= -0.5
+        self.pos[:, 0] = torch.clamp(self.pos[:, 0], 0, SCREEN_W - 1)
+        self.pos[:, 1] = torch.clamp(self.pos[:, 1], 0, SCREEN_H - 1)
+
         # 移動掠食者 (Predators)
         if PREDATOR_SIZE > 0 and move_predator:
             self.pred_pos, self.pred_vel = self.update_entities(
@@ -582,9 +544,10 @@ class RLSimulation:
         # 掠食者碰撞
         if PREDATOR_SIZE > 0:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
+            danger_ratio = (1.0 - (dist_pred - POP_RADIUS - PREDATOR_RADIUS) / ALERT_RADIUS).clamp(min=0.0, max=1.0)
             killed = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=1) & self.alive
-            pred_mask = (dist_pred - POP_RADIUS - PREDATOR_RADIUS < ALERT_RADIUS).any(dim=1).float()
-            rewards += (PREDATOR_NEARBY_REWARD * pred_mask * self.alive.float() * (~killed).float())
+            danger_penalty = torch.sum(PREDATOR_NEARBY_REWARD * danger_ratio, dim=1)
+            rewards += (danger_penalty * self.alive.float() * (~killed).float())
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
 
@@ -610,31 +573,14 @@ class RLSimulation:
             self.respawn_timer[dead_mask] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (dead_mask.sum(),), device=DEVICE)
         
         # 近牆痛覺
-        p = self.pos.unsqueeze(1)       # (N, 1, 2)
-        v = self.vel.unsqueeze(1)       # (N, 1, 2)
-        a = self.wall_A.unsqueeze(0)    # (1, W, 2)
-        b = self.wall_B.unsqueeze(0)    # (1, W, 2)
-        # 1. 計算投影點 (Closest Point on Segment)
-        ab = b - a                 # (1, W, 2)
-        ap = p - a                 # (N, W, 2)
-        # 計算 t = dot(ap, ab) / dot(ab, ab)，限制在 [0, 1]
-        t = torch.sum(ap * ab, dim=-1) / (torch.sum(ab * ab, dim=-1) + 1e-6)
-        t = torch.clamp(t, 0.0, 1.0)
-        closest_points = a + t.unsqueeze(-1) * ab # (N, W, 2)
-        # 2. 計算距離向量與單位法向量
-        dist_vec = p - closest_points             # (N, W, 2)
-        wall_dist = torch.norm(dist_vec, dim=-1)       # (N, W)
-        wall_normal = dist_vec / (wall_dist.unsqueeze(-1) + 1e-6) # (N, W, 2)
-        # 3. 計算衝向牆壁的速度分量 (v_dot_n)
-        # normal 是從牆指向 Agent，所以 dot < 0 代表衝向牆
-        v_dot_n = torch.sum(v * wall_normal, dim=-1)   # (N, W)
-        push_factor = torch.clamp(-v_dot_n, min=0.0)
-        # 4. 計算懲罰比例 (使用平方消除邊界噪音)
-        dist_ratio = (1.0 - (wall_dist - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(0.0, 1.0)
-        wall_penalties = WALL_NEARBY_REWARD * (dist_ratio ** 2) * push_factor # (N, W)
-        # 5. 整合結果：對每個 Agent，取所有牆壁中懲罰最嚴重的那個
-        wall_penalty, _ = torch.max(wall_penalties, dim=1)
-        rewards += wall_penalty * self.alive.float()
+        d_left = self.pos[:, 0]
+        d_right = (SCREEN_W - 1) - self.pos[:, 0]
+        d_top = self.pos[:, 1]
+        d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
+        wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
+        wall_ratios = (1.0 - (wall_dists - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
+        wall_penalty = torch.sum(WALL_NEARBY_REWARD * wall_ratios, dim=1)
+        rewards += (wall_penalty * self.alive.float())
 
         # 食物邏輯
         # --- 第一階段：食物碰撞與重生 ---
@@ -658,22 +604,18 @@ class RLSimulation:
             self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
 
         # --- 第二階段：食物吸引 (使用重生後的新位置) ---
-        # if FOOD_SIZE > 1:
-        #     dist_food = torch.cdist(self.pos, self.food_pos)
-        #     food_mask = (dist_food - POP_RADIUS - FOOD_RADIUS < PERCEPTION_RADIUS).any(dim=1).float()
-        #     rewards += (FOOD_NEARBY_REWARD * food_mask * self.alive.float())
+        if FOOD_SIZE > 1:
+            dist_food = torch.cdist(self.pos, self.food_pos)            
+            food_ratio = (1.0 - (dist_food - POP_RADIUS - FOOD_RADIUS) / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
+            food_reward_sum = torch.sum(FOOD_NEARBY_REWARD * food_ratio, dim=1)
+            rewards += (food_reward_sum * self.alive.float())
             
         # 隊友排斥，排除自己與自己的距離
         if POP_SIZE > 1:
-            # 距離倍率加總
-            # dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
-            # team_ratio = (1.0 - (dist_agents - POP_RADIUS * 2) / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-            # team_penalty = torch.sum(TEAM_NEARBY_REWARD * torch.pow(team_ratio, 2), dim=1)
-            # rewards += (team_penalty * self.alive.float())
-            # 單一單懲罰
-            dist_team = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
-            team_mask = (dist_team - POP_RADIUS * 2 < TEAM_RADIUS).any(dim=1).float()
-            rewards += (TEAM_NEARBY_REWARD * team_mask * self.alive.float())
+            dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
+            team_ratio = (1.0 - (dist_agents - POP_RADIUS * 2) / TEAM_RADIUS).clamp(min=0.0, max=1.0)
+            team_penalty = torch.sum(TEAM_NEARBY_REWARD * torch.pow(team_ratio, 2), dim=1)
+            rewards += (team_penalty * self.alive.float())
 
         next_states = self.last_states = self.get_states()
         
@@ -901,13 +843,10 @@ class RLSimulation:
             except Exception as e:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
-    def draw(self, label_only, draw_perception, draw_alert, verbose):
+    def draw(self, draw_label, draw_units, draw_perception, draw_alert, verbose):
         self.screen.fill((20, 20, 25))
 
-        if not label_only:
-            for shape in self.wall_v:
-                pygame.draw.lines(self.screen, (128,0,0), True, shape, 1)
-
+        if draw_units:
             for f in self.food_pos.cpu().numpy():
                 pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), FOOD_RADIUS)
 
@@ -1014,25 +953,9 @@ class RLSimulation:
             "loss": (255, 120, 120),     # 柔和紅 (損失/負面指標)
             "success": (120, 255, 120)   # 翠綠色 (獎勵/存活)
         }
-        info = self.last_info
-        left_labels = [
-            ("Steps:", f"{self.steps:,}", THEME["perf"], True),
-            ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
-            ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
-            ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
-            ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
-            ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
-            ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
-            ("Rewards:", f"{self.rewards_avg:.2f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
-            ("Killed:", f"{self.killed:,}", THEME["loss"], False),
-            ("Collided:", f"{self.collided:,}", THEME["loss"], False),
-            ("Starved:", f"{self.starved:,}", THEME["loss"], False),
-            ("Alive:", f"{int(self.alive.sum())}/{POP_SIZE}", THEME["success"], False)
-        ]
         right_labels = [
             ("FPS:", f"{self.fps_avg:.0f}", THEME["perf"], False)
         ]
-
         def render_label_column(labels, label_x, value_anchor_x, start_y=10, padding=4):
             """
             通用標籤列繪製方法
@@ -1061,8 +984,25 @@ class RLSimulation:
                 line_height = max(lbl_rect.height, val_rect.height)
                 current_y += line_height + padding
 
-        render_label_column(left_labels, label_x=10, value_anchor_x=200)
         render_label_column(right_labels, label_x=SCREEN_W - 70, value_anchor_x=SCREEN_W - 10)
+
+        if draw_label:
+            info = self.last_info
+            left_labels = [
+                ("Steps:", f"{self.steps:,}", THEME["perf"], True),
+                ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
+                ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
+                ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
+                ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
+                ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
+                ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
+                ("Rewards:", f"{self.rewards_avg:.2f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
+                ("Killed:", f"{self.killed:,}", THEME["loss"], False),
+                ("Collided:", f"{self.collided:,}", THEME["loss"], False),
+                ("Starved:", f"{self.starved:,}", THEME["loss"], False),
+                ("Alive:", f"{int(self.alive.sum())}/{POP_SIZE}", THEME["success"], False)
+            ]
+            render_label_column(left_labels, label_x=10, value_anchor_x=200)
 
         pygame.display.flip()
         self.clock.tick(self.fps)
@@ -1071,12 +1011,14 @@ class RLSimulation:
         running = True
         training = True
         is_paused = False
-        label_only = False
+        draw_label = True
+        draw_units = True
         draw_alert = False
         draw_perception = False
         move_food = True
         move_predator = True
         verbose = 0
+        video_writer = None
 
         self.last_states = self.get_states()
         self.fps_avg = self.clock.get_fps()
@@ -1099,17 +1041,18 @@ class RLSimulation:
                     elif event.key == pygame.K_MINUS:
                         self.fps = 5
                         self.update_caption()
-                    elif event.key == pygame.K_r:
+                    elif event.key == pygame.K_z:
                         self.reset_env()
-                    # 檢查 大寫 R (Shift + R)
-                    if event.key == pygame.K_r and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                    if event.key == pygame.K_z and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
                         self.init_network()
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
                     elif event.key == pygame.K_t:
                         training = not training
-                    elif event.key == pygame.K_h:
-                        label_only = not label_only
+                    elif event.key == pygame.K_l:
+                        draw_label = not draw_label
+                    elif event.key == pygame.K_u:
+                        draw_units = not draw_units
                     elif event.key == pygame.K_a:
                         draw_alert = not draw_alert
                     elif event.key == pygame.K_p:
@@ -1120,6 +1063,17 @@ class RLSimulation:
                         move_predator = not move_predator
                     elif event.key == pygame.K_v:
                         verbose = (verbose + 1) % 3
+                    elif event.key == pygame.K_r:
+                        if video_writer:
+                            video_writer.release()
+                            video_writer = None
+                            print("錄影結束並存檔。")
+                        else:
+                            now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                            filename = f"{now}.mp4"
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            video_writer = cv2.VideoWriter(filename, fourcc, 60, (SCREEN_W, SCREEN_H))
+                            print(f"開始錄影: {filename}")
 
             if not is_paused:
                 self.update(move_food, move_predator)
@@ -1129,7 +1083,19 @@ class RLSimulation:
                     self.save_state()
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
-            self.draw(label_only, draw_perception, draw_alert, verbose)
+            self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
+        
+            if video_writer:
+                # 取得 Pygame 畫面像素
+                view = pygame.surfarray.array3d(self.screen)
+                # 轉換格式：Pygame 是 (width, height, RGB) -> OpenCV 需要 (height, width, BGR)
+                view = view.transpose([1, 0, 2])
+                view = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
+                # 寫入影格
+                video_writer.write(view)
+                
+        if video_writer:
+            video_writer.release()
 
         self.save_state()
         pygame.quit()
