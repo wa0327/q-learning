@@ -43,11 +43,11 @@ KILLED_REWARD = -15.0  # 被殺
 COLLIDED_REWARD = -12.5 # 撞死
 STARVED_REWARD = -10.0  # 餓死
 MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
-MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵，與速度成線性
+MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
-WALL_PENALTY = COLLIDED_REWARD * 0.15
-PREDATOR_PENALTY = KILLED_REWARD * 0.05
+WALL_PENALTY = COLLIDED_REWARD * 0.15   # 近牆最大懲罰
+PREDATOR_PENALTY = KILLED_REWARD * 0.05 # 近敵最大懲罰
 
 # 模型核心參數
 GAMMA = 0.99
@@ -495,21 +495,21 @@ class RLSimulation:
             # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
             forward_speed = torch.dot(self.vel[i], forward_vec)
 
-            # 2. 基礎移動獎勵：改用 forward_speed
+            # 2. 基礎移動獎勵
             move_reward = forward_speed * MOVE_REWARD
 
             # 3. 嚴格的轉向懲罰
             steer_penalty = 0.0 #MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
 
-            # 3. 靜止/低效懲罰 (Lazy Penalty)
+            # 3. 靜止/低效懲罰
             # 如果有效前進速度太低，就給予負分，逼它動起來
             lazy_penalty = MOVE_REWARD * 0.5 * torch.clamp(0.4 - forward_speed, min=0.0)
 
-            # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
+            # 4. 高速與油門懲罰
             throttle_penalty = 0.0
             # throttle_threshold = 0.875
-            # if throttle_val > throttle_threshold:
-            #     throttle_penalty = MOVE_REWARD * 0.5 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
+            # diff = torch.abs(torch.abs(throttle_val) - throttle_threshold)
+            # throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 5.0) - 1.0)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
