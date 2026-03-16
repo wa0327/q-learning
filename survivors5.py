@@ -10,6 +10,7 @@ from datetime import datetime
 import math
 import shutil
 import cv2
+from pathlib import Path
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
@@ -251,6 +252,8 @@ class RLSimulation:
         self.brain_path = f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}.pt"
         self.throttle_factor = POP_MAX_SPEED * (1 - DAMPING_FACTOR)
         self.reset_env()
+        path = Path(BASE_PATH)
+        path.mkdir(parents=True, exist_ok=True)
         self.load_state()
 
         # 四類環境物件的 one-hot 編碼
