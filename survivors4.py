@@ -269,6 +269,7 @@ class RLSimulation:
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)
+        self.forward_speed = torch.zeros(POP_SIZE, device=DEVICE)
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
@@ -442,7 +443,7 @@ class RLSimulation:
         if PREDATOR_SIZE > 0:
             fill_buffer(process_obj(self.pred_pos, PREDATOR_RADIUS, self.l_pred))
 
-        speed = torch.norm(self.vel, dim=1) / POP_MAX_SPEED
+        speed = self.forward_speed / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy / MAX_ENERGY], dim=1)
 
@@ -496,7 +497,7 @@ class RLSimulation:
 
             # --- 移動獎勵
             # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
-            forward_speed = torch.dot(self.vel[i], forward_vec)
+            forward_speed = self.forward_speed[i] = torch.dot(self.vel[i], forward_vec)
 
             # 2. 基礎移動獎勵
             move_reward = forward_speed * MOVE_REWARD
@@ -858,6 +859,7 @@ class RLSimulation:
             act_np = self.last_actions.cpu().numpy()
             vel_np = self.vel.cpu().numpy()
             ang_np = self.angle.cpu().numpy()
+            spd_np = self.forward_speed.cpu().numpy()
 
             for i, p in enumerate(p_np):
                 pos_tuple = (int(p[0]), int(p[1]))
@@ -881,7 +883,7 @@ class RLSimulation:
                 act = act_np[i]
                 throttle = act[1]
                 vel = vel_np[i]
-                speed = np.linalg.norm(vel)
+                speed = spd_np[i]
 
                 # 顯示能量數值
                 if verbose >= 1:
@@ -897,8 +899,9 @@ class RLSimulation:
                     self.screen.blit(dbg_surface, dbg_rect)
 
                 # 繪製慣性方向
-                if speed > 0:
-                    v_line_length = 2 + speed * 1.1
+                speed_abs = abs(speed)
+                if speed_abs > 0.1:
+                    v_line_length = speed_abs * 1.8
                     # 終點座標 = 當前位置 + 速度向量 * 縮放係數
                     vel_end_p = (
                         int(p[0] + vel[0] * v_line_length), 
@@ -922,7 +925,7 @@ class RLSimulation:
                     else:
                         power /= 3
                         angle += np.pi
-                        line_width = 5
+                        line_width = 1
                         line_color = (255, 255, 0)
 
                     line_length = 25 * power
