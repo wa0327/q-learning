@@ -632,9 +632,6 @@ class RLSimulation:
                 dead_mask[i]
             )
 
-        if self.steps % 2 == 0:
-            self.optimize_model()
-
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
         if ready_to_respawn.any():
             indices = torch.where(ready_to_respawn)[0]
@@ -1008,6 +1005,7 @@ class RLSimulation:
 
     def run(self):
         running = True
+        training = True
         is_paused = False
         label_only = False
         draw_alert = False
@@ -1044,6 +1042,8 @@ class RLSimulation:
                         self.init_network()
                     elif event.key == pygame.K_SPACE:
                         is_paused = not is_paused
+                    elif event.key == pygame.K_t:
+                        training = not training
                     elif event.key == pygame.K_h:
                         label_only = not label_only
                     elif event.key == pygame.K_a:
@@ -1059,6 +1059,8 @@ class RLSimulation:
 
             if not is_paused:
                 self.update(move_food, move_predator)
+                if training and self.steps % 2 == 0:
+                    self.optimize_model()
                 if self.steps % 5000 == 0:
                     self.save_state()
 
