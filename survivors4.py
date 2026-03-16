@@ -22,7 +22,7 @@ POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
-PREDATOR_SIZE = 3
+PREDATOR_SIZE = 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
@@ -40,7 +40,7 @@ RND_POS_PADDING = 10    # 隨機取位邊距
 # 獎懲設定
 FOOD_REWARD = 15.0     # 吃到食物
 KILLED_REWARD = -15.0  # 被殺
-COLLIDED_REWARD = -15.0 # 撞死
+COLLIDED_REWARD = -12.5 # 撞死
 STARVED_REWARD = -10.0  # 餓死
 MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵，與速度成線性
@@ -56,37 +56,47 @@ LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
 MEMORY_SIZE = 100000
 BATCH_SIZE = 256
-FEAT_DIM = 12   # 每個物件特微 [cos, sin, score] x 四種類型
+FEAT_DIM = 7    # 每個物件特微 [cos, sin, dist, is_wall, is_food, is_team, is_pred]
 STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.05
-MAX_OBJ = 5     # 最大環境物件數量
+MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
 class Actor(nn.Module):
     def __init__(self):
         super().__init__()
         # 特徵提取層 (保持你的 Attention 機制)
-        self.conv = nn.Conv1d(FEAT_DIM, 32, 1)
-        self.attn_weights = nn.Linear(32, 1)
+        self.conv = nn.Sequential(
+            nn.Conv1d(FEAT_DIM, 64, 1),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, 1)
+        )
+        self.attn_weights = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
         
         # 共享的全連接層
         self.fc_common = nn.Sequential(
-            nn.Linear(32 + STATE_DIM, 64),
+            nn.Linear(64 + STATE_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
             nn.ReLU()
         )
         
         # SAC 核心：輸出均值與對數標準差
-        self.mu = nn.Linear(64, ACTION_DIM)
-        self.log_std = nn.Linear(64, ACTION_DIM)
+        self.mu = nn.Linear(256, ACTION_DIM)
+        self.log_std = nn.Linear(256, ACTION_DIM)
         
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
     def forward(self, m_in, s_in, deterministic=False, with_logprob=True):
-        # 1. Attention 處理 (與原代碼一致)
+        # 1. Attention 處理
         feat = F.relu(self.conv(m_in))
         feat = feat.transpose(1, 2)
         weights = F.softmax(self.attn_weights(feat), dim=1)
@@ -125,25 +135,41 @@ class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         # Q1 結構
-        self.conv1 = nn.Conv1d(FEAT_DIM, 32, 1)
-        self.attn1 = nn.Linear(32, 1)
-        self.fc1 = nn.Sequential(
-            nn.Linear(32 + STATE_DIM + ACTION_DIM, 64),
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(FEAT_DIM, 64, 1),
             nn.ReLU(),
+            nn.Conv1d(64, 64, 1)
+        )
+        self.attn1 = nn.Sequential(
             nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(32, 1)
+        )
+        self.fc1 = nn.Sequential(
+            nn.Linear(64 + STATE_DIM + ACTION_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
         )
         
         # Q2 結構
-        self.conv2 = nn.Conv1d(FEAT_DIM, 32, 1)
-        self.attn2 = nn.Linear(32, 1)
-        self.fc2 = nn.Sequential(
-            nn.Linear(32 + STATE_DIM + ACTION_DIM, 64),
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(FEAT_DIM, 64, 1),
             nn.ReLU(),
+            nn.Conv1d(64, 64, 1)
+        )
+        self.attn2 = nn.Sequential(
             nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(32, 1)
+        )
+        self.fc2 = nn.Sequential(
+            nn.Linear(64 + STATE_DIM + ACTION_DIM, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
         )
 
     def forward(self, m_in, s_in, action):
@@ -220,11 +246,14 @@ class RLSimulation:
         self.throttle_factor = POP_MAX_SPEED * (1 - DAMPING_FACTOR)
         self.reset_env()
         self.load_state()
-        
-        # 定義四面牆的方位向量, 左牆: (-1, 0), 右牆: (1, 0), 上牆: (0, -1), 下牆: (0, 1)
-        self.wall_normals = torch.tensor([
-            [-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]
-        ], device=DEVICE)
+
+        # 四類環境物件的 one-hot 編碼
+        self.l_wall = torch.tensor([1, 0, 0, 0], device=DEVICE).view(1, 4, 1)
+        self.l_food = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 4, 1)
+        self.l_team = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 4, 1)
+        self.l_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 4, 1)
+        # 四邊牆的固定角度
+        self.wall_angles = torch.tensor([math.pi, 0.0, -math.pi * 0.5, math.pi * 0.5], device=DEVICE).view(1, 4)
 
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
@@ -343,74 +372,73 @@ class RLSimulation:
         }
 
     def get_states(self):
-        # --- 1. 處理牆壁 (Wall: Channel 0-2) ---
-        wall_in = torch.zeros((POP_SIZE, 3, MAX_OBJ), device=DEVICE)
+        angel = self.angle.view(POP_SIZE, 1)
+        mixed_in = torch.zeros((POP_SIZE, FEAT_DIM, MAX_OBJ), device=DEVICE, dtype=torch.float32)
+        current_idx = 0
 
+        def fill_buffer(features):
+            nonlocal current_idx
+            num_new = features.shape[2]
+            space_left = MAX_OBJ - current_idx
+            if num_new > 0 and space_left > 0:
+                actual_add = min(num_new, space_left)
+                mixed_in[:, :, current_idx : current_idx + actual_add] = features[:, :, :actual_add]
+                current_idx += actual_add
+
+        def process_obj(obj_pos, obj_radius, one_hot_label, is_self=False):
+            nonlocal current_idx
+            if obj_pos.shape[0] == 0:
+                return None
+            
+            # 計算相對位移 (POP_SIZE, OBJ_SIZE, 2)
+            diff = obj_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+            dist = torch.norm(diff, dim=2)
+            if is_self: # 處理隊友時排除自己
+                dist.fill_diagonal_(1e6)
+                
+            # 計算相對角度
+            abs_ang = torch.atan2(diff[..., 1], diff[..., 0])
+            rel_ang = abs_ang - angel
+            
+            # 計算距離
+            dist_norm = ((dist - POP_RADIUS - obj_radius) / PERCEPTION_RADIUS).clamp(0, 1)
+            # 排除視野遮罩
+            mask = ((dist - POP_RADIUS - obj_radius) < PERCEPTION_RADIUS).float()
+            
+            phys = torch.stack([
+                torch.cos(rel_ang),
+                torch.sin(rel_ang),
+                dist_norm
+            ], dim=1) * mask.unsqueeze(1)
+            
+            onehot = one_hot_label.expand(POP_SIZE, 4, phys.shape[2])
+            return torch.cat([phys, onehot], dim=1)
+
+        # --- 1. 處理牆壁 (Wall) ---
         d_left = self.pos[:, 0]
         d_right = SCREEN_W - self.pos[:, 0]
         d_top = self.pos[:, 1]
         d_bottom = SCREEN_H - self.pos[:, 1]
         wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1) 
-        
-        wall_angles = torch.atan2(self.wall_normals[:, 1], self.wall_normals[:, 0]).unsqueeze(0) - self.angle.unsqueeze(1)
-        wall_dist = (wall_dists / PERCEPTION_RADIUS).clamp(min=0, max=1)
-        wall_mask = (wall_dists < PERCEPTION_RADIUS).float()
-        
-        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_dist], dim=2) * wall_mask.unsqueeze(-1)
-        wall_in[:, :, :4] = wall_phys.transpose(1, 2)[:, :, :MAX_OBJ]
+        wall_dist = ((wall_dists - POP_RADIUS) / PERCEPTION_RADIUS).clamp(min=0, max=1)
+        wall_mask = ((wall_dists - POP_RADIUS) < PERCEPTION_RADIUS).float()
+        wall_angles = self.wall_angles - angel
+        wall_phys = torch.stack([torch.cos(wall_angles), torch.sin(wall_angles), wall_dist], dim=1) * wall_mask.unsqueeze(1)
+        wall_in = torch.cat([wall_phys, self.l_wall.expand(POP_SIZE, 4, wall_phys.shape[2])], dim=1)
+        fill_buffer(wall_in)
 
-        # --- 2. 處理食物 (Food: Channel 3-5) ---
-        food_in = torch.zeros((POP_SIZE, 3, MAX_OBJ), device=DEVICE)
+        # --- 2. 處理食物 (Food) ---
         if FOOD_SIZE > 0:
-            dist_food = torch.cdist(self.pos, self.food_pos)
-            k_f = min(MAX_OBJ, FOOD_SIZE)
-            val_f, f_idx = torch.topk(dist_food, k_f, largest=False)
-            
-            selected_food_pos = self.food_pos[f_idx] 
-            f_diff = selected_food_pos - self.pos.unsqueeze(1)
-            f_ang = torch.atan2(f_diff[..., 1], f_diff[..., 0]) - self.angle.unsqueeze(1)
-            food_dist = (val_f / PERCEPTION_RADIUS).clamp(min=0, max=1)
-            food_mask = (val_f < PERCEPTION_RADIUS).float()
-            
-            food_phys = torch.stack([torch.cos(f_ang), torch.sin(f_ang), food_dist], dim=2) * food_mask.unsqueeze(-1)
-            food_in[:, :, :k_f] = food_phys.transpose(1, 2)
+            fill_buffer(process_obj(self.food_pos, FOOD_RADIUS, self.l_food))
 
-        # --- 4. 處理敵人 (Predator: Channel 9-11) ---
-        pred_in = torch.zeros((POP_SIZE, 3, MAX_OBJ), device=DEVICE)
-        if PREDATOR_SIZE > 0:
-            dist_pred = torch.cdist(self.pos, self.pred_pos)
-            k_p = min(MAX_OBJ, PREDATOR_SIZE)
-            val_p, p_idx = torch.topk(dist_pred, k_p, largest=False)
-            
-            selected_pred_pos = self.pred_pos[p_idx]
-            p_diff = selected_pred_pos - self.pos.unsqueeze(1)
-            p_ang = torch.atan2(p_diff[..., 1], p_diff[..., 0]) - self.angle.unsqueeze(1)
-            pred_dist = (val_p / PERCEPTION_RADIUS).clamp(min=0, max=1)
-            pred_mask = (val_p < PERCEPTION_RADIUS).float()
-            
-            pred_phys = torch.stack([torch.cos(p_ang), torch.sin(p_ang), pred_dist], dim=2) * pred_mask.unsqueeze(-1)
-            pred_in[:, :, :k_p] = pred_phys.transpose(1, 2)
-
-        # --- 3. 處理隊友 (Team: Channel 6-8) ---
-        team_in = torch.zeros((POP_SIZE, 3, MAX_OBJ), device=DEVICE)
+        # --- 3. 處理隊友 (Team) ---
         if POP_SIZE > 1:
-            dist_agents = torch.cdist(self.pos, self.pos)
-            dist_agents.fill_diagonal_(999.0)
-            k_t = min(MAX_OBJ, POP_SIZE - 1)
-            val_t, t_idx = torch.topk(dist_agents, k_t, largest=False)
-            
-            selected_team_pos = self.pos[t_idx]
-            t_diff = selected_team_pos - self.pos.unsqueeze(1)
-            t_ang = torch.atan2(t_diff[..., 1], t_diff[..., 0]) - self.angle.unsqueeze(1)
-            team_dist = (val_t / PERCEPTION_RADIUS).clamp(min=0, max=1)
-            team_mask = (val_t < PERCEPTION_RADIUS).float()
-            
-            team_phys = torch.stack([torch.cos(t_ang), torch.sin(t_ang), team_dist], dim=2) * team_mask.unsqueeze(-1)
-            team_in[:, :, :k_t] = team_phys.transpose(1, 2)
+            fill_buffer(process_obj(self.pos, POP_RADIUS, self.l_team, is_self=True))
 
-        # --- 5. 合併與自身狀態 ---
-        mixed_in = torch.cat([wall_in, food_in, team_in, pred_in], dim=1)
-        
+        # --- 4. 處理敵人 (Predator) ---
+        if PREDATOR_SIZE > 0:
+            fill_buffer(process_obj(self.pred_pos, PREDATOR_RADIUS, self.l_pred))
+
         speed = torch.norm(self.vel, dim=1) / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy / MAX_ENERGY], dim=1)
@@ -471,7 +499,7 @@ class RLSimulation:
             move_reward = forward_speed * MOVE_REWARD
 
             # 3. 嚴格的轉向懲罰
-            steer_penalty = MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
+            steer_penalty = 0.0 #MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
 
             # 3. 靜止/低效懲罰 (Lazy Penalty)
             # 如果有效前進速度太低，就給予負分，逼它動起來
@@ -479,9 +507,9 @@ class RLSimulation:
 
             # 4. 高速與油門懲罰 (維持你原有的速度限制邏輯)
             throttle_penalty = 0.0
-            throttle_threshold = 0.875
-            if throttle_val > throttle_threshold:
-                throttle_penalty = MOVE_REWARD * 0.5 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
+            # throttle_threshold = 0.875
+            # if throttle_val > throttle_threshold:
+            #     throttle_penalty = MOVE_REWARD * 0.5 * torch.pow((throttle_val - throttle_threshold) / (1.0 - throttle_threshold), 2)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
@@ -976,7 +1004,7 @@ class RLSimulation:
         label_only = False
         draw_alert = False
         draw_perception = False
-        move_food = False
+        move_food = True
         move_predator = True
         verbose = 0
 
