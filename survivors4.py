@@ -264,7 +264,7 @@ class RLSimulation:
             [0.0, 0.0], [SCREEN_W-1, 0.0], [SCREEN_W-1, SCREEN_H-1], [0.0, SCREEN_H-1]
         ], device=DEVICE)
         tv = torch.tensor([
-            [400.0, 120.0], [750.0, 450.0], [213.0, 600.0]
+            [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
         ], device=DEVICE)
         self.wall_A = torch.cat([ov, tv], dim=0)
         self.wall_B = torch.cat([
@@ -466,7 +466,6 @@ class RLSimulation:
             wall_phys, 
             self.l_wall.expand(POP_SIZE, 4, self.wall_A.shape[0])
         ], dim=1)
-        wall_in = self.get_wall_in()
         fill_buffer(wall_in)
 
         # --- 2. 處理食物 (Food) ---
