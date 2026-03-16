@@ -49,7 +49,7 @@ TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.05     # 近牆最大懲罰(實際按距離比例遞減)
 PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.05   # 近敵最大懲罰(實際按距離比例遞減)
-FOOD_NEARBY_REWARD = FOOD_REWARD * 0.05         # 近食最大獎勵(實際按距離比例遞減)
+FOOD_NEARBY_REWARD = FOOD_REWARD * 0.01         # 近食最大獎勵(實際按距離比例遞減)
 TEAM_NEARBY_REWARD = STEP_REWARD                # 近隊最大懲罰(實際按距離比例遞減)
 
 # 模型核心參數
@@ -960,7 +960,7 @@ class RLSimulation:
             ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
             ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
             ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
-            ("Rewards:", f"{self.rewards_avg:.4f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
+            ("Rewards:", f"{self.rewards_avg:.2f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
             ("Killed:", f"{self.killed:,}", THEME["loss"], False),
             ("Collided:", f"{self.collided:,}", THEME["loss"], False),
             ("Starved:", f"{self.starved:,}", THEME["loss"], False),
