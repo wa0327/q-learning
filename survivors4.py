@@ -35,6 +35,7 @@ ALERT_RADIUS = 100      # 警戒敵人半徑
 WALL_SENSE_RADIUS = 50  # 牆壁感知半徑
 TEAM_RADIUS = 30        # 友方過近半徑
 DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
+BACKWARD_FACTOR = 0.33
 RND_POS_PADDING = 10    # 隨機取位邊距
 
 # 獎懲設定
@@ -42,12 +43,14 @@ FOOD_REWARD = 15.0     # 吃到食物
 KILLED_REWARD = -15.0  # 被殺
 COLLIDED_REWARD = -12.5 # 撞死
 STARVED_REWARD = -10.0  # 餓死
-MOVE_REWARD_FACTOR = 0.2 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
-MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS / POP_MAX_SPEED # 移動基礎獎勵
+MOVE_REWARD_FACTOR = 0.5 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
+MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
-WALL_PENALTY = COLLIDED_REWARD * 0.15   # 近牆最大懲罰
-PREDATOR_PENALTY = KILLED_REWARD * 0.05 # 近敵最大懲罰
+WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.05     # 近牆最大懲罰(實際按距離比例遞減)
+PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.05   # 近敵最大懲罰(實際按距離比例遞減)
+FOOD_NEARBY_REWARD = FOOD_REWARD * 0.05         # 近食最大獎勵(實際按距離比例遞減)
+TEAM_NEARBY_REWARD = STEP_REWARD                # 近隊最大懲罰(實際按距離比例遞減)
 
 # 模型核心參數
 GAMMA = 0.99
@@ -463,8 +466,8 @@ class RLSimulation:
                 continue
             
             speed_val = torch.norm(self.vel[i])
-            steer_val = actions[i][0]     # -1~1
-            throttle_val = actions[i][1]
+            steer_val = actions[i][0]       # [-1, 1] 舵向控制值 [左, 右]
+            throttle_val = actions[i][1]    # [-1, 1] 油門控制值 [退, 進]
 
             # 映射至 -0.15 到 0.15 弧度，舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
             # 1. 基礎舵效：隨速度上升 (0 -> 2.0 速度區間)
@@ -475,8 +478,8 @@ class RLSimulation:
             steer = steer_val * 0.15 * sensitivity * high_speed_damping
             self.angle[i] += steer
 
-            # Action[1] 為油門 (-1 到 1 映射至 0 到 THROTTLE_FACTOR 加速度)
-            throttle = throttle_val * (self.throttle_factor if throttle_val > 0 else self.throttle_factor / 3)
+            # 換算為油門值
+            throttle = throttle_val * (self.throttle_factor if throttle_val > 0 else self.throttle_factor * BACKWARD_FACTOR)
             # 向量動力學：計算當前車頭朝向單位向量
             forward_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
             # 推力 = 向量 X 油門
@@ -498,18 +501,18 @@ class RLSimulation:
             # 2. 基礎移動獎勵
             move_reward = forward_speed * MOVE_REWARD
 
-            # 3. 嚴格的轉向懲罰
+            # 3. 轉向懲罰
             steer_penalty = 0.0 #MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
 
-            # 3. 靜止/低效懲罰
+            # 3. 低效懲罰
             # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = MOVE_REWARD * 0.5 * torch.clamp(0.4 - forward_speed, min=0.0)
+            lazy_penalty = 0.0 #MOVE_REWARD * 0.5 * torch.clamp(0.4 - forward_speed, min=0.0)
 
-            # 4. 高速與油門懲罰
+            # 4. 控制油門效率
             throttle_penalty = 0.0
-            # throttle_threshold = 0.875
-            # diff = torch.abs(torch.abs(throttle_val) - throttle_threshold)
-            # throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 5.0) - 1.0)
+            throttle_threshold = 0.75 # 性能最佳的油門
+            diff = torch.abs(torch.abs(throttle_val) - throttle_threshold)
+            throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 3.0) - 1.0)
 
             # 5. 最終移動獎勵整合
             # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
@@ -540,7 +543,7 @@ class RLSimulation:
             dist_pred = torch.cdist(self.pos, self.pred_pos)
             danger_ratio = (1.0 - (dist_pred - POP_RADIUS - PREDATOR_RADIUS) / ALERT_RADIUS).clamp(min=0.0, max=1.0)
             killed = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=1) & self.alive
-            danger_penalty = torch.sum(PREDATOR_PENALTY * danger_ratio, dim=1)
+            danger_penalty = torch.sum(PREDATOR_NEARBY_REWARD * danger_ratio, dim=1)
             rewards += (danger_penalty * self.alive.float() * (~killed).float())
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
@@ -573,7 +576,7 @@ class RLSimulation:
         d_bottom = (SCREEN_H - 1) - self.pos[:, 1]
         wall_dists = torch.stack([d_left, d_right, d_top, d_bottom], dim=1)
         wall_ratios = (1.0 - (wall_dists - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(min=0.0, max=1.0)
-        wall_penalty = torch.sum(WALL_PENALTY * wall_ratios, dim=1)
+        wall_penalty = torch.sum(WALL_NEARBY_REWARD * wall_ratios, dim=1)
         rewards += (wall_penalty * self.alive.float())
 
         # 食物邏輯
@@ -601,14 +604,14 @@ class RLSimulation:
         if FOOD_SIZE > 1:
             dist_food = torch.cdist(self.pos, self.food_pos)            
             food_ratio = (1.0 - (dist_food - POP_RADIUS - FOOD_RADIUS) / PERCEPTION_RADIUS).clamp(min=0.0, max=1.0)
-            food_reward_sum = torch.sum(MOVE_REWARD * 2.0 * food_ratio, dim=1)
+            food_reward_sum = torch.sum(FOOD_NEARBY_REWARD * food_ratio, dim=1)
             rewards += (food_reward_sum * self.alive.float())
             
-        # 隊友排斥，排除自己與自己的距離 (對角線設為大值)
+        # 隊友排斥，排除自己與自己的距離
         if POP_SIZE > 1:
             dist_agents = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0)
             team_ratio = (1.0 - (dist_agents - POP_RADIUS * 2) / TEAM_RADIUS).clamp(min=0.0, max=1.0)
-            team_penalty = torch.sum(STEP_REWARD * 1.5 * torch.pow(team_ratio, 2), dim=1)
+            team_penalty = torch.sum(TEAM_NEARBY_REWARD * torch.pow(team_ratio, 2), dim=1)
             rewards += (team_penalty * self.alive.float())
 
         next_states = self.last_states = self.get_states()
