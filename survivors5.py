@@ -9,13 +9,15 @@ from pathlib import Path
 from datetime import datetime
 import math
 import shutil
+import cv2
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 # --- 參數設定 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCREEN_W, SCREEN_H = 900, 700
-SAVE_PATH = f"{script_name}.pt"
+BASE_PATH = f"weights/{script_name}"
+SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
 POP_SIZE = 16
@@ -246,7 +248,7 @@ class RLSimulation:
         
         # 初始化神經網路
         self.init_network(Actor, Critic)
-        self.brain_path = f"{script_name}_{self.actor.__class__.__name__}.pt"
+        self.brain_path = f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}.pt"
         self.throttle_factor = POP_MAX_SPEED * (1 - DAMPING_FACTOR)
         self.reset_env()
         self.load_state()
@@ -861,7 +863,7 @@ class RLSimulation:
             'critic_opt': self.critic_opt.state_dict(),
             'alpha_opt': self.alpha_opt.state_dict(),
         }, self.brain_path)
-        shutil.copy2(self.brain_path, f"{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
+        shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
         print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
@@ -1077,6 +1079,7 @@ class RLSimulation:
         move_food = True
         move_predator = True
         verbose = 0
+        video_writer = None
 
         self.last_states = self.get_states()
         self.fps_avg = self.clock.get_fps()
@@ -1120,6 +1123,17 @@ class RLSimulation:
                         move_predator = not move_predator
                     elif event.key == pygame.K_v:
                         verbose = (verbose + 1) % 3
+                    elif event.key == pygame.K_r:
+                        if video_writer:
+                            video_writer.release()
+                            video_writer = None
+                            print("錄影結束並存檔。")
+                        else:
+                            now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                            filename = f"{now}.mp4"
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            video_writer = cv2.VideoWriter(filename, fourcc, 60, (SCREEN_W, SCREEN_H))
+                            print(f"開始錄影: {filename}")
 
             if not is_paused:
                 self.update(move_food, move_predator)
@@ -1130,6 +1144,18 @@ class RLSimulation:
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(label_only, draw_perception, draw_alert, verbose)
+
+            if video_writer:
+                # 取得 Pygame 畫面像素
+                view = pygame.surfarray.array3d(self.screen)
+                # 轉換格式：Pygame 是 (width, height, RGB) -> OpenCV 需要 (height, width, BGR)
+                view = view.transpose([1, 0, 2])
+                view = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
+                # 寫入影格
+                video_writer.write(view)
+                
+        if video_writer:
+            video_writer.release()
 
         self.save_state()
         pygame.quit()
