@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 import math
+import shutil
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
@@ -48,7 +49,7 @@ MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.05     # 近牆最大懲罰(實際按距離比例遞減)
-PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.05   # 近敵最大懲罰(實際按距離比例遞減)
+PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.08   # 近敵最大懲罰(實際按距離比例遞減)
 FOOD_NEARBY_REWARD = FOOD_REWARD * 0.01         # 近食最大獎勵(實際按距離比例遞減)
 TEAM_NEARBY_REWARD = STEP_REWARD                # 近隊最大懲罰(實際按距離比例遞減)
 
@@ -64,7 +65,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.05
+MIN_ALPHA = 0.01
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -802,6 +803,7 @@ class RLSimulation:
             'critic_opt': self.critic_opt.state_dict(),
             'alpha_opt': self.alpha_opt.state_dict(),
         }, self.brain_path)
+        shutil.copy2(self.brain_path, f"{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
         print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
