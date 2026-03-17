@@ -316,7 +316,7 @@ class RLSimulation:
         self.collided = 0
         self.starved = 0
         self.eaten = 0
-        self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
+        self.last_actions = torch.zeros((POP_SIZE, ACTION_DIM), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)
         self.forward_speed = torch.zeros(POP_SIZE, device=DEVICE)
@@ -529,7 +529,6 @@ class RLSimulation:
         with torch.no_grad():
             m, s = self.last_states
             actions, _ = self.actor(m, s, deterministic=False, with_logprob=False)
-            self.last_actions = actions.detach().clone()
 
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
@@ -587,9 +586,12 @@ class RLSimulation:
             diff = torch.abs(torch.abs(throttle_val) - throttle_threshold)
             throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 3.0) - 1.0)
 
-            # 5. 最終移動獎勵整合
-            # 計算方式：(有效前進 * 轉向效率) - 懶惰代價 - 超速代價
-            rewards[i] += move_reward - steer_penalty - lazy_penalty - throttle_penalty
+            # 5. 動作變動量懲罰
+            action_diff = actions[i] - self.last_actions[i]
+            smooth_penalty = MOVE_REWARD * 0.5 * torch.sum(action_diff.pow(2)) 
+
+            # 6. 最終移動獎勵整合
+            rewards[i] += move_reward - steer_penalty - lazy_penalty - throttle_penalty - smooth_penalty
 
         # 掠食者 (Predators)
         if PREDATOR_SIZE > 0:
@@ -669,8 +671,9 @@ class RLSimulation:
 
         dead_mask = killed | collided | starved
 
+        self.last_actions = actions.detach().clone()
         next_states = self.last_states = self.get_states()
-        
+
         # 把經驗推入 Replay Buffer
         for i in range(POP_SIZE):
             if not was_alive[i]: 
