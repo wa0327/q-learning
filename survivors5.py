@@ -26,24 +26,23 @@ SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 # 環境參數
 WALL_SIZE = 0
 POP_SIZE = 16
-POP_RADIUS = 4          # 生存者體積半徑
+POP_RADIUS = 4                      # 生存者體積半徑
 POP_MAX_SPEED = 3.0
-POP_MAX_STEER = math.radians(15) # 最大轉向角度
+POP_DAMPING_FACTOR = 0.85           # 阻力系數，越高越需要維持高油門
+POP_BACKWARD_FACTOR = 0.33
+POP_MAX_STEER = math.radians(15)    # 最大轉向角度
+POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
-PREDATOR_SIZE = 8
-PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
-PREDATOR_MIN_SPEED = 1.5
-PREDATOR_MAX_SPEED = 2.5
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 50.0      # 食物補充能量
 EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
-PERCEPTION_RADIUS = 250 # 視野感知半徑
-ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS + POP_MAX_SPEED # 警戒敵人半徑
-WALL_SENSE_RADIUS = POP_RADIUS + POP_MAX_SPEED # 牆壁感知半徑
-DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
-BACKWARD_FACTOR = 0.33
+PREDATOR_SIZE = 8
+PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
+PREDATOR_MIN_SPEED = 1.5
+PREDATOR_MAX_SPEED = 2.5
+ALERT_RADIUS = POP_MAX_SPEED * 2 # 危險警戒半徑
 RND_POS_PADDING = 50.0  # 隨機取位邊距
 
 # 獎懲設定
@@ -70,7 +69,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 1e-9
+MIN_ALPHA = 0.05
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -252,7 +251,7 @@ class RLSimulation:
         # 初始化神經網路
         self.init_network(Actor, Critic)
         self.brain_path = f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}.pt"
-        self.throttle_factor = POP_MAX_SPEED * (1 - DAMPING_FACTOR)
+        self.throttle_factor = POP_MAX_SPEED * POP_DAMPING_FACTOR
         self.reset_env()
         path = Path(BASE_PATH)
         path.mkdir(parents=True, exist_ok=True)
@@ -371,7 +370,7 @@ class RLSimulation:
 
     def optimize_model(self):
         if len(self.memory) < BATCH_SIZE:
-            return
+            return False
         
         m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample(BATCH_SIZE)
         r_b = r_b.unsqueeze(1) 
@@ -430,6 +429,7 @@ class RLSimulation:
             "a_loss": actor_loss.item()
         }
         self.steps += 1
+        return True
 
     def get_states(self):
         angel = self.angle.view(POP_SIZE, 1)
@@ -461,9 +461,9 @@ class RLSimulation:
             rel_ang = abs_ang - angel
             
             # 計算距離
-            dist_norm = ((dist - POP_RADIUS - obj_radius) / PERCEPTION_RADIUS).clamp(0, 1)
+            dist_norm = ((dist - POP_RADIUS - obj_radius) / POP_PERCEPTION_RADIUS).clamp(0, 1)
             # 排除視野遮罩
-            mask = ((dist - POP_RADIUS - obj_radius) < PERCEPTION_RADIUS).float()
+            mask = ((dist - POP_RADIUS - obj_radius) < POP_PERCEPTION_RADIUS).float()
             
             phys = torch.stack([
                 torch.cos(rel_ang),
@@ -494,8 +494,8 @@ class RLSimulation:
         rel_ang = abs_ang - self.angle.view(POP_SIZE, 1)
 
         # 正規化距離與遮罩 (只看感知範圍內)
-        wall_dist_norm = ((wall_dist - POP_RADIUS) / PERCEPTION_RADIUS).clamp(0, 1)
-        wall_mask = ((wall_dist - POP_RADIUS) < PERCEPTION_RADIUS).float()
+        wall_dist_norm = ((wall_dist - POP_RADIUS) / POP_PERCEPTION_RADIUS).clamp(0, 1)
+        wall_mask = ((wall_dist - POP_RADIUS) < POP_PERCEPTION_RADIUS).float()
 
         # 構建物理特徵 (Cos, Sin, Dist)
         # wall_phys 維度: (POP_SIZE, 3, W)
@@ -527,14 +527,14 @@ class RLSimulation:
 
         return (mixed_in, self_in)
     
-    def update(self, move_food, move_predator):
+    def update(self, training, move_food, move_predator):
         was_alive = self.alive.clone()
         current_states = self.get_states()
         
         # 取得連續動作並加入探索噪音
         with torch.no_grad():
             m, s = self.last_states
-            actions, _ = self.actor(m, s, deterministic=False, with_logprob=False)
+            actions, _ = self.actor(m, s, deterministic=not training, with_logprob=False)
 
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
@@ -550,9 +550,9 @@ class RLSimulation:
         # 2. 速度與舵效計算
         speed_vals = torch.norm(self.vel, dim=1)
         
-        # 基礎舵效：(0 -> 2.0 速度區間)
-        sensitivity = torch.clamp(speed_vals / 2.0, min=0.0, max=1.0).pow(2.0)
-        # 高速衰減：(3.5 -> 4.0 速度區間)
+        # 基礎舵效：(0 -> 0.2 速度區間)
+        sensitivity = torch.clamp(speed_vals / 0.2, min=0.0, max=1.0).pow(2.0)
+        # 高速衰減：(MAX_SPEED * 0.875 -> MAX_SPEED 速度區間)
         high_speed_damping = torch.clamp(1.875 - (speed_vals / POP_MAX_SPEED), min=0.7, max=1.0)
         
         # 計算轉角增量並更新
@@ -560,7 +560,7 @@ class RLSimulation:
         self.angle += steer_delta * alive_mask_flat
 
         # 3. 換算油門與推力
-        throttle_factors = torch.where(throttle_vals > 0, self.throttle_factor, self.throttle_factor * BACKWARD_FACTOR)
+        throttle_factors = torch.where(throttle_vals > 0, self.throttle_factor, self.throttle_factor * POP_BACKWARD_FACTOR)
         throttles = (throttle_vals * throttle_factors).unsqueeze(1)
 
         # 計算車頭向量
@@ -570,8 +570,8 @@ class RLSimulation:
         thrust = pop_vecs * throttles
 
         # 4. 更新物理狀態
-        # 速度更新：V = V * Damping + Thrust
-        self.vel = (self.vel * DAMPING_FACTOR + thrust) * alive_mask
+        # 速度更新：V = V * (1 - Damping) + Thrust
+        self.vel = (self.vel * (1 - POP_DAMPING_FACTOR) + thrust) * alive_mask
         # 位置更新：P = P + V
         self.pos += self.vel * alive_mask
 
@@ -665,7 +665,7 @@ class RLSimulation:
 
         # 近牆痛覺
         wall_min_dist, closest_wall_idx = torch.min(dist_to_walls, dim=1) # (N,)
-        wall_dist_ratio = (1.0 - (wall_min_dist - POP_RADIUS) / WALL_SENSE_RADIUS).clamp(0.0, 1.0)
+        wall_dist_ratio = (1.0 - (wall_min_dist - POP_RADIUS) / ALERT_RADIUS).clamp(0.0, 1.0)
         wall_closest_points = wall_closest_points[torch.arange(self.pos.size(0), device=DEVICE), closest_wall_idx]
         wall_mask = (wall_dist_ratio > 0) & self.alive
         if wall_mask.any():
@@ -831,7 +831,7 @@ class RLSimulation:
         farthest_idx = torch.argmax(dists, dim=1)
         
         # 建立一個 Mask，過濾掉太近的 (小於 200)
-        valid_mask = dists > PERCEPTION_RADIUS
+        valid_mask = dists > POP_PERCEPTION_RADIUS
         
         final_pos = torch.empty((num_to_respawn, 2), device=DEVICE)
         
@@ -847,7 +847,7 @@ class RLSimulation:
 
         return final_pos
         
-    def save_state(self, save_brain):
+    def save_state(self):
         torch.save({
             'frames': self.frames,
             'pos': self.pos,
@@ -863,18 +863,17 @@ class RLSimulation:
             'starved': self.starved
         }, SAVE_PATH)
 
-        if save_brain:
-            torch.save({
-                'steps': self.steps,
-                'actor': self.actor.state_dict(),
-                'critic': self.critic.state_dict(),
-                'critic_target': self.critic_target.state_dict(),
-                'log_alpha': self.log_alpha,
-                'actor_opt': self.actor_opt.state_dict(),
-                'critic_opt': self.critic_opt.state_dict(),
-                'alpha_opt': self.alpha_opt.state_dict(),
-            }, self.brain_path)
-            shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
+        torch.save({
+            'steps': self.steps,
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'log_alpha': self.log_alpha,
+            'actor_opt': self.actor_opt.state_dict(),
+            'critic_opt': self.critic_opt.state_dict(),
+            'alpha_opt': self.alpha_opt.state_dict(),
+        }, self.brain_path)
+        shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
@@ -1016,11 +1015,10 @@ class RLSimulation:
 
                 # 畫出視野範圍
                 if draw_perception:
-                    pygame.draw.circle(self.screen, color, pos_tuple, PERCEPTION_RADIUS, 1)
+                    pygame.draw.circle(self.screen, color, pos_tuple, POP_PERCEPTION_RADIUS, 1)
                 # 畫出警戒範圍
                 if draw_alert:
                     pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
-                    pygame.draw.circle(self.screen, color, pos_tuple, WALL_SENSE_RADIUS, 1)
 
                 if verbose >= 2:
                     for start, end in self.wall_lines:
@@ -1093,10 +1091,10 @@ class RLSimulation:
 
     def run(self, args):
         running = True
-        training = False if args.no_train else True
+        training = False if args.demo else True
         is_paused = False
         draw_label = True
-        draw_units = False
+        draw_units = True
         draw_alert = False
         draw_perception = False
         move_food = True
@@ -1173,14 +1171,16 @@ class RLSimulation:
                             start_record()
 
             if not is_paused:
-                self.update(move_food, move_predator)
+                self.update(training, move_food, move_predator)
                 if training:
-                    self.optimize_model()
+                    updated = self.optimize_model()
+                else:
+                    updated = False
 
                 if self.steps >= args.steps:
                     running = False
-                elif self.frames % 5000 == 0:
-                    self.save_state(training)
+                elif updated and self.steps % 5000 == 0:
+                    self.save_state()
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
@@ -1193,7 +1193,7 @@ class RLSimulation:
             frame_queue.put(None)
             video_thread.join()
 
-        self.save_state(training)
+        self.save_state()
         pygame.quit()
 
     def record_proc(self, frame_queue, filename, width, height, fps):
@@ -1229,7 +1229,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
-    parser.add_argument("--no_train", action="store_true", default=False, help="停止訓練")
+    parser.add_argument("--demo", action="store_true", default=False, help="模型性能展示")
     args = parser.parse_args()
     
     sim = RLSimulation()
