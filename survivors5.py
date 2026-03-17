@@ -13,6 +13,7 @@ import cv2
 from pathlib import Path
 import threading
 import queue
+import argparse
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
@@ -23,13 +24,14 @@ BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
-POP_SIZE = 16
+LEVEL = 0
+POP_SIZE = 50 if LEVEL == 0 else 16
 POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
 POP_MAX_STEER = math.radians(35) # 最大轉向角度
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
-PREDATOR_SIZE = 8
+PREDATOR_SIZE = 0 if LEVEL == 0 else 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
@@ -1081,7 +1083,7 @@ class RLSimulation:
         pygame.display.flip()
         self.clock.tick(self.fps)
 
-    def run(self):
+    def run(self, args):
         running = True
         training = True
         is_paused = False
@@ -1089,7 +1091,7 @@ class RLSimulation:
         draw_units = True
         draw_alert = False
         draw_perception = False
-        move_food = True
+        move_food = False if LEVEL == 0 else True
         move_predator = True
         verbose = 0
         video_thread = None
@@ -1156,7 +1158,10 @@ class RLSimulation:
                 self.update(move_food, move_predator)
                 if training and self.steps % 2 == 0:
                     self.optimize_model()
-                if self.steps % 5000 == 0:
+
+                if self.steps >= args.steps:
+                    running = False
+                elif self.steps % 5000 == 0:
                     self.save_state()
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
@@ -1192,5 +1197,9 @@ class RLSimulation:
         print(f"錄影已關閉，檔案：{filename}")
         
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=CAPTION)
+    parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
+    args = parser.parse_args()
+    
     sim = RLSimulation()
-    sim.run()
+    sim.run(args)
