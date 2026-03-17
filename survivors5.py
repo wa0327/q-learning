@@ -24,15 +24,14 @@ BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
-LEVEL = 0
 WALL_SIZE = 0
-POP_SIZE = 50 if LEVEL == 0 else 16
+POP_SIZE = 16
 POP_RADIUS = 4          # 生存者體積半徑
-POP_MAX_SPEED = 4
-POP_MAX_STEER = math.radians(35) # 最大轉向角度
+POP_MAX_SPEED = 3.0
+POP_MAX_STEER = math.radians(15) # 最大轉向角度
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
-PREDATOR_SIZE = 0 if LEVEL == 0 else 8
+PREDATOR_SIZE = 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
@@ -40,10 +39,9 @@ MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 50.0      # 食物補充能量
 EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
-PERCEPTION_RADIUS = 200 # 視野感知半徑
-ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS + 6 # 警戒敵人半徑
-WALL_SENSE_RADIUS = POP_RADIUS + 6 # 牆壁感知半徑
-TEAM_RADIUS = 30        # 友方過近半徑
+PERCEPTION_RADIUS = 250 # 視野感知半徑
+ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS + POP_MAX_SPEED # 警戒敵人半徑
+WALL_SENSE_RADIUS = POP_RADIUS + POP_MAX_SPEED # 牆壁感知半徑
 DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
 BACKWARD_FACTOR = 0.33
 RND_POS_PADDING = 50.0  # 隨機取位邊距
@@ -57,8 +55,8 @@ MOVE_REWARD_FACTOR = 0.25 # [移動總獎勵]與[最大獎勵]的佔比，數值
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
-WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.5     # 近牆懲罰, 提早預警危險
-PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.5   # 近敵懲罰, 提早預警危險
+WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.25     # 近牆懲罰, 提早預警危險
+PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.25   # 近敵懲罰, 提早預警危險
 
 # 模型核心參數
 GAMMA = 0.99
@@ -72,7 +70,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.02
+MIN_ALPHA = 1e-9
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -248,7 +246,7 @@ class RLSimulation:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Consolas", 14)
         self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
-        self.fps = 240
+        self.fps = 300
         self.update_caption()
         
         # 初始化神經網路
@@ -317,6 +315,7 @@ class RLSimulation:
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
 
     def reset_env(self):
+        self.frames = 0
         self.rewards_avg = 0.0
         self.killed = 0
         self.collided = 0
@@ -430,6 +429,7 @@ class RLSimulation:
             "c_loss": critic_loss.item(),
             "a_loss": actor_loss.item()
         }
+        self.steps += 1
 
     def get_states(self):
         angel = self.angle.view(POP_SIZE, 1)
@@ -551,9 +551,9 @@ class RLSimulation:
         speed_vals = torch.norm(self.vel, dim=1)
         
         # 基礎舵效：(0 -> 2.0 速度區間)
-        sensitivity = torch.clamp(speed_vals / 0.1, min=0.0, max=1.0).pow(2.0)
-        # 高速衰減：(2.0 -> 4.0 速度區間)
-        high_speed_damping = torch.clamp(1.75 - (speed_vals / POP_MAX_SPEED), min=0.6, max=1.0)
+        sensitivity = torch.clamp(speed_vals / 2.0, min=0.0, max=1.0).pow(2.0)
+        # 高速衰減：(3.5 -> 4.0 速度區間)
+        high_speed_damping = torch.clamp(1.875 - (speed_vals / POP_MAX_SPEED), min=0.7, max=1.0)
         
         # 計算轉角增量並更新
         steer_delta = steer_vals * POP_MAX_STEER * sensitivity * high_speed_damping
@@ -704,17 +704,17 @@ class RLSimulation:
             self.vel[indices] = 0.0
 
         self.respawn_timer[~self.alive] -= 1
-        self.steps += 1
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
         self.killed += killed.sum().item()
         self.collided += collided.sum().item()
         self.starved += starved.sum().item()
         self.rewards = rewards.detach().cpu().numpy()
+        self.frames += 1
 
     def kill(self, killed):
         self.alive[killed] = False
         self.vel[killed] = 0.0 # 死掉後速度歸零
-        self.respawn_timer[killed] = 1 if LEVEL == 0 or POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
+        self.respawn_timer[killed] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
 
     def get_saftest_pos(self, n):
         """
@@ -847,8 +847,9 @@ class RLSimulation:
 
         return final_pos
         
-    def save_state(self):
+    def save_state(self, save_brain):
         torch.save({
+            'frames': self.frames,
             'pos': self.pos,
             'energy': self.energy,
             'alive': self.alive,
@@ -861,17 +862,20 @@ class RLSimulation:
             'collided': self.collided,
             'starved': self.starved
         }, SAVE_PATH)
-        torch.save({
-            'steps': self.steps,
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
-            'critic_target': self.critic_target.state_dict(),
-            'log_alpha': self.log_alpha,
-            'actor_opt': self.actor_opt.state_dict(),
-            'critic_opt': self.critic_opt.state_dict(),
-            'alpha_opt': self.alpha_opt.state_dict(),
-        }, self.brain_path)
-        shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
+
+        if save_brain:
+            torch.save({
+                'steps': self.steps,
+                'actor': self.actor.state_dict(),
+                'critic': self.critic.state_dict(),
+                'critic_target': self.critic_target.state_dict(),
+                'log_alpha': self.log_alpha,
+                'actor_opt': self.actor_opt.state_dict(),
+                'critic_opt': self.critic_opt.state_dict(),
+                'alpha_opt': self.alpha_opt.state_dict(),
+            }, self.brain_path)
+            shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
         print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
@@ -880,6 +884,7 @@ class RLSimulation:
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
+                self.frames = state['frames']
                 self.pos = state['pos']
                 self.energy = state['energy']
                 self.alive = state['alive']
@@ -891,13 +896,13 @@ class RLSimulation:
                 self.killed = state['killed']
                 self.collided = state['collided']
                 self.starved = state['starved']
-                print(f"--- [Loaded] Load completed ---")
+                print(f"--- [Loaded] Load completed, frames {self.frames:,} ---")
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
 
         if os.path.exists(self.brain_path):
             try:
-                brain_state = torch.load(self.brain_path, map_location=DEVICE)
+                brain_state = torch.load(self.brain_path, map_location=DEVICE, weights_only=False)
                 self.steps = brain_state['steps']
                 self.actor.load_state_dict(brain_state['actor'])
                 self.critic.load_state_dict(brain_state['critic'])
@@ -913,7 +918,7 @@ class RLSimulation:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
     def draw(self, draw_label, draw_units, draw_perception, draw_alert, verbose):
-        self.screen.fill((20, 20, 25))
+        self.screen.fill((20, 20, 20))
 
         if draw_units:
             for shape in self.wall_v:
@@ -975,7 +980,7 @@ class RLSimulation:
                 # 繪製慣性方向
                 speed_abs = abs(speed)
                 if speed_abs > 0.1:
-                    v_line_length = speed_abs * 1.8
+                    v_line_length = speed_abs * 2.5
                     # 終點座標 = 當前位置 + 速度向量 * 縮放係數
                     vel_end_p = (
                         int(p[0] + vel[0] * v_line_length), 
@@ -1002,7 +1007,7 @@ class RLSimulation:
                         line_width = 1
                         line_color = (255, 255, 0)
 
-                    line_length = 25 * power
+                    line_length = 20 * power
                     end_p = (
                         int(p[0] + np.cos(angle) * line_length),
                         int(p[1] + np.sin(angle) * line_length)
@@ -1016,7 +1021,6 @@ class RLSimulation:
                 if draw_alert:
                     pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
                     pygame.draw.circle(self.screen, color, pos_tuple, WALL_SENSE_RADIUS, 1)
-                    pygame.draw.circle(self.screen, color, pos_tuple, TEAM_RADIUS, 1)
 
                 if verbose >= 2:
                     for start, end in self.wall_lines:
@@ -1089,13 +1093,13 @@ class RLSimulation:
 
     def run(self, args):
         running = True
-        training = True
+        training = False if args.no_train else True
         is_paused = False
         draw_label = True
-        draw_units = True
+        draw_units = False
         draw_alert = False
         draw_perception = False
-        move_food = False if LEVEL == 0 else True
+        move_food = True
         move_predator = True
         verbose = 0
         video_thread = None
@@ -1135,10 +1139,10 @@ class RLSimulation:
                         self.fps -= 5
                         self.update_caption()
                     elif event.key == pygame.K_EQUALS:
-                        self.fps = 240
+                        self.fps = 300
                         self.update_caption()
                     elif event.key == pygame.K_MINUS:
-                        self.fps = 5
+                        self.fps = 60
                         self.update_caption()
                     elif event.key == pygame.K_z:
                         self.reset_env()
@@ -1170,13 +1174,13 @@ class RLSimulation:
 
             if not is_paused:
                 self.update(move_food, move_predator)
-                if training and self.steps % 2 == 0:
+                if training:
                     self.optimize_model()
 
                 if self.steps >= args.steps:
                     running = False
-                elif self.steps % 5000 == 0:
-                    self.save_state()
+                elif self.frames % 5000 == 0:
+                    self.save_state(training)
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
@@ -1189,7 +1193,7 @@ class RLSimulation:
             frame_queue.put(None)
             video_thread.join()
 
-        self.save_state()
+        self.save_state(training)
         pygame.quit()
 
     def record_proc(self, frame_queue, filename, width, height, fps):
@@ -1225,6 +1229,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
+    parser.add_argument("--no_train", action="store_true", default=False, help="停止訓練")
     args = parser.parse_args()
     
     sim = RLSimulation()
