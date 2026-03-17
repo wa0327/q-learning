@@ -26,6 +26,7 @@ SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 POP_SIZE = 16
 POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
+POP_MAX_STEER = math.radians(35) # 最大轉向角度
 FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
 PREDATOR_SIZE = 8
@@ -37,26 +38,24 @@ FOOD_ENERGY = 50.0      # 食物補充能量
 EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
 PERCEPTION_RADIUS = 200 # 視野感知半徑
-ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS + POP_MAX_SPEED * 6 # 警戒敵人半徑，給至少6幀的時間反應
-WALL_SENSE_RADIUS = POP_RADIUS + POP_MAX_SPEED * 3 # 牆壁感知半徑，給至少3幀的時間反應
+ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS # 警戒敵人半徑
+WALL_SENSE_RADIUS = POP_RADIUS # 牆壁感知半徑
 TEAM_RADIUS = 30        # 友方過近半徑
 DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
 BACKWARD_FACTOR = 0.33
-RND_POS_PADDING = 10    # 隨機取位邊距
+RND_POS_PADDING = 50.0  # 隨機取位邊距
 
 # 獎懲設定
-FOOD_REWARD = 15.0     # 吃到食物
-KILLED_REWARD = -15.0  # 被殺
-COLLIDED_REWARD = -12.5 # 撞死
-STARVED_REWARD = -10.0  # 餓死
-MOVE_REWARD_FACTOR = 0.5 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
+FOOD_REWARD = 15.0    # 吃到食物
+KILLED_REWARD = -25   # 被殺
+COLLIDED_REWARD = -20 # 撞死
+STARVED_REWARD = -25  # 餓死
+MOVE_REWARD_FACTOR = 0.25 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0.5 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
-WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.5     # 近牆最大懲罰(實際按距離比例遞減)
-PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.5   # 近敵最大懲罰(實際按距離比例遞減)
-FOOD_NEARBY_REWARD = FOOD_REWARD * 0.05        # 近食最大獎勵(實際按距離比例遞減)
-TEAM_NEARBY_REWARD = STEP_REWARD               # 近隊最大懲罰(實際按距離比例遞減)
+WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.5     # 近牆懲罰, 提早預警危險
+PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.5   # 近敵懲罰, 提早預警危險
 
 # 模型核心參數
 GAMMA = 0.99
@@ -70,7 +69,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.05
+MIN_ALPHA = 0.02
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -263,22 +262,50 @@ class RLSimulation:
         self.l_food = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 4, 1)
         self.l_team = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 4, 1)
         self.l_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 4, 1)
-        # 四邊牆的固定角度
-        self.wall_angles = torch.tensor([math.pi, 0.0, -math.pi * 0.5, math.pi * 0.5], device=DEVICE).view(1, 4)
 
         # 定義牆面
-        ov = torch.tensor([
+        w1 = torch.tensor([
             [0.0, 0.0], [SCREEN_W-1, 0.0], [SCREEN_W-1, SCREEN_H-1], [0.0, SCREEN_H-1]
         ], device=DEVICE)
-        tv = torch.tensor([
-            [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
+        w2 = torch.tensor([
+            [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4]
         ], device=DEVICE)
-        self.wall_A = torch.cat([ov, tv], dim=0)
-        self.wall_B = torch.cat([
-            torch.roll(ov, -1, 0), 
-            torch.roll(tv, -1, 0)
+        w3 = torch.tensor([
+            [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
+        ], device=DEVICE)
+        w4 = torch.tensor([
+            [SCREEN_W/2, SCREEN_H*3/8], [SCREEN_W/2, SCREEN_H*5/8]
+        ], device=DEVICE)
+        w5 = torch.tensor([
+            [SCREEN_W*1/8, SCREEN_H*1/8], [SCREEN_W*1/8, SCREEN_H*7/8]
+        ], device=DEVICE)
+        w6 = torch.tensor([
+            [SCREEN_W*7/8, SCREEN_H*1/8], [SCREEN_W*7/8, SCREEN_H*7/8]
+        ], device=DEVICE)
+        self.wall_A = torch.cat([
+            w1,
+            # w2,
+            # w3,
+            # w4,
+            # w5,
+            # w6
         ], dim=0)
-        self.wall_v = [ov.cpu().numpy().tolist(), tv.cpu().numpy().tolist()]
+        self.wall_B = torch.cat([
+            torch.roll(w1, -1, 0),
+            # torch.roll(w2, -1, 0),
+            # torch.roll(w3, -1, 0),
+            # torch.roll(w4, -1, 0),
+            # torch.roll(w5, -1, 0),
+            # torch.roll(w6, -1, 0)
+        ], dim=0)
+        self.wall_v = [
+            w1.cpu().numpy().tolist(),
+            # w2.cpu().numpy().tolist(),
+            # w3.cpu().numpy().tolist(),
+            # w4.cpu().numpy().tolist(),
+            # w5.cpu().numpy().tolist(),
+            # w6.cpu().numpy().tolist()
+        ]
 
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
@@ -288,6 +315,7 @@ class RLSimulation:
         self.killed = 0
         self.collided = 0
         self.starved = 0
+        self.eaten = 0
         self.last_actions = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)
@@ -516,11 +544,11 @@ class RLSimulation:
 
             # 映射至 -0.15 到 0.15 弧度，舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
             # 1. 基礎舵效：隨速度上升 (0 -> 2.0 速度區間)
-            sensitivity = torch.clamp(speed_val / 2.0, min=0.0, max=1.0)
+            sensitivity = torch.clamp(speed_val / 0.1, min=0.0, max=1.0).pow(2.0)
             # 2. 高速衰減：速度過高時，強行降低角速度以增大轉向半徑 (2.0 -> 4.0 速度區間)
-            # 當速度從 2.0 升到 4.0，衰減係數從 1.0 降到 0.6
-            high_speed_damping = torch.clamp(1.5 - (speed_val / POP_MAX_SPEED), min=0.6, max=1.0)
-            steer = steer_val * 0.15 * sensitivity * high_speed_damping
+            # 當速度從 3.0 升到 4.0，衰減係數從 1.0 降到 0.6
+            high_speed_damping = torch.clamp(1.75 - (speed_val / POP_MAX_SPEED), min=0.6, max=1.0)
+            steer = steer_val * POP_MAX_STEER * sensitivity * high_speed_damping
             self.angle[i] += steer
 
             # 換算為油門值
@@ -600,8 +628,7 @@ class RLSimulation:
                 self.food_pos, self.food_vel = self.update_entities(
                     self.food_pos, self.food_vel, FOOD_RADIUS, min_speed=0.5, max_speed=1.0
                 )
-            # 食物邏輯
-            # --- 食物碰撞 ---
+            # 食物碰撞
             dist_food = torch.cdist(self.pos, self.food_pos)
             hits_food = (dist_food < POP_RADIUS + FOOD_RADIUS) & self.alive.unsqueeze(1)
             if hits_food.any():
@@ -620,12 +647,8 @@ class RLSimulation:
                 
                 # 更新食物座標
                 self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
+                self.eaten += len(f_idx)
 
-            # --- 食物吸引 ---
-            dist_food = torch.cdist(self.pos, self.food_pos)
-            food_mask = (dist_food - POP_RADIUS - FOOD_RADIUS < PERCEPTION_RADIUS).any(dim=1) & self.alive
-            rewards[food_mask] += FOOD_NEARBY_REWARD
-            
         # 能量耗盡
         starved = (self.energy <= 0) & self.alive
         rewards[starved] += STARVED_REWARD
@@ -643,12 +666,6 @@ class RLSimulation:
             self.wall_lines = list(zip(starts, ends))
         else:
             self.wall_lines = []
-
-        # 隊友排斥
-        if POP_SIZE > 1:
-            dist_team = torch.cdist(self.pos, self.pos).fill_diagonal_(999.0) # 排除自己與自己的距離
-            team_mask = (dist_team - POP_RADIUS * 2 < TEAM_RADIUS).any(dim=1) & self.alive
-            rewards[team_mask] += TEAM_NEARBY_REWARD
 
         dead_mask = killed | collided | starved
 
@@ -783,7 +800,7 @@ class RLSimulation:
     
     def respawn_food(self, f_idx, a_idx):
         num_to_respawn = len(f_idx)
-        pad = 10.0  # 避免生在牆縫裡，Agent 很難吃到
+        pad = RND_POS_PADDING  # 避免生在牆縫裡，Agent 很難吃到
         
         # 1. 為每個需要重生的食物生成一組候選點 (假設每個食物給 10 個候選)
         num_samples = 10
@@ -829,6 +846,7 @@ class RLSimulation:
             'food_pos': self.food_pos,
             'pred_pos': self.pred_pos,
             'rewards_avg': self.rewards_avg,
+            'eaten': self.eaten,
             'killed': self.killed,
             'collided': self.collided,
             'starved': self.starved
@@ -846,7 +864,7 @@ class RLSimulation:
         shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         info = self.last_info
-        print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Killed:{self.killed} Collided:{self.collided} Starved:{self.starved}")
+        print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
@@ -859,6 +877,7 @@ class RLSimulation:
                 self.food_pos = state['food_pos']
                 self.pred_pos = state['pred_pos']
                 self.rewards_avg = state['rewards_avg']
+                self.eaten = state['eaten']
                 self.killed = state['killed']
                 self.collided = state['collided']
                 self.starved = state['starved']
@@ -1047,6 +1066,7 @@ class RLSimulation:
                 ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
                 ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
                 ("Rewards:", f"{self.rewards_avg:.2f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
+                ("Eaten:", f"{self.eaten:,}", THEME["success"], False),
                 ("Killed:", f"{self.killed:,}", THEME["loss"], False),
                 ("Collided:", f"{self.collided:,}", THEME["loss"], False),
                 ("Starved:", f"{self.starved:,}", THEME["loss"], False),
