@@ -17,7 +17,7 @@ import argparse
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
-# --- 參數設定 ---
+# 參數設定
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SCREEN_W, SCREEN_H = 1280, 720
 BASE_PATH = f"weights/{script_name}"
