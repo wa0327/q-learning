@@ -70,7 +70,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.2
+MIN_ALPHA = 0.05
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
