@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import math
 import shutil
-import cv2
+import ffmpeg
 from pathlib import Path
 import threading
 import queue
@@ -25,6 +25,7 @@ SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
 LEVEL = 0
+WALL_SIZE = 0
 POP_SIZE = 50 if LEVEL == 0 else 16
 POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
@@ -40,8 +41,8 @@ FOOD_ENERGY = 50.0      # 食物補充能量
 EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
 PERCEPTION_RADIUS = 200 # 視野感知半徑
-ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS # 警戒敵人半徑
-WALL_SENSE_RADIUS = POP_RADIUS # 牆壁感知半徑
+ALERT_RADIUS = POP_RADIUS + PREDATOR_RADIUS + 6 # 警戒敵人半徑
+WALL_SENSE_RADIUS = POP_RADIUS + 6 # 牆壁感知半徑
 TEAM_RADIUS = 30        # 友方過近半徑
 DAMPING_FACTOR = 0.85   # 阻力系數，越高越划
 BACKWARD_FACTOR = 0.33
@@ -266,48 +267,51 @@ class RLSimulation:
         self.l_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 4, 1)
 
         # 定義牆面
-        w1 = torch.tensor([
+        self.wall_v = []
+        wall_A, wall_B = [], []
+        self.add_wall_group(wall_A, wall_B, [
             [0.0, 0.0], [SCREEN_W-1, 0.0], [SCREEN_W-1, SCREEN_H-1], [0.0, SCREEN_H-1]
-        ], device=DEVICE)
-        w2 = torch.tensor([
-            [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4]
-        ], device=DEVICE)
-        w3 = torch.tensor([
-            [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
-        ], device=DEVICE)
-        w4 = torch.tensor([
-            [SCREEN_W/2, SCREEN_H*3/8], [SCREEN_W/2, SCREEN_H*5/8]
-        ], device=DEVICE)
-        w5 = torch.tensor([
-            [SCREEN_W*1/8, SCREEN_H*1/8], [SCREEN_W*1/8, SCREEN_H*7/8]
-        ], device=DEVICE)
-        w6 = torch.tensor([
-            [SCREEN_W*7/8, SCREEN_H*1/8], [SCREEN_W*7/8, SCREEN_H*7/8]
-        ], device=DEVICE)
-        self.wall_A = torch.cat([
-            w1,
-            # w2,
-            # w3,
-            # w4,
-            # w5,
-            # w6
-        ], dim=0)
-        self.wall_B = torch.cat([
-            torch.roll(w1, -1, 0),
-            # torch.roll(w2, -1, 0),
-            # torch.roll(w3, -1, 0),
-            # torch.roll(w4, -1, 0),
-            # torch.roll(w5, -1, 0),
-            # torch.roll(w6, -1, 0)
-        ], dim=0)
-        self.wall_v = [
-            w1.cpu().numpy().tolist(),
-            # w2.cpu().numpy().tolist(),
-            # w3.cpu().numpy().tolist(),
-            # w4.cpu().numpy().tolist(),
-            # w5.cpu().numpy().tolist(),
-            # w6.cpu().numpy().tolist()
-        ]
+        ], True)
+        if WALL_SIZE > 0:
+            self.add_wall_group(wall_A, wall_B, [
+                [SCREEN_W/4, SCREEN_H/4], [SCREEN_W*3/4, SCREEN_H/4]
+            ], False)
+        if WALL_SIZE > 1:
+            self.add_wall_group(wall_A, wall_B, [
+                [SCREEN_W*3/4, SCREEN_H*3/4], [SCREEN_W/4, SCREEN_H*3/4]
+            ], False)
+        if WALL_SIZE > 2:
+            self.add_wall_group(wall_A, wall_B, [
+                [SCREEN_W/2, SCREEN_H*3/8], [SCREEN_W/2, SCREEN_H*5/8]
+            ], False)
+        if WALL_SIZE > 3:
+            self.add_wall_group(wall_A, wall_B, [
+                [SCREEN_W*1/8, SCREEN_H*1/8], [SCREEN_W*1/8, SCREEN_H*7/8]
+            ], False)
+        if WALL_SIZE > 4:
+            self.add_wall_group(wall_A, wall_B, [
+                [SCREEN_W*7/8, SCREEN_H*1/8], [SCREEN_W*7/8, SCREEN_H*7/8]
+            ], False)
+        self.wall_A = torch.cat(wall_B, dim=0)
+        self.wall_B = torch.cat(wall_A, dim=0)
+
+    def add_wall_group(self, wall_A, wall_B, points, closed):
+        """
+        points: list of [x, y] or torch.Tensor
+        closed: True 則連成迴圈 (1->2->3->4->1), False 則連成線段 (1->2->3->4)
+        """
+        self.wall_v.append(points)
+        points = torch.tensor(points, dtype=torch.float32, device=DEVICE)
+        
+        if closed:
+            # 閉合路徑：每個點都作為起點，終點是下一個點 (含最後一個點連回第一個)
+            wall_A.append(points)
+            wall_B.append(torch.roll(points, -1, 0))
+        else:
+            # 開放路徑：N 個點產生 N-1 條線段
+            # 起點為第 0 到 N-2 個點，終點為第 1 到 N-1 個點
+            wall_A.append(points[:-1])
+            wall_B.append(points[1:])
 
     def update_caption(self):
         pygame.display.set_caption(f"{CAPTION} | FPS:{self.fps}")
@@ -710,7 +714,7 @@ class RLSimulation:
     def kill(self, killed):
         self.alive[killed] = False
         self.vel[killed] = 0.0 # 死掉後速度歸零
-        self.respawn_timer[killed] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
+        self.respawn_timer[killed] = 1 if LEVEL == 0 or POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
 
     def get_saftest_pos(self, n):
         """
@@ -1097,6 +1101,24 @@ class RLSimulation:
         video_thread = None
         frame_queue = None
 
+        def start_record():
+            nonlocal video_thread, frame_queue
+            frame_queue = queue.Queue()
+            filename = f"{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4"
+            video_thread = threading.Thread(
+                target=self.record_proc,
+                args=(frame_queue, filename, SCREEN_W, SCREEN_H, 60)
+            )
+            video_thread.start()
+            print(f"開始錄影...")
+        def stop_record():
+            nonlocal video_thread, frame_queue
+            frame_queue.put(None)
+            video_thread = None
+
+        if args.record:
+            start_record()
+
         self.last_states = self.get_states()
         self.fps_avg = self.clock.get_fps()
         while running:
@@ -1142,17 +1164,9 @@ class RLSimulation:
                         verbose = (verbose + 1) % 3
                     elif event.key == pygame.K_r:
                         if video_thread and video_thread.is_alive():
-                            frame_queue.put(None)
-                            video_thread = None
+                            stop_record()
                         else:
-                            frame_queue = queue.Queue()
-                            filename = f"{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4"
-                            video_thread = threading.Thread(
-                                target=self.record_proc,
-                                args=(frame_queue, filename, SCREEN_W, SCREEN_H, 60)
-                            )
-                            video_thread.start()
-                            print(f"開始錄影...")
+                            start_record()
 
             if not is_paused:
                 self.update(move_food, move_predator)
@@ -1179,8 +1193,19 @@ class RLSimulation:
         pygame.quit()
 
     def record_proc(self, frame_queue, filename, width, height, fps):
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(filename, fourcc, fps, (width, height))
+        process = (
+            ffmpeg
+            .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}', r=fps)
+            .output(filename,
+                    hide_banner=None,
+                    loglevel='error',
+                    vcodec='h264_nvenc', # 強制指定 NVIDIA H.264 編碼器
+                    pix_fmt='yuv420p',   # 為了影片相容性，轉為 YUV420
+                    preset='fast',       # 速度設定：slow, medium, fast, hp, hq
+                    bitrate='5M')        # 設定位元率
+            .overwrite_output()
+            .run_async(pipe_stdin=True)
+        )
         
         while True:
             item = frame_queue.get()
@@ -1189,16 +1214,17 @@ class RLSimulation:
                 
             view = pygame.surfarray.array3d(item)
             view = view.transpose([1, 0, 2])
-            view = cv2.cvtColor(view, cv2.COLOR_RGB2BGR)
-            video_writer.write(view)
+            process.stdin.write(view.tobytes())
             frame_queue.task_done()
 
-        video_writer.release()
+        process.stdin.close()
+        process.wait()
         print(f"錄影已關閉，檔案：{filename}")
-        
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
+    parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
     args = parser.parse_args()
     
     sim = RLSimulation()
