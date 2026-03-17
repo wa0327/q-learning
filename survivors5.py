@@ -23,7 +23,7 @@ BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
-POP_SIZE = 50
+POP_SIZE = 16
 POP_RADIUS = 4          # 生存者體積半徑
 POP_MAX_SPEED = 4
 FOOD_SIZE = POP_SIZE * 2
