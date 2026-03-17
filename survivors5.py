@@ -533,65 +533,66 @@ class RLSimulation:
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
         # 物理運算 (載具動力學)
-        for i in range(POP_SIZE):
-            if not self.alive[i]:
-                continue
-            
-            speed_val = torch.norm(self.vel[i])
-            steer_val = actions[i][0]       # [-1, 1] 舵向控制值 [左, 右]
-            throttle_val = actions[i][1]    # [-1, 1] 油門控制值 [退, 進]
+        # 0. 取得存活者
+        alive_mask = self.alive.float().unsqueeze(1) 
+        alive_mask_flat = self.alive.float()
 
-            # 映射至 -0.15 到 0.15 弧度，舵效：速度越快轉向越明顯，但極速時轉向半徑應變大
-            # 1. 基礎舵效：隨速度上升 (0 -> 2.0 速度區間)
-            sensitivity = torch.clamp(speed_val / 0.1, min=0.0, max=1.0).pow(2.0)
-            # 2. 高速衰減：速度過高時，強行降低角速度以增大轉向半徑 (2.0 -> 4.0 速度區間)
-            # 當速度從 3.0 升到 4.0，衰減係數從 1.0 降到 0.6
-            high_speed_damping = torch.clamp(1.75 - (speed_val / POP_MAX_SPEED), min=0.6, max=1.0)
-            steer = steer_val * POP_MAX_STEER * sensitivity * high_speed_damping
-            self.angle[i] += steer
+        # 1. 取得控制值
+        steer_vals = actions[:, 0]      # [-1, 1] 舵向控制值 [左, 右]
+        throttle_vals = actions[:, 1]   # [-1, 1] 油門控制值 [退, 進]
 
-            # 換算為油門值
-            throttle = throttle_val * (self.throttle_factor if throttle_val > 0 else self.throttle_factor * BACKWARD_FACTOR)
-            # 向量動力學：計算當前車頭朝向單位向量
-            forward_vec = torch.tensor([torch.cos(self.angle[i]), torch.sin(self.angle[i])], device=DEVICE)
-            # 推力 = 向量 X 油門
-            thrust = forward_vec * throttle
-            self.vel[i] = self.vel[i] * DAMPING_FACTOR + thrust
-            
-            # 更新位置
-            self.pos[i] += self.vel[i]
+        # 2. 速度與舵效計算
+        speed_vals = torch.norm(self.vel, dim=1)
+        
+        # 基礎舵效：(0 -> 2.0 速度區間)
+        sensitivity = torch.clamp(speed_vals / 0.1, min=0.0, max=1.0).pow(2.0)
+        # 高速衰減：(2.0 -> 4.0 速度區間)
+        high_speed_damping = torch.clamp(1.75 - (speed_vals / POP_MAX_SPEED), min=0.6, max=1.0)
+        
+        # 計算轉角增量並更新
+        steer_delta = steer_vals * POP_MAX_STEER * sensitivity * high_speed_damping
+        self.angle += steer_delta * alive_mask_flat
 
-            # 能量消耗
-            static_cost = 0.2 * ENERGY_DECAY                                          # 基礎消耗 (0.02)
-            dynamic_cost = 0.8 * ENERGY_DECAY * torch.pow(torch.abs(throttle_val), 2) # 動態消耗 (最大 0.08)
-            self.energy[i] -= static_cost + dynamic_cost
+        # 3. 換算油門與推力
+        throttle_factors = torch.where(throttle_vals > 0, self.throttle_factor, self.throttle_factor * BACKWARD_FACTOR)
+        throttles = (throttle_vals * throttle_factors).unsqueeze(1)
 
-            # --- 移動獎勵
-            # 1. 計算「有效前進速度」：將實際速度向量投影到車頭方向
-            forward_speed = self.forward_speed[i] = torch.dot(self.vel[i], forward_vec)
+        # 計算車頭向量
+        pop_vecs = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1)
+        
+        # 推力 = 向量 * 油門
+        thrust = pop_vecs * throttles
 
-            # 2. 基礎移動獎勵
-            move_reward = forward_speed * MOVE_REWARD
+        # 4. 更新物理狀態
+        # 速度更新：V = V * Damping + Thrust
+        self.vel = (self.vel * DAMPING_FACTOR + thrust) * alive_mask
+        # 位置更新：P = P + V
+        self.pos += self.vel * alive_mask
 
-            # 3. 轉向懲罰
-            steer_penalty = 0.0 #MOVE_REWARD * 0.2 * torch.pow(steer_val, 2) * (speed_val / POP_MAX_SPEED)
+        # 5. 能量消耗
+        static_cost = 0.2 * ENERGY_DECAY
+        dynamic_cost = 0.8 * ENERGY_DECAY * torch.pow(throttle_vals, 2)
+        self.energy -= (static_cost + dynamic_cost) * alive_mask_flat
 
-            # 3. 低效懲罰
-            # 如果有效前進速度太低，就給予負分，逼它動起來
-            lazy_penalty = 0.0 #MOVE_REWARD * 0.5 * torch.clamp(0.4 - forward_speed, min=0.0)
+        # --- 移動獎勵計算 ---
+        # 1. 有效前進速度 (Dot product)
+        self.forward_speed = torch.sum(self.vel * pop_vecs, dim=1)
+        
+        # 2. 基礎移動獎勵
+        move_reward = self.forward_speed * MOVE_REWARD
 
-            # 4. 控制油門效率
-            throttle_penalty = 0.0
-            throttle_threshold = 0.75 # 性能最佳的油門
-            diff = torch.abs(torch.abs(throttle_val) - throttle_threshold)
-            throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 3.0) - 1.0)
+        # 4. 控制油門效率懲罰
+        throttle_threshold = 0.75
+        diff = torch.abs(torch.abs(throttle_vals) - throttle_threshold)
+        throttle_penalty = MOVE_REWARD * 0.5 * (torch.exp(diff * 3.0) - 1.0)
 
-            # 5. 動作變動量懲罰
-            action_diff = actions[i] - self.last_actions[i]
-            smooth_penalty = MOVE_REWARD * 0.5 * torch.sum(action_diff.pow(2)) 
+        # 5. 動作變動量懲罰 (動作平滑度)
+        action_diff = actions - self.last_actions
+        smooth_penalty = MOVE_REWARD * 0.5 * torch.sum(action_diff.pow(2), dim=1)
 
-            # 6. 最終移動獎勵整合
-            rewards[i] += move_reward - steer_penalty - lazy_penalty - throttle_penalty - smooth_penalty
+        # 6. 整合獎勵 (僅針對活著的個體加分)
+        total_step_reward = move_reward - throttle_penalty - smooth_penalty
+        rewards += total_step_reward * alive_mask_flat
 
         # 掠食者 (Predators)
         if PREDATOR_SIZE > 0:
