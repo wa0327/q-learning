@@ -1,3 +1,4 @@
+# 2026-3-18
 [2026-03-18 15:32:05][Info] Steps:5,000 Alpha:0.2274 Entropy:1.1720 Q-Val:-0.8945 C-Loss:3.4685 A-Loss:0.7215 Rewards:-0.4080 Eaten:37 Killed:47 Collided:66 Starved:5
 [2026-03-18 15:33:07][Info] Steps:10,000 Alpha:0.0585 Entropy:-0.0171 Q-Val:-2.0820 C-Loss:2.1050 A-Loss:1.8082 Rewards:-0.0852 Eaten:74 Killed:72 Collided:70 Starved:41
 [2026-03-18 15:34:13][Info] Steps:15,000 Alpha:0.0157 Entropy:-1.2388 Q-Val:-0.0359 C-Loss:0.3998 A-Loss:-0.0095 Rewards:-0.0675 Eaten:106 Killed:75 Collided:73 Starved:76
@@ -67,4 +68,75 @@
 [2026-03-18 20:03:28][Info] FPS:115.11 Steps:95,000 Alpha:0.0380 Entropy:-2.0125 Q-Val:6.4317 C-Loss:5.7134 A-Loss:-6.6184 Rewards:0.2076 Eaten:13,385 Killed:70 Collided:59 Starved:266
 [2026-03-18 20:04:13][Info] FPS:99.94 Steps:100,000 Alpha:0.0396 Entropy:-2.3464 Q-Val:7.8455 C-Loss:1.9620 A-Loss:-7.7125 Rewards:0.2702 Eaten:14,649 Killed:75 Collided:60 Starved:267
 
-如果在不影響模型表現的前提下，要對這套模型剪枝，應該怎麼做？
+# 減枝內容
+MAX_OBJ 減至 60
+[2026-03-18 20:13:04][Info] FPS:118.26 Steps:5,000 Alpha:0.2279 Entropy:1.0044 Q-Val:4.5491 C-Loss:4.0233 A-Loss:-4.7741 Rewards:-0.2524 Eaten:25 Killed:40 Collided:79 Starved:6
+[2026-03-18 20:13:46][Info] FPS:120.16 Steps:10,000 Alpha:0.0547 Entropy:0.2514 Q-Val:2.5716 C-Loss:3.0513 A-Loss:-2.5084 Rewards:-0.1991 Eaten:48 Killed:88 Collided:126 Starved:18
+[2026-03-18 20:14:28][Info] FPS:114.93 Steps:15,000 Alpha:0.0156 Entropy:-1.1224 Q-Val:-0.7332 C-Loss:1.4928 A-Loss:0.6513 Rewards:-0.1352 Eaten:87 Killed:145 Collided:133 Starved:31
+[2026-03-18 20:15:11][Info] FPS:118.86 Steps:20,000 Alpha:0.0048 Entropy:-2.1028 Q-Val:-1.7926 C-Loss:6.8021 A-Loss:1.7552 Rewards:-0.0826 Eaten:125 Killed:203 Collided:141 Starved:43
+[2026-03-18 20:15:53][Info] FPS:116.61 Steps:25,000 Alpha:0.0051 Entropy:-1.7266 Q-Val:-3.2721 C-Loss:1.1930 A-Loss:3.1222 Rewards:-0.1308 Eaten:175 Killed:270 Collided:158 Starved:62
+[2026-03-18 20:16:36][Info] FPS:122.00 Steps:30,000 Alpha:0.0059 Entropy:-2.0846 Q-Val:-6.2515 C-Loss:3.1651 A-Loss:6.1391 Rewards:-0.2244 Eaten:236 Killed:316 Collided:187 Starved:81
+[2026-03-18 20:17:21][Info] FPS:118.87 Steps:35,000 Alpha:0.0115 Entropy:-2.2220 Q-Val:-10.1540 C-Loss:7.0963 A-Loss:10.0410 Rewards:-0.2140 Eaten:297 Killed:371 Collided:217 Starved:100
+[2026-03-18 20:18:03][Info] FPS:119.06 Steps:40,000 Alpha:0.0161 Entropy:-2.1421 Q-Val:-13.6803 C-Loss:5.3570 A-Loss:13.6369 Rewards:-0.0797 Eaten:333 Killed:421 Collided:238 Starved:124
+[2026-03-18 20:18:45][Info] FPS:114.52 Steps:45,000 Alpha:0.0132 Entropy:-2.2618 Q-Val:-13.5975 C-Loss:3.4279 A-Loss:13.4661 Rewards:-0.1982 Eaten:367 Killed:474 Collided:251 Starved:148
+[2026-03-18 20:19:27][Info] FPS:121.03 Steps:50,000 Alpha:0.0083 Entropy:-1.9862 Q-Val:-15.0565 C-Loss:4.8456 A-Loss:14.7330 Rewards:-0.1169 Eaten:394 Killed:540 Collided:265 Starved:161
+[2026-03-18 20:20:09][Info] FPS:120.87 Steps:55,000 Alpha:0.0106 Entropy:-1.9019 Q-Val:-12.6665 C-Loss:2.0027 A-Loss:12.5901 Rewards:-0.0939 Eaten:429 Killed:603 Collided:270 Starved:170
+[2026-03-18 20:20:51][Info] FPS:118.77 Steps:60,000 Alpha:0.0081 Entropy:-2.3017 Q-Val:-11.0188 C-Loss:1.2818 A-Loss:10.8974 Rewards:-0.0289 Eaten:482 Killed:664 Collided:271 Starved:187
+[2026-03-18 20:21:32][Info] FPS:121.93 Steps:65,000 Alpha:0.0069 Entropy:-2.7666 Q-Val:-9.6769 C-Loss:3.4187 A-Loss:9.4764 Rewards:-0.0504 Eaten:561 Killed:734 Collided:275 Starved:213
+[2026-03-18 20:22:14][Info] FPS:118.90 Steps:70,000 Alpha:0.0077 Entropy:-1.8454 Q-Val:-8.9636 C-Loss:1.0763 A-Loss:8.8884 Rewards:-0.0759 Eaten:681 Killed:799 Collided:285 Starved:221
+[2026-03-18 20:22:57][Info] FPS:118.49 Steps:75,000 Alpha:0.0136 Entropy:-1.7585 Q-Val:-5.7032 C-Loss:3.6789 A-Loss:5.7335 Rewards:-0.0182 Eaten:1,052 Killed:873 Collided:290 Starved:226
+[2026-03-18 20:23:39][Info] FPS:120.02 Steps:80,000 Alpha:0.0210 Entropy:-2.0452 Q-Val:-1.3486 C-Loss:10.8476 A-Loss:1.1883 Rewards:-0.0996 Eaten:1,385 Killed:938 Collided:294 Starved:232
+[2026-03-18 20:24:21][Info] FPS:117.91 Steps:85,000 Alpha:0.0151 Entropy:-1.7907 Q-Val:1.3942 C-Loss:1.1535 A-Loss:-1.4251 Rewards:-0.0577 Eaten:1,832 Killed:1,006 Collided:294 Starved:233
+[2026-03-18 20:25:04][Info] FPS:117.39 Steps:90,000 Alpha:0.0139 Entropy:-2.0486 Q-Val:0.3874 C-Loss:11.2833 A-Loss:-0.4160 Rewards:0.0189 Eaten:2,353 Killed:1,063 Collided:295 Starved:238
+[2026-03-18 20:25:49][Info] FPS:113.52 Steps:95,000 Alpha:0.0171 Entropy:-1.8781 Q-Val:1.0581 C-Loss:2.6070 A-Loss:-1.1779 Rewards:-0.0053 Eaten:3,013 Killed:1,121 Collided:300 Starved:240
+[2026-03-18 20:26:36][Info] FPS:102.75 Steps:100,000 Alpha:0.0209 Entropy:-1.8260 Q-Val:2.7406 C-Loss:2.9126 A-Loss:-2.8099 Rewards:0.0552 Eaten:3,843 Killed:1,174 Collided:301 Starved:243
+
+# 減枝內容
+HIDDEN_FEAT_DIM = 32
+HIDDEN_FC_DIM = 128
+[2026-03-18 20:30:09][Info] FPS:123.15 Steps:5,000 Alpha:0.2277 Entropy:0.8670 Q-Val:6.6517 C-Loss:2.3635 A-Loss:-7.0783 Rewards:-0.1304 Eaten:18 Killed:51 Collided:65 Starved:6
+[2026-03-18 20:30:50][Info] FPS:121.66 Steps:10,000 Alpha:0.0537 Entropy:0.6288 Q-Val:2.6905 C-Loss:5.1772 A-Loss:-2.7061 Rewards:-0.1617 Eaten:50 Killed:106 Collided:89 Starved:19
+[2026-03-18 20:31:30][Info] FPS:123.24 Steps:15,000 Alpha:0.0141 Entropy:-1.1636 Q-Val:-3.3951 C-Loss:7.7491 A-Loss:3.2540 Rewards:-0.2213 Eaten:75 Killed:157 Collided:154 Starved:35
+[2026-03-18 20:32:11][Info] FPS:123.19 Steps:20,000 Alpha:0.0095 Entropy:-1.7153 Q-Val:-8.3879 C-Loss:3.8543 A-Loss:8.1948 Rewards:-0.2323 Eaten:107 Killed:196 Collided:206 Starved:53
+[2026-03-18 20:32:52][Info] FPS:117.12 Steps:25,000 Alpha:0.0064 Entropy:-1.7690 Q-Val:-10.5918 C-Loss:4.4644 A-Loss:10.5763 Rewards:-0.0760 Eaten:139 Killed:247 Collided:220 Starved:64
+[2026-03-18 20:33:33][Info] FPS:120.51 Steps:30,000 Alpha:0.0072 Entropy:-2.2029 Q-Val:-10.0027 C-Loss:4.2012 A-Loss:9.9989 Rewards:-0.1455 Eaten:172 Killed:304 Collided:236 Starved:79
+[2026-03-18 20:34:14][Info] FPS:121.86 Steps:35,000 Alpha:0.0046 Entropy:-1.7894 Q-Val:-11.0285 C-Loss:1.6511 A-Loss:10.9498 Rewards:-0.2053 Eaten:196 Killed:363 Collided:252 Starved:93
+[2026-03-18 20:34:55][Info] FPS:119.92 Steps:40,000 Alpha:0.0049 Entropy:-1.8450 Q-Val:-11.4573 C-Loss:2.9839 A-Loss:11.3087 Rewards:-0.1077 Eaten:225 Killed:414 Collided:266 Starved:104
+[2026-03-18 20:35:36][Info] FPS:125.14 Steps:45,000 Alpha:0.0049 Entropy:-2.0845 Q-Val:-12.3452 C-Loss:2.1997 A-Loss:12.3040 Rewards:-0.1724 Eaten:258 Killed:472 Collided:274 Starved:109
+[2026-03-18 20:36:17][Info] FPS:121.32 Steps:50,000 Alpha:0.0083 Entropy:-1.6562 Q-Val:-12.6959 C-Loss:2.0773 A-Loss:12.5611 Rewards:-0.1414 Eaten:275 Killed:509 Collided:282 Starved:133
+[2026-03-18 20:36:57][Info] FPS:122.83 Steps:55,000 Alpha:0.0043 Entropy:-2.6921 Q-Val:-12.7975 C-Loss:3.6100 A-Loss:12.6329 Rewards:-0.1233 Eaten:309 Killed:570 Collided:292 Starved:145
+[2026-03-18 20:37:38][Info] FPS:124.00 Steps:60,000 Alpha:0.0028 Entropy:-2.2702 Q-Val:-13.2073 C-Loss:2.9414 A-Loss:13.1897 Rewards:-0.2021 Eaten:343 Killed:619 Collided:315 Starved:167
+[2026-03-18 20:38:19][Info] FPS:121.73 Steps:65,000 Alpha:0.0054 Entropy:-1.6242 Q-Val:-13.1812 C-Loss:1.4143 A-Loss:13.1974 Rewards:-0.1472 Eaten:380 Killed:673 Collided:318 Starved:184
+[2026-03-18 20:38:59][Info] FPS:124.21 Steps:70,000 Alpha:0.0056 Entropy:-1.6635 Q-Val:-12.4940 C-Loss:1.7328 A-Loss:12.4718 Rewards:-0.2055 Eaten:407 Killed:716 Collided:336 Starved:211
+[2026-03-18 20:39:40][Info] FPS:123.75 Steps:75,000 Alpha:0.0057 Entropy:-2.6064 Q-Val:-13.5716 C-Loss:2.2839 A-Loss:13.5278 Rewards:-0.1901 Eaten:442 Killed:773 Collided:343 Starved:247
+[2026-03-18 20:40:21][Info] FPS:120.32 Steps:80,000 Alpha:0.0055 Entropy:-1.4655 Q-Val:-13.9843 C-Loss:0.7619 A-Loss:14.0521 Rewards:-0.1383 Eaten:477 Killed:822 Collided:358 Starved:282
+[2026-03-18 20:41:02][Info] FPS:119.40 Steps:85,000 Alpha:0.0036 Entropy:-1.7988 Q-Val:-13.8746 C-Loss:1.1491 A-Loss:13.7414 Rewards:-0.0917 Eaten:505 Killed:871 Collided:370 Starved:306
+[2026-03-18 20:41:43][Info] FPS:123.49 Steps:90,000 Alpha:0.0056 Entropy:-2.3816 Q-Val:-13.8986 C-Loss:1.1525 A-Loss:13.7372 Rewards:-0.0877 Eaten:533 Killed:922 Collided:375 Starved:330
+[2026-03-18 20:42:24][Info] FPS:120.79 Steps:95,000 Alpha:0.0029 Entropy:-1.9501 Q-Val:-14.1542 C-Loss:1.6823 A-Loss:14.1720 Rewards:-0.2903 Eaten:566 Killed:986 Collided:386 Starved:355
+[2026-03-18 20:43:05][Info] FPS:122.36 Steps:100,000 Alpha:0.0082 Entropy:-3.0681 Q-Val:-14.6441 C-Loss:2.0493 A-Loss:14.6396 Rewards:-0.1728 Eaten:588 Killed:1,046 Collided:404 Starved:370
+
+# 減枝內容
+HIDDEN_FEAT_DIM = 32
+[2026-03-18 20:50:18][Info] FPS:127.90 Steps:5,000 Alpha:0.2243 Entropy:1.2630 Q-Val:4.0312 C-Loss:1.7758 A-Loss:-4.4202 Rewards:-0.1024 Eaten:24 Killed:38 Collided:80 Starved:5
+[2026-03-18 20:50:59][Info] FPS:122.58 Steps:10,000 Alpha:0.0549 Entropy:0.4278 Q-Val:4.8528 C-Loss:17.6879 A-Loss:-5.3417 Rewards:-0.0730 Eaten:48 Killed:67 Collided:88 Starved:40
+[2026-03-18 20:51:40][Info] FPS:124.63 Steps:15,000 Alpha:0.0135 Entropy:-1.1628 Q-Val:3.3731 C-Loss:0.6063 A-Loss:-3.5193 Rewards:-0.0355 Eaten:65 Killed:68 Collided:92 Starved:88
+[2026-03-18 20:52:21][Info] FPS:122.04 Steps:20,000 Alpha:0.0064 Entropy:-1.7487 Q-Val:2.5946 C-Loss:0.1146 A-Loss:-2.5888 Rewards:-0.0136 Eaten:116 Killed:71 Collided:98 Starved:139
+[2026-03-18 20:53:02][Info] FPS:120.07 Steps:25,000 Alpha:0.0085 Entropy:-2.5193 Q-Val:1.0385 C-Loss:0.2721 A-Loss:-1.1572 Rewards:-0.0238 Eaten:209 Killed:71 Collided:104 Starved:191
+[2026-03-18 20:53:46][Info] FPS:121.37 Steps:30,000 Alpha:0.0138 Entropy:-1.5868 Q-Val:0.6744 C-Loss:3.6972 A-Loss:-0.7988 Rewards:0.0052 Eaten:355 Killed:71 Collided:105 Starved:226
+[2026-03-18 20:54:28][Info] FPS:122.07 Steps:35,000 Alpha:0.0153 Entropy:-1.8357 Q-Val:2.1561 C-Loss:1.3289 A-Loss:-2.3563 Rewards:-0.0067 Eaten:682 Killed:72 Collided:105 Starved:246
+[2026-03-18 20:55:12][Info] FPS:120.81 Steps:40,000 Alpha:0.0306 Entropy:-2.0072 Q-Val:7.5309 C-Loss:1.5697 A-Loss:-7.7867 Rewards:0.0651 Eaten:1,186 Killed:73 Collided:106 Starved:254
+[2026-03-18 20:55:58][Info] FPS:114.27 Steps:45,000 Alpha:0.0246 Entropy:-2.1511 Q-Val:9.3684 C-Loss:1.9914 A-Loss:-9.4059 Rewards:0.1045 Eaten:1,815 Killed:73 Collided:107 Starved:259
+[2026-03-18 20:56:42][Info] FPS:117.69 Steps:50,000 Alpha:0.0267 Entropy:-2.1108 Q-Val:9.1122 C-Loss:2.8669 A-Loss:-9.3606 Rewards:0.1434 Eaten:2,648 Killed:74 Collided:108 Starved:259
+[2026-03-18 20:57:28][Info] FPS:119.46 Steps:55,000 Alpha:0.0285 Entropy:-1.9566 Q-Val:8.5094 C-Loss:10.0829 A-Loss:-8.3961 Rewards:0.1397 Eaten:3,462 Killed:75 Collided:108 Starved:260
+[2026-03-18 20:58:13][Info] FPS:100.76 Steps:60,000 Alpha:0.0310 Entropy:-2.3688 Q-Val:6.5162 C-Loss:2.8971 A-Loss:-6.7072 Rewards:0.1417 Eaten:4,255 Killed:75 Collided:109 Starved:261
+[2026-03-18 20:58:57][Info] FPS:115.33 Steps:65,000 Alpha:0.0326 Entropy:-1.6491 Q-Val:5.1019 C-Loss:2.2287 A-Loss:-5.0693 Rewards:0.1833 Eaten:5,098 Killed:75 Collided:111 Starved:262
+[2026-03-18 20:59:44][Info] FPS:106.60 Steps:70,000 Alpha:0.0384 Entropy:-2.0785 Q-Val:4.1971 C-Loss:2.1651 A-Loss:-4.2216 Rewards:0.2060 Eaten:6,071 Killed:77 Collided:111 Starved:262
+[2026-03-18 21:00:28][Info] FPS:122.28 Steps:75,000 Alpha:0.0370 Entropy:-1.9564 Q-Val:4.0059 C-Loss:3.1435 A-Loss:-4.1178 Rewards:0.1051 Eaten:7,025 Killed:77 Collided:112 Starved:263
+[2026-03-18 21:01:10][Info] FPS:116.77 Steps:80,000 Alpha:0.0383 Entropy:-2.1348 Q-Val:2.9332 C-Loss:2.0996 A-Loss:-3.0191 Rewards:0.1948 Eaten:7,979 Killed:77 Collided:112 Starved:266
+[2026-03-18 21:01:53][Info] FPS:121.27 Steps:85,000 Alpha:0.0407 Entropy:-2.0285 Q-Val:3.7823 C-Loss:3.0193 A-Loss:-3.9493 Rewards:0.0655 Eaten:9,016 Killed:79 Collided:112 Starved:267
+[2026-03-18 21:02:37][Info] FPS:114.18 Steps:90,000 Alpha:0.0388 Entropy:-1.5993 Q-Val:0.1791 C-Loss:2.2323 A-Loss:-0.3191 Rewards:0.1794 Eaten:9,981 Killed:80 Collided:114 Starved:269
+[2026-03-18 21:03:20][Info] FPS:117.82 Steps:95,000 Alpha:0.0420 Entropy:-1.8694 Q-Val:0.6526 C-Loss:3.1281 A-Loss:-0.5744 Rewards:0.1134 Eaten:11,217 Killed:82 Collided:114 Starved:269
+[2026-03-18 21:04:04][Info] FPS:115.72 Steps:100,000 Alpha:0.0424 Entropy:-1.9867 Q-Val:2.0674 C-Loss:1.5703 A-Loss:-2.3261 Rewards:0.0832 Eaten:12,322 Killed:83 Collided:115 Starved:270
+
+# 2026-3-18 結論：
+Critic 共享的感官層的表現目前居冠。
