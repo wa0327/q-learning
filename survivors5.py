@@ -24,11 +24,9 @@ SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
 SCREEN_W, SCREEN_H = 1280, 720
-# 評估模型在此步數內應獲得最大獎勵
-EST_STEPS = 300
+EST_STEPS = 300 # 評估模型在此步數內應獲得最大獎勵
 # 這個 0.715 代表生存者需要在限制步數內，有能力跑完畫面 71.5% 的對角線距離
-POP_MAX_SPEED = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715
-WALL_SIZE = 0
+POP_MAX_SPEED = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / EST_STEPS # 在 1280x720 時約為 3.5，僅適合無任何障礙物環境。
 POP_SIZE = 16
 POP_RADIUS = 4                      # 生存者體積半徑
 POP_DAMPING_FACTOR = 0.85           # 阻力系數，越高越需要維持高油門
@@ -44,8 +42,9 @@ PREDATOR_SIZE = 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
-ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
+POP_ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
 RND_POS_PADDING = 50.0  # 隨機取位邊距
+WALL_SIZE = 0
 
 # 獎懲設定
 FOOD_REWARD = 15.0    # 吃到食物
@@ -614,7 +613,7 @@ class RLSimulation:
             rewards[killed] += KILLED_REWARD
             self.kill(killed)
             # 靠近告警
-            pred_mask = (dist_pred - POP_RADIUS - PREDATOR_RADIUS < ALERT_RADIUS).any(dim=1) & self.alive
+            pred_mask = (dist_pred - POP_RADIUS - PREDATOR_RADIUS < POP_ALERT_RADIUS).any(dim=1) & self.alive
             rewards[pred_mask] += PREDATOR_NEARBY_REWARD
         else:
             killed = torch.zeros(POP_SIZE, dtype=torch.bool, device=DEVICE)
@@ -667,7 +666,7 @@ class RLSimulation:
 
         # 近牆痛覺
         wall_min_dist, closest_wall_idx = torch.min(dist_to_walls, dim=1) # (N,)
-        wall_dist_ratio = (1.0 - (wall_min_dist - POP_RADIUS) / ALERT_RADIUS).clamp(0.0, 1.0)
+        wall_dist_ratio = (1.0 - (wall_min_dist - POP_RADIUS) / POP_ALERT_RADIUS).clamp(0.0, 1.0)
         wall_closest_points = wall_closest_points[torch.arange(self.pos.size(0), device=DEVICE), closest_wall_idx]
         wall_mask = (wall_dist_ratio > 0) & self.alive
         if wall_mask.any():
@@ -1016,7 +1015,7 @@ class RLSimulation:
                     pygame.draw.circle(self.screen, color, pos_tuple, POP_PERCEPTION_RADIUS, 1)
                 # 畫出警戒範圍
                 if draw_alert:
-                    pygame.draw.circle(self.screen, color, pos_tuple, ALERT_RADIUS, 1)
+                    pygame.draw.circle(self.screen, color, pos_tuple, POP_ALERT_RADIUS, 1)
 
                 if verbose >= 2:
                     for start, end in self.wall_lines:
@@ -1248,6 +1247,9 @@ if __name__ == "__main__":
     parser.add_argument("--frames", type=int, default=float('inf'), help="模型性能展示幀數")
     args = parser.parse_args()
     
-    print(f'預警半徑：{ALERT_RADIUS}')
+    print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
+    print(f'任務步數：{EST_STEPS}')
+    print(f'最大速度：{POP_MAX_SPEED}')
+    print(f'預警半徑：{POP_ALERT_RADIUS}')
     sim = RLSimulation()
     sim.run(args)
