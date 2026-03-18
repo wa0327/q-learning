@@ -27,7 +27,7 @@ SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 WALL_SIZE = 0
 POP_SIZE = 16
 POP_RADIUS = 4                      # 生存者體積半徑
-POP_MAX_SPEED = 3.0
+POP_MAX_SPEED = 3.5
 POP_DAMPING_FACTOR = 0.85           # 阻力系數，越高越需要維持高油門
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
@@ -42,7 +42,7 @@ PREDATOR_SIZE = 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
-ALERT_RADIUS = POP_MAX_SPEED * 2 # 危險警戒半徑
+ALERT_RADIUS = (POP_MAX_SPEED - PREDATOR_MAX_SPEED) * POP_MAX_SPEED * 3 # 危險警戒半徑
 RND_POS_PADDING = 50.0  # 隨機取位邊距
 
 # 獎懲設定
@@ -849,7 +849,6 @@ class RLSimulation:
         
     def save_state(self):
         torch.save({
-            'frames': self.frames,
             'pos': self.pos,
             'energy': self.energy,
             'alive': self.alive,
@@ -875,15 +874,12 @@ class RLSimulation:
         }, self.brain_path)
         shutil.copy2(self.brain_path, f"{BASE_PATH}/{script_name}_{self.actor.__class__.__name__}_{self.steps}.pt")
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        info = self.last_info
-        print(f"[{now}][Save] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+        self.print_info(True)
 
     def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE)
-                self.frames = state['frames']
                 self.pos = state['pos']
                 self.energy = state['energy']
                 self.alive = state['alive']
@@ -895,7 +891,7 @@ class RLSimulation:
                 self.killed = state['killed']
                 self.collided = state['collided']
                 self.starved = state['starved']
-                print(f"--- [Loaded] Load completed, frames {self.frames:,} ---")
+                print(f"--- [Loaded] Load completed ---")
             except Exception as e:
                 print(f"--- [Error] Loading failed: {e} ---")
 
@@ -1103,6 +1099,8 @@ class RLSimulation:
         video_thread = None
         frame_queue = None
 
+        self.print_info(False)
+
         def start_record():
             nonlocal video_thread, frame_queue
             frame_queue = queue.Queue()
@@ -1181,6 +1179,8 @@ class RLSimulation:
                     running = False
                 elif updated and self.steps % 5000 == 0:
                     self.save_state()
+                elif not training and self.frames % 1000 == 0:
+                    self.print_info(False)
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
@@ -1193,7 +1193,9 @@ class RLSimulation:
             frame_queue.put(None)
             video_thread.join()
 
-        self.save_state()
+        if training:
+            self.save_state()
+
         pygame.quit()
 
     def record_proc(self, frame_queue, filename, width, height, fps):
@@ -1224,6 +1226,14 @@ class RLSimulation:
         process.stdin.close()
         process.wait()
         print(f"錄影已關閉，檔案：{filename}")
+
+    def print_info(self, training):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if training:
+            info = self.last_info
+            print(f"[{now}][Info] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+        else:
+            print(f"[{now}][Info] Frames:{self.frames:,} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
