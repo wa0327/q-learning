@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/survivors5.py",
             "console": "integratedTerminal",
-            "args": "--demo -r"
+            "args": "--demo"
         }
     ]
 }
