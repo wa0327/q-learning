@@ -74,7 +74,7 @@ STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
 ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
 TARGET_ENTROPY = -ACTION_DIM
 INIT_ALPHA = 1.0
-MIN_ALPHA = 0.05
+MIN_ALPHA = 1e-9
 MAX_OBJ = 100    # 最大環境物件數量
 
 # --- SAC 網路架構 ---
@@ -243,12 +243,10 @@ class ReplayMemory:
         return self.size
 
 class GLRenderer:
-    def __init__(self, ctx, w, h):
+    def __init__(self, ctx, fbo_texture, w, h):
         self.ctx = ctx
+        self.fbo_texture = fbo_texture
         self.w, self.h = w, h
-        self.fbo_texture = self.ctx.texture((SCREEN_W, SCREEN_H), 3)
-        self.fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.fbo = self.ctx.framebuffer(color_attachments=[self.fbo_texture])
         
         # --- 圓形 Shader (Instanced) ---
         self.circle_prog = ctx.program(
@@ -448,7 +446,10 @@ class RLSimulation:
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
         self.ctx = moderngl.create_context()
-        self.renderer = GLRenderer(self.ctx, SCREEN_W, SCREEN_H)
+        fbo_texture = self.ctx.texture((SCREEN_W, SCREEN_H), 3)
+        fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.fbo = self.ctx.framebuffer(color_attachments=[fbo_texture])
+        self.renderer = GLRenderer(self.ctx, fbo_texture, SCREEN_W, SCREEN_H)
         self.ui_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         self.pbo = self.ctx.buffer(reserve=SCREEN_W * SCREEN_H * 3)
         self.clock = pygame.time.Clock()
@@ -1116,7 +1117,7 @@ class RLSimulation:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
     def draw(self, draw_label, draw_units, draw_perception, draw_alert, verbose):
-        self.renderer.fbo.use()
+        self.fbo.use()
         self.ctx.clear(0.08, 0.08, 0.08)
         self.ui_surface.fill((0, 0, 0, 0)) 
         

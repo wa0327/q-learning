@@ -1,0 +1,50 @@
+環境大小：1280 x 720
+任務步數：300
+最大速度：3.50
+預警半徑：10.50
+[Actor] Network & Optimizer init complete.
+[2026-03-18 15:31:02][Info] Frames:0 Rewards:0.0000 Eaten:0 Killed:0 Collided:0 Starved:0
+[2026-03-18 15:32:05][Info] Steps:5,000 Alpha:0.2274 Entropy:1.1720 Q-Val:-0.8945 C-Loss:3.4685 A-Loss:0.7215 Rewards:-0.4080 Eaten:37 Killed:47 Collided:66 Starved:5
+[2026-03-18 15:33:07][Info] Steps:10,000 Alpha:0.0585 Entropy:-0.0171 Q-Val:-2.0820 C-Loss:2.1050 A-Loss:1.8082 Rewards:-0.0852 Eaten:74 Killed:72 Collided:70 Starved:41
+[2026-03-18 15:34:13][Info] Steps:15,000 Alpha:0.0157 Entropy:-1.2388 Q-Val:-0.0359 C-Loss:0.3998 A-Loss:-0.0095 Rewards:-0.0675 Eaten:106 Killed:75 Collided:73 Starved:76
+[2026-03-18 15:35:21][Info] Steps:20,000 Alpha:0.0053 Entropy:-1.8528 Q-Val:-0.1603 C-Loss:0.2216 A-Loss:0.0962 Rewards:-0.0136 Eaten:193 Killed:76 Collided:77 Starved:118
+[2026-03-18 15:36:21][Info] Steps:25,000 Alpha:0.0107 Entropy:-1.8300 Q-Val:-1.5617 C-Loss:2.5043 A-Loss:1.5753 Rewards:-0.0092 Eaten:302 Killed:76 Collided:81 Starved:171
+[2026-03-18 15:37:17][Info] Steps:30,000 Alpha:0.0113 Entropy:-1.6674 Q-Val:-2.7903 C-Loss:0.4014 A-Loss:2.5765 Rewards:0.0482 Eaten:586 Killed:78 Collided:82 Starved:203
+[2026-03-18 15:38:14][Info] Steps:35,000 Alpha:0.0260 Entropy:-1.8233 Q-Val:1.1976 C-Loss:1.2733 A-Loss:-1.4420 Rewards:0.0608 Eaten:1,130 Killed:83 Collided:83 Starved:213
+[2026-03-18 15:39:06][Info] Steps:40,000 Alpha:0.0211 Entropy:-2.1349 Q-Val:2.1748 C-Loss:1.0421 A-Loss:-2.1865 Rewards:0.1149 Eaten:1,731 Killed:84 Collided:84 Starved:217
+[2026-03-18 15:39:56][Info] Steps:45,000 Alpha:0.0237 Entropy:-2.2077 Q-Val:1.1425 C-Loss:1.9722 A-Loss:-1.3082 Rewards:0.1180 Eaten:2,491 Killed:85 Collided:85 Starved:219
+[2026-03-18 15:40:46][Info] Steps:50,000 Alpha:0.0245 Entropy:-2.1599 Q-Val:1.6233 C-Loss:2.0819 A-Loss:-1.4331 Rewards:0.1591 Eaten:3,370 Killed:87 Collided:85 Starved:222
+[2026-03-18 15:41:37][Info] Steps:55,000 Alpha:0.0338 Entropy:-2.0154 Q-Val:1.4615 C-Loss:3.0462 A-Loss:-1.5516 Rewards:0.1906 Eaten:4,308 Killed:89 Collided:85 Starved:223
+[2026-03-18 15:42:28][Info] Steps:60,000 Alpha:0.0323 Entropy:-1.8641 Q-Val:-0.0898 C-Loss:3.0711 A-Loss:0.0005 Rewards:0.2139 Eaten:5,243 Killed:91 Collided:85 Starved:224
+[2026-03-18 15:43:20][Info] Steps:65,000 Alpha:0.0353 Entropy:-1.9980 Q-Val:-0.4535 C-Loss:1.2023 A-Loss:0.7457 Rewards:0.1435 Eaten:6,305 Killed:91 Collided:85 Starved:225
+[2026-03-18 15:44:19][Info] Steps:70,000 Alpha:0.0347 Entropy:-1.9214 Q-Val:-0.3200 C-Loss:4.1428 A-Loss:0.4437 Rewards:0.1162 Eaten:7,401 Killed:93 Collided:85 Starved:227
+[2026-03-18 15:45:27][Info] Steps:75,000 Alpha:0.0372 Entropy:-1.6895 Q-Val:-3.1492 C-Loss:2.2691 A-Loss:2.9764 Rewards:0.1481 Eaten:8,505 Killed:94 Collided:85 Starved:227
+[2026-03-18 15:46:37][Info] Steps:80,000 Alpha:0.0343 Entropy:-2.0259 Q-Val:-2.1182 C-Loss:1.9428 A-Loss:2.2443 Rewards:0.2197 Eaten:9,627 Killed:94 Collided:85 Starved:227
+[2026-03-18 15:47:46][Info] Steps:85,000 Alpha:0.0346 Entropy:-2.3281 Q-Val:-1.7584 C-Loss:2.6120 A-Loss:1.5243 Rewards:0.1518 Eaten:10,842 Killed:95 Collided:85 Starved:228
+[2026-03-18 15:48:45][Info] Steps:90,000 Alpha:0.0360 Entropy:-2.1046 Q-Val:-1.9571 C-Loss:3.0667 A-Loss:2.0423 Rewards:0.1796 Eaten:12,088 Killed:95 Collided:85 Starved:228
+[2026-03-18 15:49:35][Info] Steps:95,000 Alpha:0.0357 Entropy:-2.2865 Q-Val:-2.5068 C-Loss:1.4280 A-Loss:2.5079 Rewards:0.1903 Eaten:13,182 Killed:96 Collided:85 Starved:228
+[2026-03-18 15:50:26][Info] Steps:100,000 Alpha:0.0345 Entropy:-1.9657 Q-Val:-2.8836 C-Loss:1.5675 A-Loss:2.7990 Rewards:0.1685 Eaten:14,261 Killed:97 Collided:85 Starved:231
+[2026-03-18 15:51:31][Info] Steps:105,000 Alpha:0.0364 Entropy:-2.1163 Q-Val:-2.7464 C-Loss:2.0450 A-Loss:2.4972 Rewards:0.1946 Eaten:15,425 Killed:97 Collided:85 Starved:233
+[2026-03-18 15:52:40][Info] Steps:110,000 Alpha:0.0367 Entropy:-2.1636 Q-Val:-3.4777 C-Loss:1.5594 A-Loss:3.4868 Rewards:0.2619 Eaten:16,605 Killed:98 Collided:85 Starved:234
+[2026-03-18 15:53:49][Info] Steps:115,000 Alpha:0.0338 Entropy:-1.7714 Q-Val:-3.4237 C-Loss:1.3078 A-Loss:3.4603 Rewards:0.2073 Eaten:17,712 Killed:98 Collided:85 Starved:238
+[2026-03-18 15:54:57][Info] Steps:120,000 Alpha:0.0324 Entropy:-1.9537 Q-Val:-3.2823 C-Loss:1.9145 A-Loss:3.3369 Rewards:0.1475 Eaten:18,792 Killed:98 Collided:85 Starved:241
+[2026-03-18 15:55:51][Info] Steps:125,000 Alpha:0.0315 Entropy:-2.1916 Q-Val:-2.5607 C-Loss:4.2993 A-Loss:2.4786 Rewards:0.1795 Eaten:19,901 Killed:100 Collided:85 Starved:244
+[2026-03-18 15:56:41][Info] Steps:130,000 Alpha:0.0303 Entropy:-1.9183 Q-Val:-3.0885 C-Loss:2.0166 A-Loss:2.9588 Rewards:0.2546 Eaten:20,953 Killed:102 Collided:85 Starved:246
+[2026-03-18 15:57:30][Info] Steps:135,000 Alpha:0.0326 Entropy:-1.9366 Q-Val:-2.7145 C-Loss:2.2941 A-Loss:2.7452 Rewards:0.1155 Eaten:22,044 Killed:102 Collided:85 Starved:246
+[2026-03-18 15:58:20][Info] Steps:140,000 Alpha:0.0300 Entropy:-1.7793 Q-Val:-2.2728 C-Loss:2.3102 A-Loss:2.2781 Rewards:0.2424 Eaten:23,226 Killed:106 Collided:85 Starved:247
+[2026-03-18 15:59:09][Info] Steps:145,000 Alpha:0.0281 Entropy:-2.3858 Q-Val:-2.8377 C-Loss:2.4687 A-Loss:2.7512 Rewards:0.0920 Eaten:24,271 Killed:106 Collided:85 Starved:249
+[2026-03-18 15:59:59][Info] Steps:150,000 Alpha:0.0277 Entropy:-2.0297 Q-Val:-2.4621 C-Loss:1.3460 A-Loss:2.4527 Rewards:0.1573 Eaten:25,303 Killed:107 Collided:85 Starved:249
+[2026-03-18 16:00:48][Info] Steps:155,000 Alpha:0.0311 Entropy:-2.0671 Q-Val:-1.6512 C-Loss:2.2523 A-Loss:1.5634 Rewards:0.1650 Eaten:26,459 Killed:108 Collided:85 Starved:250
+[2026-03-18 16:01:37][Info] Steps:160,000 Alpha:0.0342 Entropy:-2.1961 Q-Val:-0.7341 C-Loss:0.9146 A-Loss:1.0236 Rewards:0.1493 Eaten:27,702 Killed:110 Collided:85 Starved:250
+[2026-03-18 16:02:27][Info] Steps:165,000 Alpha:0.0318 Entropy:-2.3460 Q-Val:0.0041 C-Loss:2.6516 A-Loss:0.0150 Rewards:0.1788 Eaten:28,895 Killed:114 Collided:85 Starved:251
+[2026-03-18 16:03:16][Info] Steps:170,000 Alpha:0.0324 Entropy:-2.1098 Q-Val:-0.2817 C-Loss:1.0890 A-Loss:0.2911 Rewards:0.2678 Eaten:30,160 Killed:114 Collided:85 Starved:251
+[2026-03-18 16:04:05][Info] Steps:175,000 Alpha:0.0331 Entropy:-1.6956 Q-Val:-0.3653 C-Loss:2.1760 A-Loss:0.2803 Rewards:0.2090 Eaten:31,500 Killed:114 Collided:85 Starved:251
+[2026-03-18 16:04:55][Info] Steps:180,000 Alpha:0.0281 Entropy:-1.8506 Q-Val:-0.7154 C-Loss:1.4651 A-Loss:0.6340 Rewards:0.1715 Eaten:32,647 Killed:116 Collided:85 Starved:251
+[2026-03-18 16:05:45][Info] Steps:185,000 Alpha:0.0296 Entropy:-2.0255 Q-Val:-0.3172 C-Loss:1.1493 A-Loss:0.3882 Rewards:0.2305 Eaten:33,899 Killed:116 Collided:85 Starved:251
+[2026-03-18 16:06:34][Info] Steps:190,000 Alpha:0.0332 Entropy:-1.6588 Q-Val:0.2807 C-Loss:3.5956 A-Loss:-0.2226 Rewards:0.2434 Eaten:35,154 Killed:117 Collided:85 Starved:251
+[2026-03-18 16:07:23][Info] Steps:195,000 Alpha:0.0293 Entropy:-2.0385 Q-Val:-1.1031 C-Loss:1.6396 A-Loss:1.1086 Rewards:0.1416 Eaten:36,314 Killed:119 Collided:85 Starved:251
+[2026-03-18 16:08:13][Info] Steps:200,000 Alpha:0.0272 Entropy:-2.1622 Q-Val:0.2498 C-Loss:1.1381 A-Loss:-0.3289 Rewards:0.2128 Eaten:37,455 Killed:119 Collided:86 Starved:256
+[2026-03-18 16:18:00][Info] Steps:205,000 Alpha:0.0268 Entropy:-2.0463 Q-Val:0.5572 C-Loss:1.5325 A-Loss:-0.6029 Rewards:0.1992 Eaten:38,654 Killed:121 Collided:86 Starved:258
+[2026-03-18 16:19:08][Info] Steps:210,000 Alpha:0.0276 Entropy:-2.3402 Q-Val:0.1872 C-Loss:1.8038 A-Loss:-0.1038 Rewards:0.2184 Eaten:39,812 Killed:123 Collided:86 Starved:259
+[2026-03-18 16:20:16][Info] Steps:215,000 Alpha:0.0268 Entropy:-2.2794 Q-Val:-0.2286 C-Loss:1.4243 A-Loss:0.2669 Rewards:0.1484 Eaten:41,018 Killed:123 Collided:86 Starved:259
+[2026-03-18 16:21:25][Info] Steps:220,000 Alpha:0.0261 Entropy:-2.0051 Q-Val:0.3855 C-Loss:0.9103 A-Loss:-0.4327 Rewards:0.2409 Eaten:42,281 Killed:123 Collided:86 Starved:260
