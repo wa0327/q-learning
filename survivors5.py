@@ -155,43 +155,44 @@ class Critic(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # 定義單個 Q 網路結構的內部函數
-        def build_q_net():
-            return nn.ModuleDict({
-                "conv": nn.Sequential(
-                    nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
-                    nn.ReLU(),
-                    nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1)
-                ),
-                "attn": nn.Sequential(
-                    nn.Linear(HIDDEN_FEAT_DIM, HIDDEN_ATTN_DIM),
-                    nn.Tanh(),
-                    nn.Linear(HIDDEN_ATTN_DIM, 1)
-                ),
-                "fc": nn.Sequential(
-                    nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
-                    nn.ReLU(),
-                    nn.Linear(HIDDEN_FC_DIM, CRITIC_OUT_DIM),
-                    nn.ReLU(),
-                    nn.Linear(CRITIC_OUT_DIM, 1)
-                )
-            })
+        # 共享的感官層 (Backbone)
+        self.conv = nn.Sequential(
+            nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.ReLU(),
+            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.ReLU()
+        )
+        self.attn = nn.Sequential(
+            nn.Linear(HIDDEN_FEAT_DIM, HIDDEN_ATTN_DIM),
+            nn.Tanh(),
+            nn.Linear(HIDDEN_ATTN_DIM, 1)
+        )
+
+        # 獨立的 Q 評價層 (Heads)
+        def build_q_head():
+            return nn.Sequential(
+                nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
+                nn.ReLU(),
+                nn.Linear(HIDDEN_FC_DIM, CRITIC_OUT_DIM),
+                nn.ReLU(),
+                nn.Linear(CRITIC_OUT_DIM, 1)
+            )
         
-        self.q1 = build_q_net()
-        self.q2 = build_q_net()
+        self.q1_head = build_q_head()
+        self.q2_head = build_q_head()
 
     def forward(self, m_in, s_in, action):
-        def _get_q(net, m_in, s_in, action):
-            f = F.relu(net["conv"](m_in)).transpose(1, 2)
-            w = F.softmax(net["attn"](f), dim=1)
-            x_attn = torch.sum(f * w, dim=1)
+        # 1. 統一提取特徵 (只算一次)
+        feat = self.conv(m_in).transpose(1, 2)
+        weights = F.softmax(self.attn(feat), dim=1)
+        x_attn = torch.sum(feat * weights, dim=1)
+        
+        # 2. 拼裝輸入
+        combined = torch.cat([x_attn, s_in, action], dim=1)
 
-            # 拼裝特徵、狀態與動作
-            x = torch.cat([x_attn, s_in, action], dim=1)
-            return net["fc"](x)
-
-        q1 = _get_q(self.q1, m_in, s_in, action)
-        q2 = _get_q(self.q2, m_in, s_in, action)
+        # 3. 分別進入獨立的評估分支
+        q1 = self.q1_head(combined)
+        q2 = self.q2_head(combined)
         return q1, q2
 
 class ReplayMemory:
@@ -1341,6 +1342,9 @@ class RLSimulation:
         video_thread = None
         frame_queue = None
 
+        self.fps_avg = self.clock.get_fps()
+        self.last_states = self.get_states()
+
         self.print_info(False)
 
         def start_record():
@@ -1361,8 +1365,6 @@ class RLSimulation:
         if args.record:
             start_record()
 
-        self.last_states = self.get_states()
-        self.fps_avg = self.clock.get_fps()
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1470,9 +1472,9 @@ class RLSimulation:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if training:
             info = self.last_info
-            print(f"[{now}][Info] Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] Frames:{self.frames:,} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Frames:{self.frames:,} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
