@@ -1,19 +1,21 @@
 import pygame
+import moderngl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 import numpy as np
 import os
+import subprocess
 from pathlib import Path
 from datetime import datetime
 import math
 import shutil
-import ffmpeg
 from pathlib import Path
 import threading
 import queue
 import argparse
+import shlex
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
@@ -23,7 +25,9 @@ BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
-SCREEN_W, SCREEN_H = 1280, 720
+SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
+SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
+WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 EST_STEPS = 300 # 評估模型在此步數內應獲得最大獎勵
 # 這個 0.715 代表生存者需要在限制步數內，有能力跑完畫面 71.5% 的對角線距離
 POP_MAX_SPEED = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / EST_STEPS # 在 1280x720 時約為 3.5，僅適合無任何障礙物環境。
@@ -44,7 +48,7 @@ PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
 POP_ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
 RND_POS_PADDING = 50.0  # 隨機取位邊距
-WALL_SIZE = 0
+WALL_SIZE = 5
 
 # 獎懲設定
 FOOD_REWARD = 15.0    # 吃到食物
@@ -238,11 +242,214 @@ class ReplayMemory:
     def __len__(self):
         return self.size
 
+class GLRenderer:
+    def __init__(self, ctx, w, h):
+        self.ctx = ctx
+        self.w, self.h = w, h
+        self.fbo_texture = self.ctx.texture((SCREEN_W, SCREEN_H), 3)
+        self.fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.fbo = self.ctx.framebuffer(color_attachments=[self.fbo_texture])
+        
+        # --- 圓形 Shader (Instanced) ---
+        self.circle_prog = ctx.program(
+            vertex_shader="""
+                #version 330
+                in vec2 in_vert; in vec4 in_pos_rad; in vec3 in_color;
+                out vec3 v_color;
+                out vec2 v_dist; // 傳遞距離資訊給 Fragment Shader
+                uniform vec2 res;
+                void main() {
+                    vec2 p = (in_pos_rad.xy / res) * 2.0 - 1.0;
+                    p.y *= -1.0;
+                    vec2 scale = (in_pos_rad.z / res) * 2.0;
+                    gl_Position = vec4(p + in_vert * scale, 0.0, 1.0);
+                    v_color = in_color;
+                    v_dist = in_vert; // 這會是圓心出發的向量 (-1 到 1)
+                }
+            """,
+            fragment_shader="""
+                #version 330
+                in vec3 v_color;
+                in vec2 v_dist;
+                out vec4 f;
+                uniform bool is_hollow;
+                uniform float thickness;
+                void main() {
+                    float d = length(v_dist);
+                    if (d > 1.0)
+                        discard; // 超過圓半徑的不畫
+                    
+                    if (is_hollow) {
+                        // 如果是空心模式，只畫邊緣 0.9 到 1.0 的部分
+                        if (d < (1.0 - thickness))
+                        discard; 
+                    }
+                    f = vec4(v_color, 1.0);
+                }
+            """
+        )
+        self.circle_prog['res'].value = (w, h)
+        
+        # 圓形模板 (32節點)
+        ang = np.linspace(0, 2*np.pi, 32, endpoint=False)
+        verts = np.stack([np.cos(ang), np.sin(ang)], axis=1).astype('f4')
+        self.vbo_circle_temp = ctx.buffer(verts)
+        self.vbo_circle_inst = ctx.buffer(reserve=10000 * 7 * 4) # 預留空間
+        self.vao_circle = ctx.vertex_array(self.circle_prog, [
+            (self.vbo_circle_temp, '2f', 'in_vert'),
+            (self.vbo_circle_inst, '4f 3f /i', 'in_pos_rad', 'in_color')
+        ])
+
+        # --- 線段 Shader ---
+        self.line_prog = ctx.program(
+            vertex_shader="""
+                #version 330
+                in vec2 in_vert; in vec3 in_color;
+                out vec3 v_color;
+                uniform vec2 res;
+                void main() {
+                    vec2 pixel_pos = in_vert + vec2(0.5, 0.5);
+                    vec2 p = (pixel_pos / res) * 2.0 - 1.0;
+                    p.y *= -1.0;
+                    gl_Position = vec4(p, 0.0, 1.0);
+                    v_color = in_color;
+                }
+            """,
+            fragment_shader="#version 330\nin vec3 v_color; out vec4 f; void main() { f = vec4(v_color, 1.0); }"
+        )
+        self.line_prog['res'].value = (w, h)
+        self.vbo_line = ctx.buffer(reserve=20000 * 5 * 4)
+        self.vao_line = ctx.vertex_array(self.line_prog, [(self.vbo_line, '2f 3f', 'in_vert', 'in_color')])
+
+        # --- Text Overlay ---
+        self.text_texture = ctx.texture((w, h), 4)
+        self.text_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.text_prog = ctx.program(
+            vertex_shader="""
+                #version 330
+                in vec2 in_vert; 
+                in vec2 in_texcoord;
+                out vec2 v_texcoord;
+                void main() {
+                    gl_Position = vec4(in_vert, 0.0, 1.0);
+                    v_texcoord = in_texcoord;
+                }
+            """,
+            fragment_shader="""
+                #version 330
+                uniform sampler2D tex;
+                in vec2 v_texcoord;
+                out vec4 f_color;
+                void main() {
+                    f_color = texture(tex, v_texcoord);
+                }
+            """
+        )
+        quad = np.array([
+            -1, 1, 0, 0,  -1, -1, 0, 1,   1, 1, 1, 0,
+            -1, -1, 0, 1,  1, -1, 1, 1,   1, 1, 1, 0,
+        ], dtype='f4')
+        self.vbo_text = ctx.buffer(quad)
+        self.vao_text = ctx.vertex_array(
+            self.text_prog,
+            [(self.vbo_text, '2f 2f', 'in_vert', 'in_texcoord')]
+        )
+
+        # --- Screen blit shader ---
+        self.screen_prog = ctx.program(
+            vertex_shader="""
+                #version 330
+                in vec2 in_vert;
+                out vec2 uv;
+                void main() {
+                    uv = (in_vert + 1.0) * 0.5;
+                    gl_Position = vec4(in_vert, 0.0, 1.0);
+                }
+            """,
+            fragment_shader="""
+                #version 330
+                uniform sampler2D tex;
+                in vec2 uv;
+                out vec4 fragColor;
+                void main() {
+                    fragColor = texture(tex, uv);
+                }
+            """,
+        )
+        quad = np.array([
+            -1, -1,
+            1, -1,
+            -1,  1,
+            1,  1,
+        ], dtype='f4')
+        self.vbo_screen = ctx.buffer(quad)
+        self.vao_screen = ctx.simple_vertex_array(
+            self.screen_prog,
+            self.vbo_screen,
+            'in_vert'
+        )
+
+    def draw_circles(self, pos, rad, color):
+        """ pos:[N,2], rad:[N,1], color:[N,3] (0~1) """
+        if pos.shape[0] == 0:
+            return
+        data = torch.cat([pos, rad, rad, color], dim=1).cpu().numpy().astype('f4')
+        self.vbo_circle_inst.write(data)
+        self.vao_circle.render(moderngl.TRIANGLE_FAN, instances=pos.shape[0])
+
+    def draw_lines(self, start, end, color):
+        """ start:[N,2], end:[N,2], color:[N,3] """
+        if start.shape[0] == 0:
+            return
+        # 將線段轉為頂點流 [P1, Color1, P2, Color2, ...]
+        N = start.shape[0]
+        data = torch.empty((N, 2, 5), device=start.device)
+        data[:, 0, :2] = start
+        data[:, 0, 2:] = color
+        data[:, 1, :2] = end
+        data[:, 1, 2:] = color
+        self.vbo_line.write(data.cpu().numpy().astype('f4'))
+        self.vao_line.render(moderngl.LINES, vertices=N*2)
+
+    def draw_text(self, surface):
+        """ surface: pygame.Surface """
+
+        # 更新 texture
+        rgba_data = pygame.image.tostring(surface, 'RGBA')
+        self.text_texture.write(rgba_data)
+
+        # 開啟 alpha blending（文字透明必須）
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+
+        # 畫 fullscreen quad
+        self.text_texture.use(0)
+        self.vao_text.render()
+ 
+    def blit_to_screen(self, win_w, win_h):
+        """把 FBO texture 縮放畫到螢幕"""
+
+        self.ctx.screen.use()
+        self.ctx.viewport = (0, 0, win_w, win_h)
+
+        # 關閉深度測試（避免干擾）
+        self.ctx.disable(moderngl.DEPTH_TEST)
+
+        # 不需要 blending（純覆蓋）
+        self.ctx.disable(moderngl.BLEND)
+
+        self.fbo_texture.use(0)
+        self.vao_screen.render(moderngl.TRIANGLE_STRIP)
+        
 # --- 模擬環境 ---
 class RLSimulation:
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.SCALED)
+        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
+        self.ctx = moderngl.create_context()
+        self.renderer = GLRenderer(self.ctx, SCREEN_W, SCREEN_H)
+        self.ui_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        self.pbo = self.ctx.buffer(reserve=SCREEN_W * SCREEN_H * 3)
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Consolas", 14)
         self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
@@ -265,10 +472,9 @@ class RLSimulation:
         self.l_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 4, 1)
 
         # 定義牆面
-        self.wall_v = []
         wall_A, wall_B = [], []
         self.add_wall_group(wall_A, wall_B, [
-            [0.0, 0.0], [SCREEN_W-1, 0.0], [SCREEN_W-1, SCREEN_H-1], [0.0, SCREEN_H-1]
+            [0, 0], [SCREEN_W-1, 0], [SCREEN_W-1, SCREEN_H-1], [0, SCREEN_H-1]
         ], True)
         if WALL_SIZE > 0:
             self.add_wall_group(wall_A, wall_B, [
@@ -290,24 +496,19 @@ class RLSimulation:
             self.add_wall_group(wall_A, wall_B, [
                 [SCREEN_W*7/8, SCREEN_H*1/8], [SCREEN_W*7/8, SCREEN_H*7/8]
             ], False)
-        self.wall_A = torch.cat(wall_B, dim=0)
-        self.wall_B = torch.cat(wall_A, dim=0)
+        self.wall_A = torch.cat(wall_A, dim=0)
+        self.wall_B = torch.cat(wall_B, dim=0)
+        self.wall_v = torch.stack([self.wall_A, self.wall_B], dim=1)
 
     def add_wall_group(self, wall_A, wall_B, points, closed):
-        """
-        points: list of [x, y] or torch.Tensor
-        closed: True 則連成迴圈 (1->2->3->4->1), False 則連成線段 (1->2->3->4)
-        """
-        self.wall_v.append(points)
         points = torch.tensor(points, dtype=torch.float32, device=DEVICE)
         
         if closed:
-            # 閉合路徑：每個點都作為起點，終點是下一個點 (含最後一個點連回第一個)
+            # 閉合：N 個點產生 N 條線 (1->2, 2->3, 3->4, 4->1)
             wall_A.append(points)
             wall_B.append(torch.roll(points, -1, 0))
         else:
-            # 開放路徑：N 個點產生 N-1 條線段
-            # 起點為第 0 到 N-2 個點，終點為第 1 到 N-1 個點
+            # 開放：N 個點產生 N-1 條線 (1->2, 2->3, 3->4)
             wall_A.append(points[:-1])
             wall_B.append(points[1:])
 
@@ -665,17 +866,17 @@ class RLSimulation:
         self.kill(starved)
 
         # 近牆痛覺
-        wall_min_dist, closest_wall_idx = torch.min(dist_to_walls, dim=1) # (N,)
+        wall_min_dist, closest_wall_idx = torch.min(dist_to_walls, dim=1)
         wall_dist_ratio = (1.0 - (wall_min_dist - POP_RADIUS) / POP_ALERT_RADIUS).clamp(0.0, 1.0)
-        wall_closest_points = wall_closest_points[torch.arange(self.pos.size(0), device=DEVICE), closest_wall_idx]
         wall_mask = (wall_dist_ratio > 0) & self.alive
         if wall_mask.any():
+            wall_contacts = wall_closest_points[torch.arange(self.pos.size(0), device=DEVICE), closest_wall_idx]
+            starts = self.pos[wall_mask]
+            ends = wall_contacts[wall_mask]
+            self.wall_lines = torch.stack([starts, ends], dim=1)
             rewards[wall_mask] += WALL_NEARBY_REWARD
-            starts = self.pos[wall_mask].cpu().numpy().tolist()
-            ends = wall_closest_points[wall_mask].cpu().numpy().tolist()
-            self.wall_lines = list(zip(starts, ends))
         else:
-            self.wall_lines = []
+            self.wall_lines = None
 
         dead_mask = killed | collided | starved
 
@@ -709,7 +910,7 @@ class RLSimulation:
         self.killed += killed.sum().item()
         self.collided += collided.sum().item()
         self.starved += starved.sum().item()
-        self.rewards = rewards.detach().cpu().numpy()
+        self.rewards = rewards
         self.frames += 1
 
     def kill(self, killed):
@@ -914,115 +1115,162 @@ class RLSimulation:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
     def draw(self, draw_label, draw_units, draw_perception, draw_alert, verbose):
-        self.screen.fill((20, 20, 20))
-
+        self.renderer.fbo.use()
+        self.ctx.clear(0.08, 0.08, 0.08)
+        self.ui_surface.fill((0, 0, 0, 0)) 
+        
         if draw_units:
-            for shape in self.wall_v:
-                pygame.draw.lines(self.screen, (128,0,0), True, shape, 1)
+            # 繪製牆面
+            w_starts = self.wall_v[:, 0, :]
+            w_ends = self.wall_v[:, 1, :]
+            num_walls = w_starts.size(0)            
+            wall_color = torch.tensor([[0.5, 0.0, 0.0]], device=DEVICE).expand(num_walls, -1)            
+            self.renderer.draw_lines(w_starts, w_ends, wall_color)
 
-            for f in self.food_pos.cpu().numpy():
-                pygame.draw.circle(self.screen, (0, 255, 120), f.astype(int), FOOD_RADIUS)
+            # 繪製食物 ---
+            if len(self.food_pos) > 0:
+                food_color = torch.tensor([[0.0, 1.0, 0.47]], device=DEVICE).expand(len(self.food_pos), -1)
+                food_rad = torch.full((len(self.food_pos), 1), FOOD_RADIUS, device=DEVICE)
+                self.renderer.draw_circles(self.food_pos, food_rad, food_color)
 
-            for p in self.pred_pos.cpu().numpy(): 
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS, 1)
-                pygame.draw.circle(self.screen, (255, 50, 50), p.astype(int), PREDATOR_RADIUS * 0.25)
+            # 繪製掠食者 (Predators) ---
+            if len(self.pred_pos) > 0:
+                num_pred = len(self.pred_pos)
+                p_color = torch.tensor([[1.0, 0.0, 0.0]], device=DEVICE).expand(num_pred, -1)                
+                # 外圈 (空心)
+                p_rad_outer = torch.full((num_pred, 1), PREDATOR_RADIUS, device=DEVICE)
+                self.renderer.circle_prog['is_hollow'].value = True
+                self.renderer.circle_prog['thickness'].value = 0.05
+                self.renderer.draw_circles(self.pred_pos, p_rad_outer, p_color * 0.5)
+                # 中心實心小圓
+                p_rad_inner = torch.full((num_pred, 1), PREDATOR_RADIUS * 0.25, device=DEVICE)
+                self.renderer.circle_prog['is_hollow'].value = False
+                self.renderer.draw_circles(self.pred_pos, p_rad_inner, p_color)
 
-            p_np = self.pos.cpu().numpy()
-            a_np = self.alive.cpu().numpy()
-            e_np = self.energy.cpu().numpy()
-            t_np = self.respawn_timer.cpu().numpy()
-            act_np = self.last_actions.cpu().numpy()
-            vel_np = self.vel.cpu().numpy()
-            ang_np = self.angle.cpu().numpy()
-            spd_np = self.forward_speed.cpu().numpy()
+            # 繪製智能體 (Agents) ---
+            alive_mask = self.alive > 0
+            dead_mask = ~alive_mask
+            
+            # 處理死亡 Agents
+            if dead_mask.any():
+                d_pos = self.pos[dead_mask]
+                d_color = torch.where((self.energy[dead_mask] <= 0).unsqueeze(1), 
+                                      torch.tensor([0.23, 0.23, 0.23], device=DEVICE), 
+                                      torch.tensor([0.47, 0.0, 0.0], device=DEVICE))
+                d_rad = torch.full((d_pos.shape[0], 1), 3.0, device=DEVICE)
+                self.renderer.draw_circles(d_pos, d_rad, d_color)
 
-            for i, p in enumerate(p_np):
-                pos_tuple = (int(p[0]), int(p[1]))
-
-                if not a_np[i]:
-                    dead_color = (60, 60, 60) if e_np[i] <= 0 else (120, 0, 0)
-                    pygame.draw.circle(self.screen, dead_color, pos_tuple, 3)
-                    timer_surface = self.font.render(f"{t_np[i]:.0f}", True, dead_color)
-                    timer_rect = timer_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - 15))
-                    self.screen.blit(timer_surface, timer_rect)
-                    continue
-
-                en_ratio = e_np[i] / MAX_ENERGY
-                r = int(255 * en_ratio)          # 越飽越紅
-                g = int(128 * en_ratio)          # 飽的時候帶點橘色感，不飽就變暗
-                b = int(255 * (1 - en_ratio))    # 越餓越藍
-                color = (r, g, b)
-                radius = int(POP_RADIUS + 4 * en_ratio)
-                pygame.draw.circle(self.screen, color, pos_tuple, radius)
-
-                act = act_np[i]
-                throttle = act[1]
-                vel = vel_np[i]
-                speed = spd_np[i]
-
-                # 顯示能量數值
-                if verbose >= 1:
-                    text_surface = self.font.render(f"{e_np[i]:.0f}", True, (255, 255, 255))
-                    text_rect = text_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] - radius - 8))
-                    self.screen.blit(text_surface, text_rect)
-
-                # 顯示除錯訊息
-                if verbose >= 2:
-                    dbg_text = f"{throttle:.2f} {speed:.2f} {self.rewards[i]:.4f}"
-                    dbg_surface = self.font.render(dbg_text, True, (255, 255, 255))
-                    dbg_rect = dbg_surface.get_rect(center=(pos_tuple[0], pos_tuple[1] + radius + 8))
-                    self.screen.blit(dbg_surface, dbg_rect)
-
-                # 繪製慣性方向
-                speed_abs = abs(speed)
-                if speed_abs > 0.1:
-                    v_line_length = speed_abs * 2.5
-                    # 終點座標 = 當前位置 + 速度向量 * 縮放係數
-                    vel_end_p = (
-                        int(p[0] + vel[0] * v_line_length), 
-                        int(p[1] + vel[1] * v_line_length)
-                    )
-                    inertia_color = (0, 191, 255) # 深天藍色
-                    pygame.draw.line(self.screen, inertia_color, pos_tuple, vel_end_p, 3)
-                    
-                # 繪製方向及油門指示線
-                if throttle != 0:
-                    power = abs(throttle)
-                    angle = ang_np[i]
-                    if throttle > 0:
-                        line_width = 1
-                        if power <= 0.5:
-                            line_color = (0, 255, 0)
-                        elif power <= 0.875:
-                            line_color = (255, 255, 255)
-                        else:
-                            line_color = (255, 0, 0)
-                    else:
-                        power /= 3
-                        angle += np.pi
-                        line_width = 1
-                        line_color = (255, 255, 0)
-
-                    line_length = 20 * power
-                    end_p = (
-                        int(p[0] + np.cos(angle) * line_length),
-                        int(p[1] + np.sin(angle) * line_length)
-                    )
-                    pygame.draw.line(self.screen, line_color, pos_tuple, end_p, line_width)
-
-                # 畫出視野範圍
+            # 處理存活 Agents
+            if alive_mask.any():
+                a_pos = self.pos[alive_mask]
+                en_ratio = (self.energy[alive_mask] / MAX_ENERGY).unsqueeze(1)
+                a_color = torch.cat([en_ratio, 0.5 * en_ratio, 1.0 - en_ratio], dim=1)
+                a_rad = (POP_RADIUS + 4 * en_ratio)
+                
+                # --- 智能體主體 ---
+                self.renderer.circle_prog['is_hollow'].value = False
+                self.renderer.draw_circles(a_pos, a_rad, a_color)
+                
+                # --- 輔助範圍 ---
                 if draw_perception:
-                    pygame.draw.circle(self.screen, color, pos_tuple, POP_PERCEPTION_RADIUS, 1)
-                # 畫出警戒範圍
+                    per_rad = torch.full_like(a_rad, POP_PERCEPTION_RADIUS)
+                    self.renderer.circle_prog['is_hollow'].value = True
+                    self.renderer.circle_prog['thickness'].value = 0.01
+                    self.renderer.draw_circles(a_pos, per_rad, a_color)
                 if draw_alert:
-                    pygame.draw.circle(self.screen, color, pos_tuple, POP_ALERT_RADIUS, 1)
+                    alt_rad = torch.full_like(a_rad, POP_ALERT_RADIUS)
+                    self.renderer.circle_prog['is_hollow'].value = True
+                    self.renderer.circle_prog['thickness'].value = 0.01
+                    self.renderer.draw_circles(a_pos, alt_rad, a_color)
 
-                if verbose >= 2:
-                    for start, end in self.wall_lines:
-                        # 畫出紅色的感應線
-                        pygame.draw.line(self.screen, (255, 50, 50), start, end, 2)
-                        # 在牆壁接觸點畫個小黃點確認
-                        pygame.draw.circle(self.screen, (255, 255, 0), (int(end[0]), int(end[1])), 3)
+                # --- 向量與指示線 ---
+                # 速度向量
+                spd = self.forward_speed[alive_mask]
+                vel = self.vel[alive_mask]
+                mask_spd = torch.abs(spd) > 0.1
+                if mask_spd.any():
+                    l_start = a_pos[mask_spd]
+                    l_end = l_start + vel[mask_spd] * (torch.abs(spd[mask_spd]) * 2.5).unsqueeze(1)
+                    l_color = torch.tensor([[0.0, 0.75, 1.0]], device=DEVICE).expand(l_start.shape[0], -1)
+                    self.renderer.draw_lines(l_start, l_end, l_color)
+
+                # 油門指示線
+                throttle = self.last_actions[alive_mask, 1]
+                mask_t = throttle != 0
+                if mask_t.any():
+                    t_start = a_pos[mask_t]
+                    t_val = throttle[mask_t]
+                    t_abs = torch.abs(t_val)
+                    t_ang = self.angle[alive_mask][mask_t]
+                    
+                    # --- A. 計算長度與角度偏移 ---
+                    # if throttle < 0: angle += pi, power /= 3
+                    is_forward = t_val > 0
+                    t_final_ang = torch.where(is_forward, t_ang, t_ang + np.pi)
+                    t_final_len = torch.where(is_forward, 20.0 * t_abs, (20.0 * t_abs) / 3.0)
+                    t_dir = torch.stack([torch.cos(t_final_ang), torch.sin(t_final_ang)], dim=1)
+                    t_end = t_start + t_dir * t_final_len.unsqueeze(1)
+                    
+                    # --- B. 分段顏色邏輯 ---
+                    num_t = t_start.size(0)
+                    t_color = torch.zeros((num_t, 3), device=DEVICE)                    
+                    # 條件 1: throttle < 0 -> 黃色 (1.0, 1.0, 0.0)
+                    mask_back = ~is_forward
+                    t_color[mask_back] = torch.tensor([1.0, 1.0, 0.0], device=DEVICE)
+                    # 條件 2: throttle > 0 且 power <= 0.5 -> 綠色 (0.0, 1.0, 0.0)
+                    mask_low = is_forward & (t_abs <= 0.5)
+                    t_color[mask_low] = torch.tensor([0.0, 1.0, 0.0], device=DEVICE)
+                    # 條件 3: throttle > 0 且 0.5 < power <= 0.875 -> 白色 (1.0, 1.0, 1.0)
+                    mask_mid = is_forward & (t_abs > 0.5) & (t_abs <= 0.875)
+                    t_color[mask_mid] = torch.tensor([1.0, 1.0, 1.0], device=DEVICE)
+                    # 條件 4: throttle > 0 且 power > 0.875 -> 紅色 (1.0, 0.0, 0.0)
+                    mask_high = is_forward & (t_abs > 0.875)
+                    t_color[mask_high] = torch.tensor([1.0, 0.0, 0.0], device=DEVICE)
+                    
+                    # --- C. 執行渲染 ---
+                    self.renderer.draw_lines(t_start, t_end, t_color)
+
+                if verbose >= 1:
+                    a_pos_np = a_pos.cpu().numpy()
+                    a_en_np = self.energy[alive_mask].cpu().numpy()
+                    a_rad_np = a_rad.cpu().numpy().flatten()
+                    
+                    if verbose >= 2:
+                        a_thr_np = self.last_actions[alive_mask, 1].cpu().numpy()
+                        a_spd_np = self.forward_speed[alive_mask].cpu().numpy()
+                        a_rew_np = self.rewards[alive_mask].cpu().numpy()
+
+                    for i in range(len(a_pos_np)):
+                        px, py = a_pos_np[i]
+                        radius = a_rad_np[i]
+                        
+                        # 顯示能量數值 (Agent 上方)
+                        en_text = f"{a_en_np[i]:.0f}"
+                        en_surf = self.font.render(en_text, True, (255, 255, 255))
+                        en_rect = en_surf.get_rect(center=(int(px), int(py - radius - 8)))
+                        self.ui_surface.blit(en_surf, en_rect)
+
+                        # 顯示除錯訊息 (Agent 下方)
+                        if verbose >= 2:
+                            dbg_text = f"{a_thr_np[i]:.2f} {a_spd_np[i]:.2f} {a_rew_np[i]:.4f}"
+                            dbg_surf = self.font.render(dbg_text, True, (255, 255, 255))
+                            dbg_rect = dbg_surf.get_rect(center=(int(px), int(py + radius + 8)))
+                            self.ui_surface.blit(dbg_surf, dbg_rect)
+                            
+            # --- 4. 除錯資訊 (牆壁感應) ---
+            if verbose >= 2 and self.wall_lines is not None:
+                w_starts = self.wall_lines[:, 0, :]
+                w_ends = self.wall_lines[:, 1, :]
+                num_w = w_starts.size(0)
+
+                # 感應紅線
+                w_line_color = torch.tensor([[1.0, 0.2, 0.2]], device=DEVICE).expand(num_w, -1)
+                self.renderer.draw_lines(w_starts, w_ends, w_line_color)
+                
+                # 接觸黃點
+                w_dot_color = torch.tensor([[1.0, 1.0, 0.0]], device=DEVICE).expand(num_w, -1)
+                w_dot_rad = torch.full((num_w, 1), 3.0, device=DEVICE)
+                self.renderer.draw_circles(w_ends, w_dot_rad, w_dot_color)
 
         THEME = {
             "label": (180, 180, 180),    # 淺灰色 (標籤專用)
@@ -1035,30 +1283,15 @@ class RLSimulation:
             ("FPS:", f"{self.fps_avg:.0f}", THEME["perf"], False)
         ]
         def render_label_column(labels, label_x, value_anchor_x, start_y=10, padding=4):
-            """
-            通用標籤列繪製方法
-            :param labels: 標籤資料列表
-            :param label_x: 標籤 (Label) 的左側起始 X 座標
-            :param value_anchor_x: 數值 (Value) 的右側對齊 X 座標
-            """
             current_y = start_y
-            
             for text, val, val_color, bold in labels:
                 font = self.big_font if bold else self.font
-                
-                # 1. 渲染 Label (固定左對齊)
                 lbl_surf = font.render(text, True, THEME["label"])
-                lbl_rect = lbl_surf.get_rect(topleft=(label_x, current_y))
-                
-                # 2. 渲染 Value (固定右對齊到錨點)
+                lbl_rect = lbl_surf.get_rect(topleft=(label_x, current_y))                    
                 val_surf = font.render(val, True, val_color)
                 val_rect = val_surf.get_rect(topright=(value_anchor_x, current_y))
-                
-                # 3. 繪製到螢幕
-                self.screen.blit(lbl_surf, lbl_rect)
-                self.screen.blit(val_surf, val_rect)
-
-                # 更新下一行高度
+                self.ui_surface.blit(lbl_surf, lbl_rect)
+                self.ui_surface.blit(val_surf, val_rect)
                 line_height = max(lbl_rect.height, val_rect.height)
                 current_y += line_height + padding
 
@@ -1083,6 +1316,10 @@ class RLSimulation:
             ]
             render_label_column(left_labels, label_x=10, value_anchor_x=200)
 
+        self.renderer.draw_text(self.ui_surface)
+
+        win_w, win_h = pygame.display.get_window_size()
+        self.renderer.blit_to_screen(win_w, win_h)
         pygame.display.flip()
         self.clock.tick(self.fps)
 
@@ -1108,7 +1345,7 @@ class RLSimulation:
             filename = f"{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4"
             video_thread = threading.Thread(
                 target=self.record_proc,
-                args=(frame_queue, filename, SCREEN_W, SCREEN_H, 60)
+                args=(frame_queue, filename)
             )
             video_thread.start()
             print(f"開始錄影...")
@@ -1190,46 +1427,40 @@ class RLSimulation:
             self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
 
             if video_thread and video_thread.is_alive():
-                raw_surface = self.screen.copy()
-                frame_queue.put(raw_surface)
+                self.fbo.read_into(self.pbo, components=3)
+                frame_queue.put(self.pbo.read())
                 
         if video_thread and video_thread.is_alive():
-            frame_queue.put(None)
-            video_thread.join()
+            stop_record()
 
         if training:
             self.save_state()
 
         pygame.quit()
 
-    def record_proc(self, frame_queue, filename, width, height, fps):
-        process = (
-            ffmpeg
-            .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}', r=fps)
-            .output(filename,
-                    hide_banner=None,
-                    loglevel='error',
-                    vcodec='h264_nvenc', # 強制指定 NVIDIA H.264 編碼器
-                    pix_fmt='yuv420p',   # 為了影片相容性，轉為 YUV420
-                    preset='fast',       # 速度設定：slow, medium, fast, hp, hq
-                    bitrate='5M')        # 設定位元率
-            .overwrite_output()
-            .run_async(pipe_stdin=True)
+    def record_proc(self, frame_queue, filename):
+        cmd = (
+            f'ffmpeg -hide_banner -loglevel error -y '
+            f'-f rawvideo -pix_fmt rgb24 -s {SCREEN_W}x{SCREEN_H} -r 60 -i - '
+            f'-vf vflip -c:v hevc_nvenc -preset p4 -tune hq -b:v 20M -pix_fmt yuv444p '
+            f'-color_range pc -colorspace bt709 -color_primaries bt709 -color_trc bt709 '
+            f'{filename}'
         )
+        proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, bufsize=SCREEN_W*SCREEN_H*3)
         
+        print(f"錄影已啟動: {filename}")
         while True:
-            item = frame_queue.get()
-            if item is None:
-                break
-                
-            view = pygame.surfarray.array3d(item)
-            view = view.transpose([1, 0, 2])
-            process.stdin.write(view.tobytes())
-            frame_queue.task_done()
-
-        process.stdin.close()
-        process.wait()
-        print(f"錄影已關閉，檔案：{filename}")
+            try:
+                data = frame_queue.get(timeout=1.0)
+                if data is None:
+                    break
+                proc.stdin.write(data)
+            except queue.Empty:
+                continue
+        
+        proc.stdin.close()
+        proc.wait()
+        print(f"錄影已關閉：{filename}")
 
     def print_info(self, training):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1249,7 +1480,7 @@ if __name__ == "__main__":
     
     print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
     print(f'任務步數：{EST_STEPS}')
-    print(f'最大速度：{POP_MAX_SPEED}')
-    print(f'預警半徑：{POP_ALERT_RADIUS}')
+    print(f'最大速度：{POP_MAX_SPEED:.2f}')
+    print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
     sim = RLSimulation()
     sim.run(args)
