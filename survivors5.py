@@ -68,11 +68,15 @@ TAU = 0.005     # 軟更新係數
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
 MEMORY_SIZE = 100000
-BATCH_SIZE = 256
-FEAT_DIM = 7    # 每個物件特微 [cos, sin, dist, is_wall, is_food, is_team, is_pred]
-STATE_DIM = 3   # 自身狀態 [速度, 轉向, 能量]
-ACTION_DIM = 2  # 輸出動作 [轉向, 油門]
-TARGET_ENTROPY = -ACTION_DIM
+REPLAY_BATCH_SIZE = 256
+FEAT_IN_DIM = 7         # 每個物件特微 [cos, sin, dist, is_wall, is_food, is_team, is_pred]
+STATE_IN_DIM = 3        # 自身狀態 [速度, 轉向, 能量]
+ACTOR_OUT_DIM = 2       # Actor 輸出層數，輸出動作 [轉向, 油門]
+HIDDEN_FEAT_DIM = 64    # 特徵提取層 (Conv1d) 的輸出維度
+HIDDEN_ATTN_DIM = 32    # Attention 內部的隱藏層維度
+HIDDEN_FC_DIM = 256     # 後段全連接層 (MLP) 的主要維度
+CRITIC_OUT_DIM = 64     # Critic 輸出前的降維層
+TARGET_ENTROPY = -ACTOR_OUT_DIM
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.0001
 MAX_OBJ = 100    # 最大環境物件數量
@@ -81,51 +85,54 @@ MAX_OBJ = 100    # 最大環境物件數量
 class Actor(nn.Module):
     def __init__(self):
         super().__init__()
-        # 特徵提取層 (保持你的 Attention 機制)
+
+        # 1. 特徵提取與廣義感知 (處理周遭物件)
         self.conv = nn.Sequential(
-            nn.Conv1d(FEAT_DIM, 64, 1),
+            nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
             nn.ReLU(),
-            nn.Conv1d(64, 64, 1)
+            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1)
         )
+
+        # 2. Attention 機制 (決定關注哪個物件)
         self.attn_weights = nn.Sequential(
-            nn.Linear(64, 32),
+            nn.Linear(HIDDEN_FEAT_DIM, HIDDEN_ATTN_DIM),
             nn.Tanh(),
-            nn.Linear(32, 1)
+            nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        # 共享的全連接層
+        # 3. 決策層 (結合感官與自身狀態)
         self.fc_common = nn.Sequential(
-            nn.Linear(64 + STATE_DIM, 256),
+            nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(HIDDEN_FC_DIM, HIDDEN_FC_DIM),
             nn.ReLU()
         )
         
-        # SAC 核心：輸出均值與對數標準差
-        self.mu = nn.Linear(256, ACTION_DIM)
-        self.log_std = nn.Linear(256, ACTION_DIM)
+        # 4. 輸出層 (SAC 需要 Mean 與 Log_Std)
+        self.mu = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
+        self.log_std = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
     def forward(self, m_in, s_in, deterministic=False, with_logprob=True):
-        # 1. Attention 處理
-        feat = F.relu(self.conv(m_in))
-        feat = feat.transpose(1, 2)
+        # 提取環境特徵 [Batch, HIDDEN_FEAT_DIM, MAX_OBJ] -> [Batch, MAX_OBJ, HIDDEN_FEAT_DIM]
+        feat = F.relu(self.conv(m_in)).transpose(1, 2)
+
+        # 計算權重並加權平均
         weights = F.softmax(self.attn_weights(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 2. 結合狀態
+        # 結合自身狀態 [Batch, HIDDEN_FEAT_DIM + STATE_IN_DIM]
         combined = torch.cat([x_attn, s_in], dim=1)
         x = self.fc_common(combined)
         
-        # 3. 計算分佈參數
+        # 計算分佈參數
         mu = self.mu(x)
-        log_std = self.log_std(x)
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = torch.clamp(self.log_std(x), self.LOG_STD_MIN, self.LOG_STD_MAX)
         std = torch.exp(log_std)
         
-        # 4. 採樣動作 (Reparameterization Trick)
+        # 採樣動作 (Reparameterization Trick)
         if not deterministic or with_logprob:
             dist = Normal(mu, std)
         if deterministic:
@@ -133,12 +140,12 @@ class Actor(nn.Module):
         else:
             z = dist.rsample()
             
-        # 5. 將動作映射到 [-1, 1] (使用 Tanh)
+        # 將動作映射到 [-1, 1]
         action = torch.tanh(z)
         
-        # 6. 計算 Log Probability (SAC 訓練必需，包含 Tanh 修正項)
         log_prob = None
         if with_logprob:
+            # 修正 Tanh 造成的機率分佈偏離
             log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
             
@@ -147,68 +154,55 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
-        # Q1 結構
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(FEAT_DIM, 64, 1),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, 1)
-        )
-        self.attn1 = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1)
-        )
-        self.fc1 = nn.Sequential(
-            nn.Linear(64 + STATE_DIM + ACTION_DIM, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+
+        # 定義單個 Q 網路結構的內部函數
+        def build_q_net():
+            return nn.ModuleDict({
+                "conv": nn.Sequential(
+                    nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+                    nn.ReLU(),
+                    nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1)
+                ),
+                "attn": nn.Sequential(
+                    nn.Linear(HIDDEN_FEAT_DIM, HIDDEN_ATTN_DIM),
+                    nn.Tanh(),
+                    nn.Linear(HIDDEN_ATTN_DIM, 1)
+                ),
+                "fc": nn.Sequential(
+                    nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
+                    nn.ReLU(),
+                    nn.Linear(HIDDEN_FC_DIM, CRITIC_OUT_DIM),
+                    nn.ReLU(),
+                    nn.Linear(CRITIC_OUT_DIM, 1)
+                )
+            })
         
-        # Q2 結構
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(FEAT_DIM, 64, 1),
-            nn.ReLU(),
-            nn.Conv1d(64, 64, 1)
-        )
-        self.attn2 = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1)
-        )
-        self.fc2 = nn.Sequential(
-            nn.Linear(64 + STATE_DIM + ACTION_DIM, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.q1 = build_q_net()
+        self.q2 = build_q_net()
 
     def forward(self, m_in, s_in, action):
-        # 處理 Q1
-        f1 = F.relu(self.conv1(m_in)).transpose(1, 2)
-        w1 = F.softmax(self.attn1(f1), dim=1)
-        x1 = torch.cat([torch.sum(f1 * w1, dim=1), s_in, action], dim=1)
-        q1 = self.fc1(x1)
-        
-        # 處理 Q2
-        f2 = F.relu(self.conv2(m_in)).transpose(1, 2)
-        w2 = F.softmax(self.attn2(f2), dim=1)
-        x2 = torch.cat([torch.sum(f2 * w2, dim=1), s_in, action], dim=1)
-        q2 = self.fc2(x2)
-        
+        def _get_q(net, m_in, s_in, action):
+            f = F.relu(net["conv"](m_in)).transpose(1, 2)
+            w = F.softmax(net["attn"](f), dim=1)
+            x_attn = torch.sum(f * w, dim=1)
+
+            # 拼裝特徵、狀態與動作
+            x = torch.cat([x_attn, s_in, action], dim=1)
+            return net["fc"](x)
+
+        q1 = _get_q(self.q1, m_in, s_in, action)
+        q2 = _get_q(self.q2, m_in, s_in, action)
         return q1, q2
 
 class ReplayMemory:
     def __init__(self, capacity):
         self.capacity = capacity
         
-        self.m_states = torch.zeros((capacity, FEAT_DIM, MAX_OBJ), device=DEVICE)
-        self.s_states = torch.zeros((capacity, STATE_DIM), device=DEVICE)
-        self.next_m_states = torch.zeros((capacity, FEAT_DIM, MAX_OBJ), device=DEVICE)
-        self.next_s_states = torch.zeros((capacity, STATE_DIM), device=DEVICE)
-        self.actions = torch.zeros((capacity, ACTION_DIM), device=DEVICE)
+        self.m_states = torch.zeros((capacity, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
+        self.s_states = torch.zeros((capacity, STATE_IN_DIM), device=DEVICE)
+        self.next_m_states = torch.zeros((capacity, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
+        self.next_s_states = torch.zeros((capacity, STATE_IN_DIM), device=DEVICE)
+        self.actions = torch.zeros((capacity, ACTOR_OUT_DIM), device=DEVICE)
         self.rewards = torch.zeros(capacity, device=DEVICE)
         self.dones = torch.zeros(capacity, device=DEVICE)
         
@@ -216,13 +210,13 @@ class ReplayMemory:
         self.size = 0
 
     def push(self, m_s, s_s, action, reward, n_m_s, n_s_s, done):
-        self.m_states[self.idx].copy_(m_s)
-        self.s_states[self.idx].copy_(s_s)
-        self.next_m_states[self.idx].copy_(n_m_s)
-        self.next_s_states[self.idx].copy_(n_s_s)
-        self.actions[self.idx].copy_(action)
-        self.rewards[self.idx] = reward
-        self.dones[self.idx] = done
+        self.m_states[self.idx].copy_(m_s.detach())
+        self.s_states[self.idx].copy_(s_s.detach())
+        self.next_m_states[self.idx].copy_(n_m_s.detach())
+        self.next_s_states[self.idx].copy_(n_s_s.detach())
+        self.actions[self.idx].copy_(action.detach())
+        self.rewards[self.idx] = float(reward)
+        self.dones[self.idx] = float(done)
         
         self.idx = (self.idx + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -524,7 +518,7 @@ class RLSimulation:
         self.collided = 0
         self.starved = 0
         self.eaten = 0
-        self.last_actions = torch.zeros((POP_SIZE, ACTION_DIM), device=DEVICE)
+        self.last_actions = torch.zeros((POP_SIZE, ACTOR_OUT_DIM), device=DEVICE)
         self.vel = torch.zeros((POP_SIZE, 2), device=DEVICE)
         self.angle = torch.rand(POP_SIZE, device=DEVICE) * (2 * np.pi)
         self.forward_speed = torch.zeros(POP_SIZE, device=DEVICE)
@@ -556,7 +550,7 @@ class RLSimulation:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
         # 熵係數 (Temperature Alpha)
-        self.target_entropy = -ACTION_DIM
+        self.target_entropy = -ACTOR_OUT_DIM
         self.log_alpha = torch.tensor([math.log(INIT_ALPHA)], requires_grad=True, device=DEVICE)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=LR_ACTOR)
 
@@ -573,49 +567,57 @@ class RLSimulation:
         print(f"[{self.actor.__class__.__name__}] Network & Optimizer init complete.")
 
     def optimize_model(self):
-        if len(self.memory) < BATCH_SIZE:
+        if len(self.memory) < REPLAY_BATCH_SIZE:
             return False
         
-        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample(BATCH_SIZE)
+        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample(REPLAY_BATCH_SIZE)
         r_b = r_b.unsqueeze(1) 
         d_b = d_b.unsqueeze(1)
 
-        alpha = self.log_alpha.exp().detach() # 當前熵係數
+        # 1. 取得當前 alpha 數值用於 Actor/Critic (不帶梯度)
+        alpha = self.log_alpha.exp().detach()
         alpha = torch.clamp(alpha, min=MIN_ALPHA)
 
-        # --- 更新 Critic ---
+        # --- 1. 更新 Critic ---
         with torch.no_grad():
-            # SAC 關鍵：在 Next State 採樣動作並計算其 Log Prob
+            # 使用 Target Critic 計算，避免過度樂觀估計
             next_actions, next_log_probs = self.actor(nm_b, ns_b)
-            # 使用 Target Critic 計算兩個 Q 值
-            q1_target, q2_target = self.critic_target(nm_b, ns_b, next_actions)
-            # 取最小值並減去熵 (Entropy)
-            min_q_target = torch.min(q1_target, q2_target) - alpha * next_log_probs
-            target_v = r_b + (GAMMA * (1 - d_b.float()) * min_q_target)
+            q1_t, q2_t = self.critic_target(nm_b, ns_b, next_actions)
             
-        # 計算當前 Critic 的兩個輸出
-        q1_current, q2_current = self.critic(m_b, s_b, a_b)
-        critic_loss = F.mse_loss(q1_current, target_v) + F.mse_loss(q2_current, target_v)
-        
+            # SAC 核心公式：Q - alpha * log_prob
+            min_q_target = torch.min(q1_t, q2_t) - alpha * next_log_probs
+            target_q = r_b + (GAMMA * (1.0 - d_b) * min_q_target)
+
+        q1_curr, q2_curr = self.critic(m_b, s_b, a_b)
+        # 計算 MSE 並結合兩個 Q 網路的損失
+        critic_loss = F.mse_loss(q1_curr, target_q) + F.mse_loss(q2_curr, target_q)
+
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
 
         # --- 2. 更新 Actor ---
-        # 重新採樣當前狀態的動作
+        # 凍結 Critic 的參數以節省計算資源 (選擇性，但較嚴謹)
+        for param in self.critic.parameters():
+            param.requires_grad = False
+
         new_actions, log_probs = self.actor(m_b, s_b)
         q1_new, q2_new = self.critic(m_b, s_b, new_actions)
         min_q_new = torch.min(q1_new, q2_new)
-        
-        # Actor Loss = Alpha * Log_Prob - Q (最大化 Q 並兼顧多樣性)
+
+        # 目標是最小化 (alpha * log_prob - Q)，等同於最大化 (Q - alpha * log_prob)
         actor_loss = (alpha * log_probs - min_q_new).mean()
-        
+
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
 
+        # 解凍 Critic
+        for param in self.critic.parameters():
+            param.requires_grad = True
+
         # --- 3. 更新 Alpha (自動調整熵) ---
-        alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
         self.alpha_opt.step()
@@ -628,7 +630,7 @@ class RLSimulation:
         self.last_info = {
             "alpha": alpha.item(),
             "entropy": -log_probs.mean().item(),
-            "q_val": torch.min(q1_current, q2_current).mean().item(),
+            "q_val": torch.min(q1_curr, q2_curr).mean().item(),
             "c_loss": critic_loss.item(),
             "a_loss": actor_loss.item()
         }
@@ -637,7 +639,7 @@ class RLSimulation:
 
     def get_states(self):
         angel = self.angle.view(POP_SIZE, 1)
-        mixed_in = torch.zeros((POP_SIZE, FEAT_DIM, MAX_OBJ), device=DEVICE, dtype=torch.float32)
+        mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE, dtype=torch.float32)
         current_idx = 0
 
         def fill_buffer(features):
