@@ -438,6 +438,7 @@ class GLRenderer:
 # --- 模擬環境 ---
 class RLSimulation:
     def __init__(self, args):
+        self.fps = 300
         pygame.init()
         if not args.headless:
             self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
@@ -450,9 +451,8 @@ class RLSimulation:
             self.pbo = self.ctx.buffer(reserve=SCREEN_W * SCREEN_H * 3)
             self.font = pygame.font.SysFont("Consolas", 14)
             self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
+            self.update_caption()
         self.clock = pygame.time.Clock()
-        self.fps = 300
-        self.update_caption()
         
         # 初始化神經網路
         self.init_network(Actor, Critic)
@@ -464,10 +464,22 @@ class RLSimulation:
         self.load_state()
 
         # 四類環境物件的 one-hot 編碼
-        self.l_wall = torch.tensor([1, 0, 0, 0], device=DEVICE).view(1, 4, 1)
-        self.l_food = torch.tensor([0, 1, 0, 0], device=DEVICE).view(1, 4, 1)
-        self.l_team = torch.tensor([0, 0, 1, 0], device=DEVICE).view(1, 4, 1)
-        self.l_pred = torch.tensor([0, 0, 0, 1], device=DEVICE).view(1, 4, 1)
+        self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_food = torch.tensor([0.0, 1.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_team = torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_pred = torch.tensor([0.0, 0.0, 0.0, 1.0], device=DEVICE).view(1, 4, 1)
+        self.l_all = torch.cat([
+            l_food.repeat(1, 1, FOOD_SIZE),
+            l_team.repeat(1, 1, POP_SIZE),
+            l_pred.repeat(1, 1, PREDATOR_SIZE)
+        ], dim=2)
+
+        # 準備對應的半徑與 Label
+        self.dynamic_radii = torch.cat([
+            torch.full((FOOD_SIZE,), FOOD_RADIUS, device=DEVICE),
+            torch.full((POP_SIZE,), POP_RADIUS, device=DEVICE),
+            torch.full((PREDATOR_SIZE,), PREDATOR_RADIUS, device=DEVICE)
+        ])
 
         # 定義牆面
         wall_A, wall_B = [], []
@@ -640,48 +652,6 @@ class RLSimulation:
         return True
 
     def get_states(self):
-        angel = self.angle.view(POP_SIZE, 1)
-        mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE, dtype=torch.float32)
-        current_idx = 0
-
-        def fill_buffer(features):
-            nonlocal current_idx
-            num_new = features.shape[2]
-            space_left = MAX_OBJ - current_idx
-            if num_new > 0 and space_left > 0:
-                actual_add = min(num_new, space_left)
-                mixed_in[:, :, current_idx : current_idx + actual_add] = features[:, :, :actual_add]
-                current_idx += actual_add
-
-        def process_obj(obj_pos, obj_radius, one_hot_label, is_self=False):
-            nonlocal current_idx
-            if obj_pos.shape[0] == 0:
-                return None
-            
-            # 計算相對位移 (POP_SIZE, OBJ_SIZE, 2)
-            diff = obj_pos.unsqueeze(0) - self.pos.unsqueeze(1)
-            dist = torch.norm(diff, dim=2)
-            if is_self: # 處理隊友時排除自己
-                dist.fill_diagonal_(1e6)
-                
-            # 計算相對角度
-            abs_ang = torch.atan2(diff[..., 1], diff[..., 0])
-            rel_ang = abs_ang - angel
-            
-            # 計算距離
-            dist_norm = ((dist - POP_RADIUS - obj_radius) / POP_PERCEPTION_RADIUS).clamp(0, 1)
-            # 排除視野遮罩
-            mask = ((dist - POP_RADIUS - obj_radius) < POP_PERCEPTION_RADIUS).float()
-            
-            phys = torch.stack([
-                torch.cos(rel_ang),
-                torch.sin(rel_ang),
-                dist_norm
-            ], dim=1) * mask.unsqueeze(1)
-            
-            onehot = one_hot_label.expand(POP_SIZE, 4, phys.shape[2])
-            return torch.cat([phys, onehot], dim=1)
-
         # --- 1. 處理牆壁 (Wall) ---
         p = self.pos.unsqueeze(1)    # (N, 1, 2)
         a = self.wall_A.unsqueeze(0) # (1, W, 2)
@@ -715,19 +685,39 @@ class RLSimulation:
             wall_phys, 
             self.l_wall.expand(POP_SIZE, 4, self.wall_A.shape[0])
         ], dim=1)
-        fill_buffer(wall_in)
 
-        # --- 2. 處理食物 (Food) ---
-        if FOOD_SIZE > 0:
-            fill_buffer(process_obj(self.food_pos, FOOD_RADIUS, self.l_food))
+        # --- 2, 3, 4. 合併處理動態物件 (Food, Team, Predator) ---
+        # 將所有動態物件位置拼接
+        dynamic_pos = torch.cat([self.food_pos, self.pos, self.pred_pos], dim=0) # (Total_D, 2)
+        
+        # 一次性計算所有動態物件的物理量
+        # diff 維度: (POP_SIZE, Total_D, 2)
+        diff_d = dynamic_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+        dist_d = torch.norm(diff_d, dim=2)
+        
+        # 排除自己 (Team 部分)
+        # 隊友的起始索引是 FOOD_SIZE
+        dist_d[:, FOOD_SIZE : FOOD_SIZE + POP_SIZE].fill_diagonal_(1e6)
 
-        # --- 3. 處理隊友 (Team) ---
-        if POP_SIZE > 1:
-            fill_buffer(process_obj(self.pos, POP_RADIUS, self.l_team, is_self=True))
+        # 角度與正規化
+        abs_ang_d = torch.atan2(diff_d[..., 1], diff_d[..., 0])
+        rel_ang_d = abs_ang_d - self.angle.view(POP_SIZE, 1)
+        
+        dist_norm_d = ((dist_d - POP_RADIUS - self.dynamic_radii) / POP_PERCEPTION_RADIUS).clamp(0, 1)
+        mask_d = ((dist_d - POP_RADIUS - self.dynamic_radii) < POP_PERCEPTION_RADIUS).float()
 
-        # --- 4. 處理敵人 (Predator) ---
-        if PREDATOR_SIZE > 0:
-            fill_buffer(process_obj(self.pred_pos, PREDATOR_RADIUS, self.l_pred))
+        # 構建動態物件特徵 (POP_SIZE, 7, Total_D)
+        phys_d = torch.stack([torch.cos(rel_ang_d), torch.sin(rel_ang_d), dist_norm_d], dim=1) * mask_d.unsqueeze(1)
+        dynamic_in = torch.cat([phys_d, self.l_all.expand(POP_SIZE, -1, -1)], dim=1)
+
+        # --- 最後：一次性拼接到 mixed_in ---
+        # 將牆壁 (wall_in) 與 動態物件 (dynamic_in) 拼接
+        all_in = torch.cat([wall_in, dynamic_in], dim=2) # (POP_SIZE, 7, W + Total_D)
+        
+        # 填充到固定長度 MAX_OBJ
+        mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
+        actual_add = min(all_in.shape[2], MAX_OBJ)
+        mixed_in[:, :, :actual_add] = all_in[:, :, :actual_add]
 
         speed = self.forward_speed / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
@@ -1367,51 +1357,52 @@ class RLSimulation:
             start_record()
 
         while running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+            if not args.headless:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
                         running = False
-                    elif event.key == pygame.K_UP:
-                        self.fps += 5
-                        self.update_caption()
-                    elif event.key == pygame.K_DOWN:
-                        self.fps -= 5
-                        self.update_caption()
-                    elif event.key == pygame.K_EQUALS:
-                        self.fps = 300
-                        self.update_caption()
-                    elif event.key == pygame.K_MINUS:
-                        self.fps = 60
-                        self.update_caption()
-                    elif event.key == pygame.K_z:
-                        self.reset_env()
-                    if event.key == pygame.K_z and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
-                        self.init_network()
-                    elif event.key == pygame.K_SPACE:
-                        is_paused = not is_paused
-                    elif event.key == pygame.K_t:
-                        training = not training
-                    elif event.key == pygame.K_l:
-                        draw_label = not draw_label
-                    elif event.key == pygame.K_u:
-                        draw_units = not draw_units
-                    elif event.key == pygame.K_a:
-                        draw_alert = not draw_alert
-                    elif event.key == pygame.K_p:
-                        draw_perception = not draw_perception
-                    elif event.key == pygame.K_f:
-                        move_food = not move_food
-                    elif event.key == pygame.K_m:
-                        move_predator = not move_predator
-                    elif event.key == pygame.K_v:
-                        verbose = (verbose + 1) % 3
-                    elif event.key == pygame.K_r:
-                        if video_thread and video_thread.is_alive():
-                            stop_record()
-                        else:
-                            start_record()
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            running = False
+                        elif event.key == pygame.K_UP:
+                            self.fps += 5
+                            self.update_caption()
+                        elif event.key == pygame.K_DOWN:
+                            self.fps -= 5
+                            self.update_caption()
+                        elif event.key == pygame.K_EQUALS:
+                            self.fps = 300
+                            self.update_caption()
+                        elif event.key == pygame.K_MINUS:
+                            self.fps = 60
+                            self.update_caption()
+                        elif event.key == pygame.K_z:
+                            self.reset_env()
+                        if event.key == pygame.K_z and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                            self.init_network()
+                        elif event.key == pygame.K_SPACE:
+                            is_paused = not is_paused
+                        elif event.key == pygame.K_t:
+                            training = not training
+                        elif event.key == pygame.K_l:
+                            draw_label = not draw_label
+                        elif event.key == pygame.K_u:
+                            draw_units = not draw_units
+                        elif event.key == pygame.K_a:
+                            draw_alert = not draw_alert
+                        elif event.key == pygame.K_p:
+                            draw_perception = not draw_perception
+                        elif event.key == pygame.K_f:
+                            move_food = not move_food
+                        elif event.key == pygame.K_m:
+                            move_predator = not move_predator
+                        elif event.key == pygame.K_v:
+                            verbose = (verbose + 1) % 3
+                        elif event.key == pygame.K_r:
+                            if video_thread and video_thread.is_alive():
+                                stop_record()
+                            else:
+                                start_record()
 
             if not is_paused:
                 self.update(training, move_food, move_predator)
@@ -1491,9 +1482,9 @@ if __name__ == "__main__":
     parser.add_argument("--headless", action="store_true", default=False, help="無頭模式")
     args = parser.parse_args()
     
-    print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
-    print(f'任務步數：{EST_STEPS}')
-    print(f'最大速度：{POP_MAX_SPEED:.2f}')
-    print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
+    # print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
+    # print(f'任務步數：{EST_STEPS}')
+    # print(f'最大速度：{POP_MAX_SPEED:.2f}')
+    # print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
     sim = RLSimulation(args)
     sim.run(args)
