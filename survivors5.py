@@ -19,15 +19,18 @@ script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 # 參數設定
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SCREEN_W, SCREEN_H = 1280, 720
 BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
+SCREEN_W, SCREEN_H = 1280, 720
+# 評估模型在此步數內應獲得最大獎勵
+EST_STEPS = 300
+# 這個 0.715 代表生存者需要在限制步數內，有能力跑完畫面 71.5% 的對角線距離
+POP_MAX_SPEED = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715
 WALL_SIZE = 0
 POP_SIZE = 16
 POP_RADIUS = 4                      # 生存者體積半徑
-POP_MAX_SPEED = 3.5
 POP_DAMPING_FACTOR = 0.85           # 阻力系數，越高越需要維持高油門
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
@@ -36,13 +39,12 @@ FOOD_SIZE = POP_SIZE * 2
 FOOD_RADIUS = 3         # 食物觸碰半徑
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 50.0      # 食物補充能量
-EST_STEPS = 300         # 評估模型在此步數內應獲得最大獎勵
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
 PREDATOR_SIZE = 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
 PREDATOR_MAX_SPEED = 2.5
-ALERT_RADIUS = (POP_MAX_SPEED - PREDATOR_MAX_SPEED) * POP_MAX_SPEED * 3 # 危險警戒半徑
+ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
 RND_POS_PADDING = 50.0  # 隨機取位邊距
 
 # 獎懲設定
@@ -1179,8 +1181,11 @@ class RLSimulation:
                     running = False
                 elif updated and self.steps % 5000 == 0:
                     self.save_state()
-                elif not training and self.frames % 1000 == 0:
-                    self.print_info(False)
+                elif not training:
+                    if self.frames % 1000 == 0:
+                        self.print_info(False)
+                    if self.frames >= args.frames:
+                        running = False
 
             self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
             self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
@@ -1240,7 +1245,9 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
     parser.add_argument("--demo", action="store_true", default=False, help="模型性能展示")
+    parser.add_argument("--frames", type=int, default=float('inf'), help="模型性能展示幀數")
     args = parser.parse_args()
     
+    print(f'預警半徑：{ALERT_RADIUS}')
     sim = RLSimulation()
     sim.run(args)
