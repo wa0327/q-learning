@@ -79,7 +79,7 @@ CRITIC_OUT_DIM = 64     # Critic 輸出前的降維層
 TARGET_ENTROPY = -ACTOR_OUT_DIM
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.0001
-MAX_OBJ = 100    # 最大環境物件數量
+MAX_OBJ = 100    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
 
 # --- SAC 網路架構 ---
 class Actor(nn.Module):
