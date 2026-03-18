@@ -437,19 +437,20 @@ class GLRenderer:
 
 # --- 模擬環境 ---
 class RLSimulation:
-    def __init__(self):
+    def __init__(self, args):
         pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
-        self.ctx = moderngl.create_context()
-        fbo_texture = self.ctx.texture((SCREEN_W, SCREEN_H), 3)
-        fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.fbo = self.ctx.framebuffer(color_attachments=[fbo_texture])
-        self.renderer = GLRenderer(self.ctx, fbo_texture, SCREEN_W, SCREEN_H)
-        self.ui_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        self.pbo = self.ctx.buffer(reserve=SCREEN_W * SCREEN_H * 3)
+        if not args.headless:
+            self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
+            self.ctx = moderngl.create_context()
+            fbo_texture = self.ctx.texture((SCREEN_W, SCREEN_H), 3)
+            fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.fbo = self.ctx.framebuffer(color_attachments=[fbo_texture])
+            self.renderer = GLRenderer(self.ctx, fbo_texture, SCREEN_W, SCREEN_H)
+            self.ui_surface = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            self.pbo = self.ctx.buffer(reserve=SCREEN_W * SCREEN_H * 3)
+            self.font = pygame.font.SysFont("Consolas", 14)
+            self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Consolas", 14)
-        self.big_font = pygame.font.SysFont("Consolas", 18, bold=True)
         self.fps = 300
         self.update_caption()
         
@@ -1429,20 +1430,25 @@ class RLSimulation:
                     if self.frames >= args.frames:
                         running = False
 
-            self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
-            self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
+            if args.headless:
+                self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
+                self.clock.tick(self.fps)
+            else:
+                self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
+                self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
 
-            if video_thread and video_thread.is_alive():
-                self.fbo.read_into(self.pbo, components=3)
-                frame_queue.put(self.pbo.read())
-                
+                if video_thread and video_thread.is_alive():
+                    self.fbo.read_into(self.pbo, components=3)
+                    frame_queue.put(self.pbo.read())
+
         if video_thread and video_thread.is_alive():
             stop_record()
 
         if training:
             self.save_state()
 
-        pygame.quit()
+        if not args.headless:
+            pygame.quit()
 
     def record_proc(self, frame_queue, filename):
         cmd = (
@@ -1482,11 +1488,12 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
     parser.add_argument("--demo", action="store_true", default=False, help="模型性能展示")
     parser.add_argument("--frames", type=int, default=float('inf'), help="模型性能展示幀數")
+    parser.add_argument("--headless", action="store_true", default=False, help="無頭模式")
     args = parser.parse_args()
     
     print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
     print(f'任務步數：{EST_STEPS}')
     print(f'最大速度：{POP_MAX_SPEED:.2f}')
     print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
-    sim = RLSimulation()
+    sim = RLSimulation(args)
     sim.run(args)
