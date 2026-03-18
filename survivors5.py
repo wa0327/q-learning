@@ -434,13 +434,14 @@ class GLRenderer:
 
         # 關閉深度測試（避免干擾）
         self.ctx.disable(moderngl.DEPTH_TEST)
+        self.ctx.disable(moderngl.CULL_FACE)
 
         # 不需要 blending（純覆蓋）
         self.ctx.disable(moderngl.BLEND)
 
         self.fbo_texture.use(0)
         self.vao_screen.render(moderngl.TRIANGLE_STRIP)
-        
+
 # --- 模擬環境 ---
 class RLSimulation:
     def __init__(self):
