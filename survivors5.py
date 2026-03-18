@@ -69,7 +69,7 @@ LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
 MEMORY_SIZE = 100000
 REPLAY_BATCH_SIZE = 256
-FEAT_IN_DIM = 7         # 每個物件特微 [cos, sin, dist, is_wall, is_food, is_team, is_pred]
+FEAT_IN_DIM = 8         # 每個物件特微 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
 STATE_IN_DIM = 3        # 自身狀態 [速度, 轉向, 能量]
 ACTOR_OUT_DIM = 2       # Actor 輸出層數，輸出動作 [轉向, 油門]
 HIDDEN_FEAT_DIM = 64    # 特徵提取層 (Conv1d) 的輸出維度(環境特徵)
@@ -465,19 +465,19 @@ class RLSimulation:
 
         # 四類環境物件的 one-hot 編碼
         self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
-        l_food = torch.tensor([0.0, 1.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
-        l_team = torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_team = torch.tensor([0.0, 1.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_food = torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE).view(1, 4, 1)
         l_pred = torch.tensor([0.0, 0.0, 0.0, 1.0], device=DEVICE).view(1, 4, 1)
         self.l_all = torch.cat([
-            l_food.repeat(1, 1, FOOD_SIZE),
             l_team.repeat(1, 1, POP_SIZE),
+            l_food.repeat(1, 1, FOOD_SIZE),
             l_pred.repeat(1, 1, PREDATOR_SIZE)
         ], dim=2)
 
         # 準備對應的半徑與 Label
         self.dynamic_radii = torch.cat([
-            torch.full((FOOD_SIZE,), FOOD_RADIUS, device=DEVICE),
             torch.full((POP_SIZE,), POP_RADIUS, device=DEVICE),
+            torch.full((FOOD_SIZE,), FOOD_RADIUS, device=DEVICE),
             torch.full((PREDATOR_SIZE,), PREDATOR_RADIUS, device=DEVICE)
         ])
 
@@ -650,75 +650,87 @@ class RLSimulation:
         }
         self.steps += 1
         return True
-
+    
     def get_states(self):
-        # --- 1. 處理牆壁 (Wall) ---
+        # 預先取得維度資訊
+        angel = self.angle.view(POP_SIZE, 1)
         p = self.pos.unsqueeze(1)    # (N, 1, 2)
-        a = self.wall_A.unsqueeze(0) # (1, W, 2)
-        b = self.wall_B.unsqueeze(0) # (1, W, 2)
 
-        # 計算投影點 (同之前邏輯)
+        # --- 1. 處理牆壁 (Wall) ---
+        a = self.wall_A.unsqueeze(0)
+        b = self.wall_B.unsqueeze(0)
         ab = b - a
         ap = p - a
         t = (torch.sum(ap * ab, dim=-1) / (torch.sum(ab * ab, dim=-1) + 1e-6)).clamp(0, 1)
-        closest_points = a + t.unsqueeze(-1) * ab # (N, W, 2)
+        closest_points = a + t.unsqueeze(-1) * ab
 
-        # 計算相對位移與距離
-        diff_wall = closest_points - p               # (N, W, 2)
-        wall_dist = torch.norm(diff_wall, dim=-1)         # (N, W)
-
-        # 計算相對角度 (相對於 Agent 目前的朝向 angle)
-        abs_ang = torch.atan2(diff_wall[..., 1], diff_wall[..., 0])
-        rel_ang = abs_ang - self.angle.view(POP_SIZE, 1)
-
-        # 正規化距離與遮罩 (只看感知範圍內)
+        diff_wall = closest_points - p
+        wall_dist = torch.norm(diff_wall, dim=-1)
+        abs_ang_w = torch.atan2(diff_wall[..., 1], diff_wall[..., 0])
+        rel_ang_w = abs_ang_w - angel
+        
         wall_dist_norm = ((wall_dist - POP_RADIUS) / POP_PERCEPTION_RADIUS).clamp(0, 1)
         wall_mask = ((wall_dist - POP_RADIUS) < POP_PERCEPTION_RADIUS).float()
 
-        # 構建物理特徵 (Cos, Sin, Dist)
-        # wall_phys 維度: (POP_SIZE, 3, W)
-        wall_phys = torch.stack([torch.cos(rel_ang), torch.sin(rel_ang), wall_dist_norm], dim=1) * wall_mask.unsqueeze(1)
+        # 牆壁能量固定為 0.0 (N, W)
+        wall_energy = torch.zeros_like(wall_dist)
 
-        # 構建 One-hot Label (假設牆的標籤是 self.l_wall)
-        # wall_in 維度: (POP_SIZE, 7, W)
+        # 構建物理特徵 (Cos, Sin, Dist, Energy) -> (N, 4, W)
+        wall_phys = torch.stack([
+            torch.cos(rel_ang_w), 
+            torch.sin(rel_ang_w), 
+            wall_dist_norm,
+            wall_energy
+        ], dim=1) * wall_mask.unsqueeze(1)
+
         wall_in = torch.cat([
             wall_phys, 
             self.l_wall.expand(POP_SIZE, 4, self.wall_A.shape[0])
         ], dim=1)
 
         # --- 2, 3, 4. 合併處理動態物件 (Food, Team, Predator) ---
-        # 將所有動態物件位置拼接
-        dynamic_pos = torch.cat([self.food_pos, self.pos, self.pred_pos], dim=0) # (Total_D, 2)
+        dynamic_pos = torch.cat([self.pos, self.food_pos, self.pred_pos], dim=0)
         
-        # 一次性計算所有動態物件的物理量
-        # diff 維度: (POP_SIZE, Total_D, 2)
-        diff_d = dynamic_pos.unsqueeze(0) - self.pos.unsqueeze(1)
+        diff_d = dynamic_pos.unsqueeze(0) - p
         dist_d = torch.norm(diff_d, dim=2)
-        
-        # 排除自己 (Team 部分)
-        # 隊友的起始索引是 FOOD_SIZE
-        dist_d[:, FOOD_SIZE : FOOD_SIZE + POP_SIZE].fill_diagonal_(1e6)
+        dist_d[:, 0:POP_SIZE].fill_diagonal_(1e6)
 
-        # 角度與正規化
         abs_ang_d = torch.atan2(diff_d[..., 1], diff_d[..., 0])
-        rel_ang_d = abs_ang_d - self.angle.view(POP_SIZE, 1)
+        rel_ang_d = abs_ang_d - angel
         
         dist_norm_d = ((dist_d - POP_RADIUS - self.dynamic_radii) / POP_PERCEPTION_RADIUS).clamp(0, 1)
+
+        # --- 能量特徵處理 ---
+        # 1. 初始化全 0 (N, Total_D)
+        energy_norm = torch.zeros((POP_SIZE, dist_d.shape[1]), device=DEVICE)
+        # 2. 填入隊友能量
+        # 這裡取 self.energy 並轉化為 (1, POP_SIZE) 後廣播給所有 Agent
+        energy_norm[:, 0:POP_SIZE] = (self.energy / MAX_ENERGY).view(1, -1)
+        # 3. 填入掠食者能量 (固定為 1.0)
+        energy_norm[:, -PREDATOR_SIZE:] = 1.0
+
+        # 構建物理特徵 (Cos, Sin, Dist, Energy) -> (N, 4, Total_D)
         mask_d = ((dist_d - POP_RADIUS - self.dynamic_radii) < POP_PERCEPTION_RADIUS).float()
+        phys_d = torch.stack([
+            torch.cos(rel_ang_d), 
+            torch.sin(rel_ang_d), 
+            dist_norm_d,
+            energy_norm
+        ], dim=1) * mask_d.unsqueeze(1)
 
-        # 構建動態物件特徵 (POP_SIZE, 7, Total_D)
-        phys_d = torch.stack([torch.cos(rel_ang_d), torch.sin(rel_ang_d), dist_norm_d], dim=1) * mask_d.unsqueeze(1)
-        dynamic_in = torch.cat([phys_d, self.l_all.expand(POP_SIZE, -1, -1)], dim=1)
+        dynamic_in = torch.cat([
+            phys_d, 
+            self.l_all.expand(POP_SIZE, -1, -1)
+        ], dim=1)
 
-        # --- 最後：一次性拼接到 mixed_in ---
-        # 將牆壁 (wall_in) 與 動態物件 (dynamic_in) 拼接
-        all_in = torch.cat([wall_in, dynamic_in], dim=2) # (POP_SIZE, 7, W + Total_D)
+        # --- 5. 拼接與填充 ---
+        all_in = torch.cat([wall_in, dynamic_in], dim=2) 
         
-        # 填充到固定長度 MAX_OBJ
         mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
         actual_add = min(all_in.shape[2], MAX_OBJ)
         mixed_in[:, :, :actual_add] = all_in[:, :, :actual_add]
 
+        # 自身狀態維持不變
         speed = self.forward_speed / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy / MAX_ENERGY], dim=1)
