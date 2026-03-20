@@ -24,26 +24,32 @@ BASE_PATH = f"weights/{script_name}"
 SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
 
 # 環境參數
+STAGE = 4
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 POP_MAX_SPEED = 3.5
-EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED # 根據速度與「生存者需跑完對角線 71.5%」的目標，推算出所需步數
-POP_SIZE = 1
+# 生存難度系數
+STAGE_SURVIVAL_MULTIPLIER = 10 if STAGE == 1 else 3 if STAGE == 2 else 2 if STAGE == 3 else 1
+EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED * STAGE_SURVIVAL_MULTIPLIER # 根據速度與「生存者需跑完對角線 71.5%」的目標，推算出所需步數
+POP_SIZE = 50
 POP_RADIUS = 4                      # 生存者體積半徑
-POP_DAMPING_FACTOR = 0.85           # 阻力系數，越高越需要維持高油門
+POP_DAMPING_FACTOR = 0.25           # 阻力系數，越高越需要維持高油門
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
 POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
-FOOD_SIZE = POP_SIZE * 2
+POP_PERCEPT_TEAM = False if STAGE == 1 else True  # 是否將隊友加入環境特徵
+FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE == 1 else 0.75 if STAGE < 4 else 0.5))
 FOOD_RADIUS = 3         # 食物觸碰半徑
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 25.0      # 食物補充能量
 ENERGY_DECAY = FOOD_ENERGY / EST_STEPS # 每步消耗能量
-PREDATOR_SIZE = 0
+MOVE_FOOD = False if STAGE < 4 else True
+FOOD_RESPAWN_NEARBY_PREDATOR = False if STAGE < 4 else True
+PREDATOR_SIZE = 0 if STAGE < 3 else 5 if STAGE < 4 else 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
-PREDATOR_MAX_SPEED = 2.5
+PREDATOR_MAX_SPEED = 2.5 if STAGE < 3 else 3.0
 POP_ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
 RND_POS_PADDING = POP_RADIUS + POP_ALERT_RADIUS  # 隨機取位邊距
 WALL_SIZE = 0
@@ -60,15 +66,15 @@ STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.25     # 近牆懲罰, 提早預警危險
 PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.25   # 近敵懲罰, 提早預警危險
 # 定義分享範圍 (例如感知半徑) 與獎勵值
-SOCIAL_RANGE = POP_PERCEPTION_RADIUS 
-SOCIAL_REWARD_VALUE = FOOD_REWARD * 0.25  # 分享 25% 的喜悅
+# SOCIAL_RANGE = POP_PERCEPTION_RADIUS 
+# SOCIAL_REWARD_VALUE = FOOD_REWARD * 0.25  # 分享 25% 的喜悅
 
 # 模型核心參數
-GAMMA = 0.99
+GAMMA = 0.97
 TAU = 0.005     # 軟更新係數
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
-MEMORY_SIZE = 100000
+MEMORY_SIZE = 200000
 REPLAY_BATCH_SIZE = 256
 FEAT_IN_DIM = 8         # 每個物件特微 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
 STATE_IN_DIM = 3        # 自身狀態 [速度, 轉向, 能量]
@@ -77,7 +83,7 @@ HIDDEN_FEAT_DIM = 64    # 特徵提取層 (Conv1d) 的輸出維度(環境特徵)
 HIDDEN_ATTN_DIM = 32    # Attention 內部的隱藏層維度
 HIDDEN_FC_DIM = 256     # 後段全連接層 (MLP) 的主要維度(決策輸出)
 CRITIC_OUT_DIM = 64     # Critic 輸出前的降維層
-TARGET_ENTROPY = -ACTOR_OUT_DIM+1
+TARGET_ENTROPY =  -ACTOR_OUT_DIM + (1 if STAGE < 3 else 0)
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.0001
 MAX_OBJ = 100    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
@@ -211,18 +217,23 @@ class ReplayMemory:
         self.idx = 0
         self.size = 0
 
-    def push(self, m_s, s_s, action, reward, n_m_s, n_s_s, done):
-        self.m_states[self.idx].copy_(m_s.detach())
-        self.s_states[self.idx].copy_(s_s.detach())
-        self.next_m_states[self.idx].copy_(n_m_s.detach())
-        self.next_s_states[self.idx].copy_(n_s_s.detach())
-        self.actions[self.idx].copy_(action.detach())
-        self.rewards[self.idx] = float(reward)
-        self.dones[self.idx] = float(done)
+    def push(self, n, m_s, s_s, action, reward, n_m_s, n_s_s, done):
+        # 計算寫入範圍的索引
+        indices = torch.arange(self.idx, self.idx + n, device=DEVICE) % self.capacity
         
-        self.idx = (self.idx + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
+        # 批次寫入
+        self.m_states[indices] = m_s.detach()
+        self.s_states[indices] = s_s.detach()
+        self.next_m_states[indices] = n_m_s.detach()
+        self.next_s_states[indices] = n_s_s.detach()
+        self.actions[indices] = action.detach()
+        self.rewards[indices] = reward.detach().float()
+        self.dones[indices] = done.detach().float()
+        
+        # 更新指針與當前大小
+        self.idx = (self.idx + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+        
     def sample(self, batch_size):
         indices = torch.randint(0, self.size, (batch_size,), device=DEVICE)
         return (
@@ -460,7 +471,7 @@ class RLSimulation:
 
         # 初始化神經網路
         self.init_network(Actor, Critic)
-        self.load_state()
+        self.load_state(load_memory=not args.demo)
         self.reset_env()
 
         # 四類環境物件的 one-hot 編碼
@@ -528,6 +539,7 @@ class RLSimulation:
     def reset_env(self):
         self.throttle_factor = POP_MAX_SPEED * POP_DAMPING_FACTOR
         self.frames = 0
+        self.energy_avg = 0.0
         self.rewards_avg = 0.0
         self.killed = 0
         self.collided = 0
@@ -545,7 +557,7 @@ class RLSimulation:
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=DEVICE) - 0.5) * 3.5
-        self.food_pos = self.get_risky_pos(FOOD_SIZE, 0.0)
+        self.food_pos = self.get_risky_pos(FOOD_SIZE, 0.0) if FOOD_RESPAWN_NEARBY_PREDATOR else self.respawn_food(FOOD_SIZE)
         self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
     
     def init_network(self, actor=None, critic=None):
@@ -712,6 +724,12 @@ class RLSimulation:
 
         # 構建物理特徵 (Cos, Sin, Dist, Energy) -> (N, 4, Total_D)
         mask_d = ((dist_d - POP_RADIUS - self.dynamic_radii) < POP_PERCEPTION_RADIUS).float()
+        # --- 新增：過濾隊友邏輯 ---
+        if not POP_PERCEPT_TEAM:
+            # 將前 POP_SIZE 個物件（隊友）的 Mask 強制設為 0
+            # 這樣 Agent 就不會「看見」任何隊友的物理與類型特徵
+            mask_d[:, 0:POP_SIZE] = 0.0
+        # ------------------------
         phys_d = torch.stack([
             torch.cos(rel_ang_d), 
             torch.sin(rel_ang_d), 
@@ -846,7 +864,10 @@ class RLSimulation:
                 # # --------------------------------------------
 
                 # 更新食物座標
-                self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
+                if FOOD_RESPAWN_NEARBY_PREDATOR:
+                    self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
+                else:
+                    self.food_pos[f_idx] = self.respawn_food(len(f_idx))
                 self.eaten += len(f_idx)
 
         # 能量消耗
@@ -861,20 +882,37 @@ class RLSimulation:
         # --- 移動獎勵計算 ---
         # 1. 有效前進速度
         self.forward_speed = torch.linalg.vecdot(self.vel, pop_vecs)
+        # 2. 前進純度
+        vel_mag = torch.norm(self.vel, dim=1, keepdim=True) + 1e-6
+        vel_purity = torch.relu(torch.linalg.vecdot(self.vel / vel_mag, pop_vecs))
         # 2. 基礎移動獎勵
-        move_reward =  MOVE_REWARD * 3.5 * (torch.relu(self.forward_speed) / POP_MAX_SPEED)
-        # 4. 控制油門效率懲罰
-        throttle_penalty = MOVE_REWARD * 0.05 * (torch.exp(torch.relu(torch.abs(throttle_vals) - 0.75) * 3.0) - 1.0)
-        # 5. 轉向懲罰
-        speed_ratio = torch.clamp(self.forward_speed / POP_MAX_SPEED, min=0.0, max=1.0)
-        steer_ratio = torch.abs(steer_vals)
-        steer_penalty = MOVE_REWARD * 6.5 * torch.pow(speed_ratio * steer_ratio, 2)
-        # 6. 動作變動量懲罰 (要求動作平滑度)
+        move_reward =  MOVE_REWARD * 2.5 * (torch.relu(self.forward_speed) / POP_MAX_SPEED) * vel_purity
+        # 如果「側滑」太嚴重（速度方向與車頭方向不一），直接扣除所有移動獎勵
+        # 我們定義一個「有效係數」，如果 purity < 0.8，move_reward 快速衰減
+        eff_move_factor = torch.pow(vel_purity, 4) # 0.8^4 剩下約 0.4，0.7^4 剩下 0.24
+        move_reward = move_reward * eff_move_factor
+        # 3. 動作變動量懲罰 (要求動作平滑度)
         action_diff = actions - self.last_actions
-        smooth_penalty = MOVE_REWARD * 0.05 * torch.sum((action_diff).pow(2), dim=1)
-        # 7. 整合獎勵
-        total_step_reward = move_reward - throttle_penalty - steer_penalty - smooth_penalty
-        # print(f" move:{self.forward_speed.item():.4f},{move_reward.item():.4f} throttle:{torch.abs(throttle_vals).item():.2f},-{throttle_penalty.item():.4f} smooth:{torch.sum(action_diff).item():.2f},-{smooth_penalty.item():.4f} steer:{steer_vals.item():.2f},-{steer_penalty.item():.4f} total:{total_step_reward.item():.4f}")
+        smooth_penalty = MOVE_REWARD * 0.2 * torch.mean((action_diff).pow(2), dim=1)
+        # 4. 控制油門效率懲罰
+        abs_throttle = torch.abs(throttle_vals)
+        throttle_penalty = MOVE_REWARD * 0.2 * torch.relu(abs_throttle - 0.75)
+        # 5. 轉向懲罰
+        steer_penalty = MOVE_REWARD * 0.3 * torch.pow(steer_vals * throttle_vals, 2)
+        # 5. 角速度懲罰，如果原地轉圈(forward_speed小)，但steer大，扣分加劇
+        # 引入【旋轉臨界懲罰】：當夾角過大(purity過低)，懲罰指數級上升
+        # 當 purity=1.0 時，bonus_spin=0；當 purity=0.8 時，開始劇烈扣分
+        purity_gap = torch.relu(0.95 - vel_purity)
+        spinning_bonus = MOVE_REWARD * 5.0 * torch.pow(purity_gap, 2) * torch.abs(steer_vals)
+        spinning_penalty = MOVE_REWARD * 3.0 * torch.pow(steer_vals, 2) * (1.0 - vel_purity)
+        # 6. 整合獎勵
+        total_step_reward = move_reward - smooth_penalty - throttle_penalty - steer_penalty - spinning_penalty - spinning_bonus
+        # print(f'move:{self.forward_speed.item():.2f}|{vel_purity.item():.2f}|{eff_move_factor.item():.2f}|{move_reward.item()/1e-4:.0f} '
+        #       f'smooth:{torch.sum(action_diff.abs()).item():.2f}|{smooth_penalty.item()/1e-4:.0f} '
+        #       f'throttle:{abs_throttle.item():.2f}|{throttle_penalty.item()/1e-4:.0f} '
+        #       f'steer:{steer_vals.item():.2f}|{steer_penalty.item()/1e-4:.0f} '
+        #       f'spinning:{spinning_bonus.item()/1e-4:.0f}|{spinning_penalty.item()/1e-4:.0f} '
+        #       f'total:{total_step_reward.item()/1e-4:.0f}')
         rewards += total_step_reward * self.alive.float()
 
         # 近牆痛覺
@@ -895,18 +933,17 @@ class RLSimulation:
         self.last_actions = actions.detach().clone()
         next_states = self.last_states = self.get_states()
 
-        # 把經驗推入 Replay Buffer
-        for i in range(POP_SIZE):
-            if not was_alive[i]: 
-                continue # 忽略死屍的經驗
+        # 把經驗推入 Replay Buffer, 忽略死屍的經驗
+        if was_alive.any():
             self.memory.push(
-                current_states[0][i],
-                current_states[1][i],
-                actions[i], 
-                rewards[i], 
-                next_states[0][i], 
-                next_states[1][i], 
-                dead_mask[i]
+                was_alive.sum(),
+                current_states[0][was_alive],
+                current_states[1][was_alive],
+                actions[was_alive], 
+                rewards[was_alive], 
+                next_states[0][was_alive], 
+                next_states[1][was_alive], 
+                dead_mask[was_alive]
             )
 
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
@@ -918,6 +955,7 @@ class RLSimulation:
             self.vel[indices] = 0.0
 
         self.respawn_timer[~self.alive] -= 1
+        self.energy_avg = self.energy_avg * 0.99 + (self.energy.sum().item() / POP_SIZE) * 0.01
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
         self.killed += killed.sum().item()
         self.collided += collided.sum().item()
@@ -1023,14 +1061,13 @@ class RLSimulation:
 
         return pos, vel
     
-    def respawn_food(self, f_idx):
-        num_to_respawn = len(f_idx)
+    def respawn_food(self, n):
         pad = RND_POS_PADDING
         num_samples = 30  # 增加採樣數，以利從「前幾名」中挑選
         top_k = 5        # 從距離最遠的前 5 名中隨機選一個
         
         # 1. 生成隨機候選點 [num_eaten, num_samples, 2]
-        candidates = torch.rand((num_to_respawn, num_samples, 2), device=DEVICE)
+        candidates = torch.rand((n, num_samples, 2), device=DEVICE)
         candidates[..., 0] = candidates[..., 0] * (SCREEN_W - 2*pad) + pad
         candidates[..., 1] = candidates[..., 1] * (SCREEN_H - 2*pad) + pad
 
@@ -1056,11 +1093,11 @@ class RLSimulation:
         
         # 6. 從這 K 個最遠的點中，為每個食物隨機選一個索引
         # 這樣可以增加食物分佈的多樣性，避免食物總是堆在同一個角落
-        rand_pick = torch.randint(0, top_k, (num_to_respawn,), device=DEVICE)
-        final_indices = top_indices[torch.arange(num_to_respawn), rand_pick]
+        rand_pick = torch.randint(0, top_k, (n,), device=DEVICE)
+        final_indices = top_indices[torch.arange(n), rand_pick]
         
         # 取得最終座標
-        final_pos = candidates[torch.arange(num_to_respawn), final_indices]
+        final_pos = candidates[torch.arange(n), final_indices]
 
         return final_pos
 
@@ -1085,12 +1122,14 @@ class RLSimulation:
                 'next_s_states': self.memory.next_s_states,
                 'actions': self.memory.actions,
                 'rewards': self.memory.rewards,
-                'dones': self.memory.dones
+                'dones': self.memory.dones,
+                'idx': self.memory.idx,
+                'size': self.memory.size
             }, f'{BASE_PATH}/{script_name}_memory.pt')
 
         self.print_info(True)
 
-    def load_state(self):
+    def load_state(self, load_memory=True):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE, weights_only=False)
@@ -1107,20 +1146,23 @@ class RLSimulation:
             except Exception as e:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
-        memory_path = f'{BASE_PATH}/{script_name}_memory.pt'
-        if os.path.exists(memory_path):
-            try:
-                state = torch.load(memory_path, map_location=DEVICE, weights_only=False)
-                self.memory.m_states = state['m_states']
-                self.memory.s_states = state['s_states']
-                self.memory.next_m_states = state['next_m_states']
-                self.memory.next_s_states = state['next_s_states']
-                self.memory.actions = state['actions']
-                self.memory.rewards = state['rewards']
-                self.memory.dones = state['dones']
-                print(f"--- [Loaded] memory {memory_path}, size {len(self.memory)} ---")
-            except Exception as e:
-                print(f"--- [Error] memory loading failed: {e} ---")
+        if load_memory:
+            memory_path = f'{BASE_PATH}/{script_name}_memory.pt'
+            if os.path.exists(memory_path):
+                try:
+                    state = torch.load(memory_path, map_location=DEVICE, weights_only=False)
+                    self.memory.m_states = state['m_states']
+                    self.memory.s_states = state['s_states']
+                    self.memory.next_m_states = state['next_m_states']
+                    self.memory.next_s_states = state['next_s_states']
+                    self.memory.actions = state['actions']
+                    self.memory.rewards = state['rewards']
+                    self.memory.dones = state['dones']
+                    self.memory.idx = state['idx']
+                    self.memory.size = state['size']
+                    print(f"--- [Loaded] memory {memory_path}, size {len(self.memory):,} ---")
+                except Exception as e:
+                    print(f"--- [Error] memory loading failed: {e} ---")
 
     def draw(self, draw_label, draw_units, draw_perception, draw_alert, verbose):
         self.fbo.use()
@@ -1323,6 +1365,7 @@ class RLSimulation:
                     ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
                 ]
             left_labels.extend([
+                ("Energy:", f"{self.energy_avg:.0f}", THEME["success"] if self.energy_avg > 0 else (255, 0, 0), False),
                 ("Rewards:", f"{self.rewards_avg:.4f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
                 ("Eaten:", f"{self.eaten:,}", THEME["success"], False),
                 ("Killed:", f"{self.killed:,}", THEME["loss"], False),
@@ -1347,7 +1390,7 @@ class RLSimulation:
         draw_units = True
         draw_alert = False
         draw_perception = False
-        move_food = True
+        move_food = MOVE_FOOD
         move_predator = True
         verbose = 0
         video_thread = None
@@ -1366,10 +1409,11 @@ class RLSimulation:
             )
             video_thread.start()
             print(f"開始錄影...")
-        def stop_record():
+        def stop_record(wait=False):
             nonlocal video_thread, frame_queue
             frame_queue.put(None)
-            video_thread = None
+            if wait:
+                video_thread.join()
 
         if args.record:
             start_record()
@@ -1457,11 +1501,10 @@ class RLSimulation:
             except KeyboardInterrupt:
                 running = False
 
-        if video_thread and video_thread.is_alive():
-            stop_record()
-
         if training:
             self.save_state(save_memory=True)
+        if video_thread and video_thread.is_alive():
+            stop_record(True)
 
         if not args.headless:
             pygame.quit()
@@ -1494,9 +1537,9 @@ class RLSimulation:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if training:
             info = self.last_info
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Frames:{self.frames:,} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
@@ -1507,6 +1550,7 @@ if __name__ == "__main__":
     parser.add_argument("--headless", action="store_true", default=False, help="無頭模式")
     args = parser.parse_args()
     
+    print(f'訓練階段：{STAGE}')
     print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
     print(f'最大速度：{POP_MAX_SPEED:.2f} 最大步數：{EST_STEPS:.2f}')
     print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
