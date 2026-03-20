@@ -27,7 +27,7 @@ SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 1
+STAGE = 4
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
@@ -1533,8 +1533,8 @@ class RLSimulation:
             self.writer.add_scalar('Train/Alpha', info['alpha'], self.steps)
             self.writer.add_scalar('Train/Entropy', info['entropy'], self.steps)
             self.writer.add_scalar('Train/Q-Value', info['q_val'], self.steps)
-            self.writer.add_scalar('Train/Critic', info['c_loss'], self.steps)
-            self.writer.add_scalar('Train/Actor', info['a_loss'], self.steps)
+            self.writer.add_scalar('Train/C-Loss', info['c_loss'], self.steps)
+            self.writer.add_scalar('Train/A-Loss', info['a_loss'], self.steps)
             self.writer.add_scalar('Env/FPS', self.fps_avg, self.steps)
             self.writer.add_scalar('Env/Rewards', self.rewards_avg, self.steps)
             self.writer.add_scalar('Env/Energy', self.energy_avg, self.steps)
