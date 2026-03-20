@@ -27,13 +27,13 @@ SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 5
+STAGE = 4
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 POP_MAX_SPEED = 3.5
 # 生存難度系數
-STAGE_SURVIVAL_MULTIPLIER = 10 if STAGE == 1 else 3 if STAGE == 2 else 2 if STAGE == 3 else 1
+STAGE_SURVIVAL_MULTIPLIER = 10 if STAGE < 2 else 3 if STAGE < 3 else 2 if STAGE < 4 else 1
 EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED * STAGE_SURVIVAL_MULTIPLIER # 根據速度與「生存者需跑完對角線 71.5%」的目標，推算出所需步數
 POP_SIZE = 50
 POP_RADIUS = 4                      # 生存者體積半徑
@@ -41,8 +41,8 @@ POP_DAMPING_FACTOR = 0.25           # 阻力系數，越高越需要維持高油
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
 POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
-POP_PERCEPT_TEAM = False if STAGE == 1 else True  # 是否將隊友加入環境特徵
-FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE == 1 else 0.75 if STAGE < 4 else 0.5 if STAGE < 5 else 0.3))
+POP_PERCEPT_TEAM = False if STAGE < 2 else True  # 是否將隊友加入環境特徵
+FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE < 2 else 0.75 if STAGE < 4 else 0.5))
 FOOD_RADIUS = 3         # 食物觸碰半徑
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 25.0      # 食物補充能量
