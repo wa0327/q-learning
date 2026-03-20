@@ -27,7 +27,7 @@ SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 1
+STAGE = 4
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
@@ -1137,9 +1137,9 @@ class RLSimulation:
                 self.actor_opt.load_state_dict(state['actor_opt'])
                 self.critic_opt.load_state_dict(state['critic_opt'])
                 self.alpha_opt.load_state_dict(state['alpha_opt'])
-                print(f"--- [Loaded] brain weights {SAVE_PATH} ---")
+                print(f"--- [Loaded] brain weights {SAVE_PATH}, steps {self.total_steps:,} ---")
             except Exception as e:
-                print(f"--- [Error] brain weights loading failed: {e}, steps {self.total_steps:,} ---")
+                print(f"--- [Error] brain weights loading failed: {e} ---")
 
         if not args.demo:
             memory_path = SAVE_MEM_PATH
@@ -1344,21 +1344,23 @@ class RLSimulation:
         render_label_column(right_labels, label_x=SCREEN_W - 70, value_anchor_x=SCREEN_W - 10)
 
         if draw_label:
-            info = self.last_info
+            left_labels = [
+                ("Ttl Steps:", f"{self.total_steps:,}", THEME["perf"], True)
+            ]
             if args.demo:
-                left_labels = [
-                    ("Frames:", f"{self.frames:,}", THEME["perf"], True),
-                ]
+                left_labels.extend([
+                    ("Frames:", f"{self.frames:,}", THEME["perf"], True)
+                ])
             else:
-                left_labels = [
-                    ("Ttl Steps:", f"{self.total_steps:,}", THEME["perf"], True),
+                info = self.last_info
+                left_labels.extend([
                     ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
                     ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
                     ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
                     ("Q-Val:", f"{info['q_val']:.4f}", THEME["perf"], False),
                     ("C-Loss:", f"{info['c_loss']:.4f}", THEME["perf"], False),
-                    ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False),
-                ]
+                    ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False)
+                ])
             left_labels.extend([
                 ("Energy:", f"{self.energy_avg:.0f}", THEME["success"] if self.energy_avg > 0 else (255, 0, 0), False),
                 ("Rewards:", f"{self.rewards_avg:.4f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
@@ -1545,9 +1547,9 @@ class RLSimulation:
             self.writer.add_scalar('Env/Starved', self.starved, self.steps)
             self.writer.flush()
             
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
