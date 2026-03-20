@@ -1139,7 +1139,7 @@ class RLSimulation:
                 self.alpha_opt.load_state_dict(state['alpha_opt'])
                 print(f"--- [Loaded] brain weights {SAVE_PATH} ---")
             except Exception as e:
-                print(f"--- [Error] brain weights loading failed: {e} ---")
+                print(f"--- [Error] brain weights loading failed: {e}, steps {self.total_steps:,} ---")
 
         if not args.demo:
             memory_path = SAVE_MEM_PATH
