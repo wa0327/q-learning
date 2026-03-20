@@ -22,7 +22,8 @@ script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_PATH = f"weights/{script_name}"
-SAVE_PATH = f"{os.path.join(BASE_PATH, script_name)}.pt"
+SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
+SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
@@ -67,9 +68,6 @@ TIME_PENALTY_FACTOR = 0.15 # [餓死前的總懲罰]與[餓死懲罰]的佔比�
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.25     # 近牆懲罰, 提早預警危險
 PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.25   # 近敵懲罰, 提早預警危險
-# 定義分享範圍 (例如感知半徑) 與獎勵值
-SOCIAL_RANGE = POP_PERCEPTION_RADIUS 
-SOCIAL_REWARD_VALUE = FOOD_REWARD * 0.25  # 分享 25% 的喜悅
 
 # 模型核心參數
 GAMMA = 0.97
@@ -855,21 +853,6 @@ class RLSimulation:
                 self.energy.index_add_(0, a_idx, torch.full((num_eaten,), FOOD_ENERGY, device=DEVICE))
                 self.energy = torch.clamp(self.energy, max=MAX_ENERGY)
                 
-                # # --- [新增] Social Reward: 隊友吃飽，我也加分 ---
-                # # 計算所有 Agent 到「被吃掉食物」的距離 (N, eaten_count)
-                # # f_idx 是被吃掉的食物索引，a_idx 是吃掉它們的 Agent 索引
-                # dist_to_eaten_food = torch.cdist(self.pos, self.food_pos[f_idx])
-                # # 判定哪些 Agent 在被吃食物的範圍內
-                # in_social_range = dist_to_eaten_food < SOCIAL_RANGE
-                # in_social_range[a_idx, torch.arange(num_eaten, device=DEVICE)] = False
-                # # 只要 Agent 在任何一個被吃食物的範圍內，就給予獎勵
-                # social_mask = in_social_range.any(dim=1) & self.alive
-                # # 3. [關鍵] 計算自身能量需求因子
-                # # 能量越低，因子越大。例如：1.5 (極餓) 到 0.1 (極飽)
-                # energy_need_factor = 1.0 - (self.energy / MAX_ENERGY)
-                # rewards[social_mask] += SOCIAL_REWARD_VALUE * energy_need_factor[social_mask]
-                # # --------------------------------------------
-
                 # 更新食物座標
                 if FOOD_RESPAWN_NEARBY_PREDATOR:
                     self.food_pos[f_idx] = self.get_risky_pos(len(f_idx), 0.0)
@@ -1108,7 +1091,7 @@ class RLSimulation:
 
         return final_pos
 
-    def save_state(self, save_memory=False):
+    def save_state(self, save_memory=False, backup_memory=False):
         torch.save({
             'steps': self.steps,
             'actor': self.actor.state_dict(),
@@ -1132,7 +1115,9 @@ class RLSimulation:
                 'dones': self.memory.dones,
                 'idx': self.memory.idx,
                 'size': self.memory.size
-            }, f'{BASE_PATH}/{script_name}_memory.pt')
+            }, SAVE_MEM_PATH)
+            if backup_memory:
+                shutil.copy2(SAVE_MEM_PATH, f"{BASE_PATH}/{script_name}_{self.steps}_memory.pt")
 
         self.print_info(True)
 
@@ -1154,7 +1139,7 @@ class RLSimulation:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
         if load_memory:
-            memory_path = f'{BASE_PATH}/{script_name}_memory.pt'
+            memory_path = SAVE_MEM_PATH
             if os.path.exists(memory_path):
                 try:
                     state = torch.load(memory_path, map_location=DEVICE, weights_only=False)
@@ -1509,7 +1494,7 @@ class RLSimulation:
                 running = False
 
         if training:
-            self.save_state(save_memory=True)
+            self.save_state(save_memory=True, backup_memory=False if args.steps == float('inf') else True)
             self.writer.close()
         if video_thread and video_thread.is_alive():
             stop_record(True)
