@@ -16,15 +16,17 @@ import threading
 import queue
 import argparse
 import shlex
+from torch.utils.tensorboard import SummaryWriter
 
 script_name = Path(__file__).stem
 CAPTION = "Vectra: Apex Protocol"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_PATH = f"weights/{script_name}"
-SAVE_PATH = f"{BASE_PATH}/{script_name}.pt"
+SAVE_PATH = f"{os.path.join(BASE_PATH, script_name)}.pt"
+LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 4
+STAGE = 5
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
@@ -39,7 +41,7 @@ POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
 POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
 POP_PERCEPT_TEAM = False if STAGE == 1 else True  # 是否將隊友加入環境特徵
-FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE == 1 else 0.75 if STAGE < 4 else 0.5))
+FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE == 1 else 0.75 if STAGE < 4 else 0.5 if STAGE < 5 else 0.3))
 FOOD_RADIUS = 3         # 食物觸碰半徑
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 25.0      # 食物補充能量
@@ -49,7 +51,7 @@ FOOD_RESPAWN_NEARBY_PREDATOR = False if STAGE < 4 else True
 PREDATOR_SIZE = 0 if STAGE < 3 else 5 if STAGE < 4 else 8
 PREDATOR_RADIUS = 20.0  # 掠食者觸碰半徑
 PREDATOR_MIN_SPEED = 1.5
-PREDATOR_MAX_SPEED = 2.5 if STAGE < 3 else 3.0
+PREDATOR_MAX_SPEED = 2.5 if STAGE < 3 else 3.0 if STAGE < 4 else 3.4
 POP_ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58) # 危險警戒半徑，按速度比例呈線性增減
 RND_POS_PADDING = POP_RADIUS + POP_ALERT_RADIUS  # 隨機取位邊距
 WALL_SIZE = 0
@@ -66,8 +68,8 @@ STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.25     # 近牆懲罰, 提早預警危險
 PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.25   # 近敵懲罰, 提早預警危險
 # 定義分享範圍 (例如感知半徑) 與獎勵值
-# SOCIAL_RANGE = POP_PERCEPTION_RADIUS 
-# SOCIAL_REWARD_VALUE = FOOD_REWARD * 0.25  # 分享 25% 的喜悅
+SOCIAL_RANGE = POP_PERCEPTION_RADIUS 
+SOCIAL_REWARD_VALUE = FOOD_REWARD * 0.25  # 分享 25% 的喜悅
 
 # 模型核心參數
 GAMMA = 0.97
@@ -468,6 +470,11 @@ class RLSimulation:
         
         path = Path(BASE_PATH)
         path.mkdir(parents=True, exist_ok=True)
+        if not args.demo:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            name = f'{timestamp}_{args.steps}' if args.steps != float('inf') else timestamp
+            log_dir = os.path.join(LOG_PATH, name)
+            self.writer = SummaryWriter(log_dir=log_dir)
 
         # 初始化神經網路
         self.init_network(Actor, Critic)
@@ -1503,6 +1510,7 @@ class RLSimulation:
 
         if training:
             self.save_state(save_memory=True)
+            self.writer.close()
         if video_thread and video_thread.is_alive():
             stop_record(True)
 
@@ -1537,6 +1545,20 @@ class RLSimulation:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if training:
             info = self.last_info
+            self.writer.add_scalar('Train/FPS', self.fps_avg, self.steps)
+            self.writer.add_scalar('Train/Alpha', info['alpha'], self.steps)
+            self.writer.add_scalar('Train/Entropy', info['entropy'], self.steps)
+            self.writer.add_scalar('Train/Q-Value', info['q_val'], self.steps)
+            self.writer.add_scalar('Train/Critic', info['c_loss'], self.steps)
+            self.writer.add_scalar('Train/Actor', info['a_loss'], self.steps)
+            self.writer.add_scalar('Train/Rewards', self.rewards_avg, self.steps)
+            self.writer.add_scalar('Env/Energy', self.energy_avg, self.steps)
+            self.writer.add_scalar('Env/Eaten', self.eaten, self.steps)
+            self.writer.add_scalar('Env/Killed', self.killed, self.steps)
+            self.writer.add_scalar('Env/Collided', self.collided, self.steps)
+            self.writer.add_scalar('Env/Starved', self.starved, self.steps)
+            self.writer.flush()
+            
             print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
             print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
