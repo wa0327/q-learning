@@ -1434,10 +1434,10 @@ class RLSimulation:
                                 self.fps -= 1
                                 self.update_caption()
                             elif event.key == pygame.K_EQUALS:
-                                self.fps = 300
+                                self.fps += 10
                                 self.update_caption()
                             elif event.key == pygame.K_MINUS:
-                                self.fps = 1
+                                self.fps -= 10
                                 self.update_caption()
                             elif event.key == pygame.K_z:
                                 self.reset_env()
