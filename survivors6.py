@@ -27,7 +27,7 @@ SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 4
+STAGE = 1
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
@@ -450,6 +450,7 @@ class GLRenderer:
 # --- 模擬環境 ---
 class RLSimulation:
     def __init__(self, args):
+        self.args = args
         self.fps = 300
         pygame.init()
         if not args.headless:
@@ -470,13 +471,13 @@ class RLSimulation:
         path.mkdir(parents=True, exist_ok=True)
         if not args.demo:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name = f'{timestamp}_{args.steps}' if args.steps != float('inf') else timestamp
+            name = f'{timestamp}_{args.epoch}' if args.epoch else timestamp
             log_dir = os.path.join(LOG_PATH, name)
             self.writer = SummaryWriter(log_dir=log_dir)
 
         # 初始化神經網路
         self.init_network(Actor, Critic)
-        self.load_state(load_memory=not args.demo)
+        self.load_state()
         self.reset_env()
 
         # 四類環境物件的 one-hot 編碼
@@ -572,6 +573,7 @@ class RLSimulation:
             critic = self.critic.__class__
 
         self.steps = 0
+        self.total_steps = 0
         
         self.actor = actor().to(DEVICE)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
@@ -667,6 +669,7 @@ class RLSimulation:
             "a_loss": actor_loss.item()
         }
         self.steps += 1
+        self.total_steps += 1
         return True
     
     def get_states(self):
@@ -1091,9 +1094,9 @@ class RLSimulation:
 
         return final_pos
 
-    def save_state(self, save_memory=False, backup_memory=False):
+    def save_state(self):
         torch.save({
-            'steps': self.steps,
+            'steps': self.total_steps,
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'critic_target': self.critic_target.state_dict(),
@@ -1102,30 +1105,30 @@ class RLSimulation:
             'critic_opt': self.critic_opt.state_dict(),
             'alpha_opt': self.alpha_opt.state_dict(),
         }, SAVE_PATH)
-        shutil.copy2(SAVE_PATH, f"{BASE_PATH}/{script_name}_{self.steps}.pt")
+        if self.args.epoch:
+            shutil.copy2(SAVE_PATH, f"{BASE_PATH}/{script_name}_{self.args.epoch}.pt")
 
-        if save_memory:
-            torch.save({
-                'm_states': self.memory.m_states,
-                's_states': self.memory.s_states,
-                'next_m_states': self.memory.next_m_states,
-                'next_s_states': self.memory.next_s_states,
-                'actions': self.memory.actions,
-                'rewards': self.memory.rewards,
-                'dones': self.memory.dones,
-                'idx': self.memory.idx,
-                'size': self.memory.size
-            }, SAVE_MEM_PATH)
-            if backup_memory:
-                shutil.copy2(SAVE_MEM_PATH, f"{BASE_PATH}/{script_name}_{self.steps}_memory.pt")
+        torch.save({
+            'm_states': self.memory.m_states,
+            's_states': self.memory.s_states,
+            'next_m_states': self.memory.next_m_states,
+            'next_s_states': self.memory.next_s_states,
+            'actions': self.memory.actions,
+            'rewards': self.memory.rewards,
+            'dones': self.memory.dones,
+            'idx': self.memory.idx,
+            'size': self.memory.size
+        }, SAVE_MEM_PATH)
+        if self.args.epoch:
+            shutil.copy2(SAVE_MEM_PATH, f"{BASE_PATH}/{script_name}_{self.args.epoch}_memory.pt")
 
         self.print_info(True)
 
-    def load_state(self, load_memory=True):
+    def load_state(self):
         if os.path.exists(SAVE_PATH):
             try:
                 state = torch.load(SAVE_PATH, map_location=DEVICE, weights_only=False)
-                self.steps = state['steps']
+                self.total_steps = state['steps']
                 self.actor.load_state_dict(state['actor'])
                 self.critic.load_state_dict(state['critic'])
                 self.critic_target.load_state_dict(state['critic_target'])
@@ -1134,11 +1137,11 @@ class RLSimulation:
                 self.actor_opt.load_state_dict(state['actor_opt'])
                 self.critic_opt.load_state_dict(state['critic_opt'])
                 self.alpha_opt.load_state_dict(state['alpha_opt'])
-                print(f"--- [Loaded] brain weights {SAVE_PATH}, steps {self.steps:,} ---")
+                print(f"--- [Loaded] brain weights {SAVE_PATH} ---")
             except Exception as e:
                 print(f"--- [Error] brain weights loading failed: {e} ---")
 
-        if load_memory:
+        if not args.demo:
             memory_path = SAVE_MEM_PATH
             if os.path.exists(memory_path):
                 try:
@@ -1348,7 +1351,7 @@ class RLSimulation:
                 ]
             else:
                 left_labels = [
-                    ("Steps:", f"{self.steps:,}", THEME["perf"], True),
+                    ("Ttl Steps:", f"{self.total_steps:,}", THEME["perf"], True),
                     ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
                     ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
                     ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
@@ -1469,9 +1472,7 @@ class RLSimulation:
                     if self.steps >= args.steps:
                         running = False
                     elif updated:
-                        if self.steps % 5000 == 0:
-                            self.save_state()
-                        elif self.steps % 1000 == 0:
+                        if self.steps % 1000 == 0:
                             self.print_info(True)
                     else:
                         if self.frames % 1000 == 0:
@@ -1494,7 +1495,7 @@ class RLSimulation:
                 running = False
 
         if training:
-            self.save_state(save_memory=True, backup_memory=False if args.steps == float('inf') else True)
+            self.save_state()
             self.writer.close()
         if video_thread and video_thread.is_alive():
             stop_record(True)
@@ -1530,12 +1531,12 @@ class RLSimulation:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if training:
             info = self.last_info
+            self.writer.add_scalar('System/FPS', self.fps_avg, self.steps)
             self.writer.add_scalar('Train/Alpha', info['alpha'], self.steps)
             self.writer.add_scalar('Train/Entropy', info['entropy'], self.steps)
             self.writer.add_scalar('Train/Q-Value', info['q_val'], self.steps)
             self.writer.add_scalar('Train/C-Loss', info['c_loss'], self.steps)
             self.writer.add_scalar('Train/A-Loss', info['a_loss'], self.steps)
-            self.writer.add_scalar('Env/FPS', self.fps_avg, self.steps)
             self.writer.add_scalar('Env/Rewards', self.rewards_avg, self.steps)
             self.writer.add_scalar('Env/Energy', self.energy_avg, self.steps)
             self.writer.add_scalar('Env/Eaten', self.eaten, self.steps)
@@ -1550,6 +1551,7 @@ class RLSimulation:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
+    parser.add_argument("-e", "--epoch", type=str, default=None, help="一個訓練週期")
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
     parser.add_argument("--demo", action="store_true", default=False, help="模型性能展示")
@@ -1559,10 +1561,10 @@ if __name__ == "__main__":
     
     print(f'訓練階段：{STAGE}')
     print(f'環境大小：{SCREEN_W} x {SCREEN_H}')
-    print(f'最大速度：{POP_MAX_SPEED:.2f} 最大步數：{EST_STEPS:.2f}')
-    print(f'預警半徑：{POP_ALERT_RADIUS:.2f}')
-    print(f'每步耗能：{ENERGY_DECAY:.4f}')
-    print(f'每步獎懲：{STEP_REWARD:.4f}')
-    print(f'移動獎懲：{MOVE_REWARD:.4f}')
+    print(f'代理數量：{POP_SIZE} 代理速度：{POP_MAX_SPEED:.2f} 最大步數：{EST_STEPS:.2f}')
+    print(f'預警半徑：{POP_ALERT_RADIUS:.2f} 每步耗能：{ENERGY_DECAY:.4f}')
+    print(f'食物數量：{FOOD_SIZE} 食物能量：{FOOD_ENERGY}')
+    print(f'天敵數量：{PREDATOR_SIZE} 天敵速度：{PREDATOR_MIN_SPEED:.1f}~{PREDATOR_MAX_SPEED:.1f}')
+    print(f'每步獎懲：{STEP_REWARD:.4f} 移動獎懲：{MOVE_REWARD:.4f}')
     sim = RLSimulation(args)
     sim.run(args)
