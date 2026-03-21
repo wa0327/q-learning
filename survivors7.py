@@ -75,7 +75,7 @@ TAU = 0.005     # 軟更新係數
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
 MEMORY_SIZE = 50000
-REPLAY_BATCH_SIZE = 256
+REPLAY_BATCH_SIZE = 128
 FEAT_IN_DIM = 8         # 每個物件特微 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
 STATE_IN_DIM = 3        # 自身狀態 [速度, 轉向, 能量]
 ACTOR_OUT_DIM = 2       # Actor 輸出層數，輸出動作 [轉向, 油門]
@@ -86,7 +86,7 @@ CRITIC_OUT_DIM = 64     # Critic 輸出前的降維層
 TARGET_ENTROPY =  -ACTOR_OUT_DIM + (1 if STAGE < 3 else 0)
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.0001
-MAX_OBJ = 20    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
+MAX_OBJ = 10    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
 HIDDEN_EMB_DIM = 8 # 編碼維度 8
 SEQ_LEN = 16
 
@@ -108,37 +108,30 @@ class Actor(nn.Module):
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        self.agent_emb = nn.Embedding(POP_SIZE, HIDDEN_EMB_DIM)
-        
         # 3. 短期記憶層
-        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM + HIDDEN_EMB_DIM, HIDDEN_FC_DIM, batch_first=True)
+        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM, batch_first=True)
         
-        # 4. 輸出層 (SAC 需要 Mean 與 Log_Std)
+        # 4. 輸出層
         self.mu = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         self.log_std = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
-    def forward(self, m_in, s_in, hidden=None, agent_id=None, deterministic=False, with_logprob=True):
+    def forward(self, m_in, s_in, hidden, deterministic=False, with_logprob=True):
         is_seq = (m_in.dim() == 4)
         if is_seq:
             B, L, f, O = m_in.shape
             m_in = m_in.view(B * L, f, O)
             s_in = s_in.view(B * L, -1)
-            # 將 agent_id [B] 擴展為序列長度 [B*L]
-            id_feat = self.agent_emb(agent_id).unsqueeze(1).expand(-1, L, -1).reshape(B * L, -1)
-        else:
-            # 推理模式，agent_id 為 [POP_SIZE]
-            id_feat = self.agent_emb(agent_id)
-
+        
         # --- 空間特徵聚合 ---
         feat = F.relu(self.conv(m_in)).transpose(1, 2)
         weights = F.softmax(self.attn_weights(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 結合自身狀態 + 身分特徵 [B(*L), Dim + State + Emb]
-        combined = torch.cat([x_attn, s_in, id_feat], dim=-1)
+        # 結合自身狀態 [B(*L), Dim + State]
+        combined = torch.cat([x_attn, s_in], dim=-1)
         
         # --- 記憶處理 ---
         if is_seq:
@@ -186,11 +179,8 @@ class Critic(nn.Module):
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        # 身分嵌入
-        self.agent_emb = nn.Embedding(POP_SIZE, HIDDEN_EMB_DIM)
-        
-        # GRU 輸入維度同步增加
-        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM + HIDDEN_EMB_DIM, HIDDEN_FC_DIM, batch_first=True)
+        # GRU
+        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM, batch_first=True)
 
         def build_q_head():
             return nn.Sequential(
@@ -202,22 +192,19 @@ class Critic(nn.Module):
         self.q1_head = build_q_head()
         self.q2_head = build_q_head()
 
-    def forward(self, m_in, s_in, action, hidden=None, agent_id=None):
+    def forward(self, m_in, s_in, action, hidden):
         is_seq = (m_in.dim() == 4)
         if is_seq:
             B, L, f, O = m_in.shape
             m_in = m_in.view(B * L, f, O)
             s_in = s_in.view(B * L, -1)
             action = action.view(B * L, -1)
-            id_feat = self.agent_emb(agent_id).unsqueeze(1).expand(-1, L, -1).reshape(B * L, -1)
-        else:
-            id_feat = self.agent_emb(agent_id)
 
         feat = self.conv(m_in).transpose(1, 2)
         weights = F.softmax(self.attn(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        combined = torch.cat([x_attn, s_in, id_feat], dim=-1)
+        combined = torch.cat([x_attn, s_in], dim=-1)
         
         if is_seq:
             combined = combined.view(B, L, -1)
@@ -236,7 +223,7 @@ class Critic(nn.Module):
             q1, q2 = q1.view(B, L, -1), q2.view(B, L, -1)
             
         return q1, q2
-    
+
 class ReplayMemory:
     def __init__(self):
         self.m_states = torch.zeros((MEMORY_SIZE, POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
@@ -267,45 +254,56 @@ class ReplayMemory:
         self.size = min(self.size + 1, MEMORY_SIZE)
         
     def sample(self):
-        # 回傳維度需要是 [Batch, Seq_Len, ...]
-        v_m, v_s, v_a, v_r, v_nm, v_ns, v_d, v_ids = [], [], [], [], [], [], [], []
+        # 1. 稍微放大抽樣倍數，確保過濾後數量足夠
+        n_sample = REPLAY_BATCH_SIZE * 5 
         
-        while len(v_m) < REPLAY_BATCH_SIZE:
-            # 隨機抽一個時間點與一個 Agent
-            t = torch.randint(0, self.size - SEQ_LEN - 1, (1,), device=DEVICE).item()
-            a_idx = torch.randint(0, POP_SIZE, (1,), device=DEVICE).item()
-            
-            # 檢查這個 Agent 在這 16 步內是否連續存活
-            lifes = self.life_counters[t : t + SEQ_LEN, a_idx]
-            if not torch.all(lifes == lifes[0]):
-                continue
-            
-            starts = self.is_starts[t + 1 : t + SEQ_LEN, a_idx]
-            if torch.any(starts):
-                continue
-                
-            # 收集這個 Agent 的連續 16 步資料
-            v_m.append(self.m_states[t : t + SEQ_LEN, a_idx])
-            v_s.append(self.s_states[t : t + SEQ_LEN, a_idx])
-            v_a.append(self.actions[t : t + SEQ_LEN, a_idx])
-            v_r.append(self.rewards[t : t + SEQ_LEN, a_idx])
-            v_d.append(self.dones[t : t + SEQ_LEN, a_idx])
-            v_ids.append(self.agent_ids[t, a_idx]) # ID 只要一個
-            
-            # Next state 就是平移一格 (t+1 到 t+SEQ_LEN+1)
-            v_nm.append(self.m_states[t + 1 : t + SEQ_LEN + 1, a_idx])
-            v_ns.append(self.s_states[t + 1 : t + SEQ_LEN + 1, a_idx])
+        # 確保不會抽到超出邊界的 index
+        t_indices = torch.randint(0, self.size - SEQ_LEN - 1, (n_sample,), device=DEVICE)
+        a_indices = torch.randint(0, POP_SIZE, (n_sample,), device=DEVICE)
 
-        # 堆疊成 Batch
+        # 2. 向量化檢查
+        idx_range = torch.arange(SEQ_LEN + 1, device=DEVICE)
+        
+        # 檢查生命週期是否連續 (取 [t : t + SEQ_LEN + 1])
+        all_lifes = self.life_counters[t_indices.unsqueeze(1) + idx_range, a_indices.unsqueeze(1)]
+        is_life_valid = torch.all(all_lifes == all_lifes[:, :1], dim=1)
+
+        # 檢查是否包含重生點 (取 [t+1 : t + SEQ_LEN + 1])
+        all_starts = self.is_starts[t_indices.unsqueeze(1) + idx_range[1:], a_indices.unsqueeze(1)]
+        is_start_valid = ~torch.any(all_starts, dim=1)
+
+        valid_mask = is_life_valid & is_start_valid
+        
+        # 確保抓到的數量足夠，若不足則重複取用 (這比讓程式崩潰好)
+        valid_t = t_indices[valid_mask]
+        valid_a = a_indices[valid_mask]
+        
+        if len(valid_t) < REPLAY_BATCH_SIZE:
+            # 如果真的運氣太差，就從合格的裡面重複抽
+            fill_idx = torch.randint(0, len(valid_t), (REPLAY_BATCH_SIZE,), device=DEVICE)
+            final_t = valid_t[fill_idx]
+            final_a = valid_a[fill_idx]
+        else:
+            final_t = valid_t[:REPLAY_BATCH_SIZE]
+            final_a = valid_a[:REPLAY_BATCH_SIZE]
+
+        # 3. 建立序列索引
+        offsets = torch.arange(SEQ_LEN, device=DEVICE).view(1, -1)
+        t_seq = final_t.view(-1, 1) + offsets
+        a_seq = final_a.view(-1, 1).expand(-1, SEQ_LEN)
+
         return (
-            torch.stack(v_m), torch.stack(v_s), torch.stack(v_a), 
-            torch.stack(v_r), torch.stack(v_nm), torch.stack(v_ns), 
-            torch.stack(v_d), torch.stack(v_ids)
+            self.m_states[t_seq, a_seq],
+            self.s_states[t_seq, a_seq],
+            self.actions[t_seq, a_seq],
+            self.rewards[t_seq, a_seq],
+            self.m_states[t_seq + 1, a_seq],
+            self.s_states[t_seq + 1, a_seq],
+            self.dones[t_seq, a_seq]
         )
     
     def __len__(self):
         return self.size
-
 
 class GLRenderer:
     def __init__(self, ctx, fbo_texture, w, h):
@@ -661,7 +659,7 @@ class RLSimulation:
         if len(self.memory) < REPLAY_BATCH_SIZE:
             return False
         
-        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b, ids_b = self.memory.sample()
+        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample()
         r_b = r_b.unsqueeze(-1) # (B, L, 1)
         d_b = d_b.unsqueeze(-1) # (B, L, 1)
 
@@ -675,14 +673,14 @@ class RLSimulation:
 
         # --- 1. 更新 Critic ---
         with torch.no_grad():
-            next_actions, next_log_probs, _ = self.actor(nm_b, ns_b, h_actor, agent_id=ids_b)
-            q1_t, q2_t = self.critic_target(nm_b, ns_b, next_actions, h_critic_t, agent_id=ids_b)
+            next_actions, next_log_probs, _ = self.actor(nm_b, ns_b, h_actor)
+            q1_t, q2_t = self.critic_target(nm_b, ns_b, next_actions, h_critic_t)
             
             min_q_target = torch.min(q1_t, q2_t) - alpha * next_log_probs
             target_q = r_b + (GAMMA * (1.0 - d_b) * min_q_target)
 
         # q1_curr: (B, L, 1)
-        q1_curr, q2_curr = self.critic(m_b, s_b, a_b, h_critic, agent_id=ids_b)
+        q1_curr, q2_curr = self.critic(m_b, s_b, a_b, h_critic)
         
         # 序列訓練中，MSE 會在 (B, L) 上計算
         critic_loss = F.mse_loss(q1_curr, target_q) + F.mse_loss(q2_curr, target_q)
@@ -695,8 +693,8 @@ class RLSimulation:
         for param in self.critic.parameters():
             param.requires_grad = False
 
-        new_actions, log_probs, _ = self.actor(m_b, s_b, h_actor, agent_id=ids_b)
-        q1_new, q2_new = self.critic(m_b, s_b, new_actions, h_critic, agent_id=ids_b)
+        new_actions, log_probs, _ = self.actor(m_b, s_b, h_actor)
+        q1_new, q2_new = self.critic(m_b, s_b, new_actions, h_critic)
         min_q_new = torch.min(q1_new, q2_new)
 
         # (B, L, 1) 維度的均值計算
@@ -811,11 +809,15 @@ class RLSimulation:
         ], dim=1)
 
         # --- 5. 拼接與填充 ---
-        all_in = torch.cat([wall_in, dynamic_in], dim=2) 
+        all_dist = torch.cat([wall_in, dynamic_in], dim=2) 
         
+        # 限制最大數量
+        _, indices = torch.sort(all_dist, dim=1) # 由近到遠
+        num_to_take = min(all_dist.shape[2], MAX_OBJ)
+        indices = indices[:, :, :num_to_take]
+        sorted_all_in = torch.gather(all_dist, 2, indices)
         mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
-        actual_add = min(all_in.shape[2], MAX_OBJ)
-        mixed_in[:, :, :actual_add] = all_in[:, :, :actual_add]
+        mixed_in[:, :, :num_to_take] = sorted_all_in
 
         # 自身狀態維持不變
         speed = self.forward_speed / POP_MAX_SPEED
@@ -829,7 +831,7 @@ class RLSimulation:
         
         # 取得連續動作並加入探索噪音
         with torch.no_grad():
-            actions, _, next_hidden = self.actor(current_m, current_s, self.hidden_state, self.agent_ids, deterministic=not training, with_logprob=False)
+            actions, _, next_hidden = self.actor(current_m, current_s, self.hidden_state, deterministic=not training, with_logprob=False)
         self.hidden_state = next_hidden
 
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
@@ -1415,7 +1417,7 @@ class RLSimulation:
 
         if draw_label:
             left_labels = [
-                ("Ttl Steps:", f"{self.total_steps:,}", THEME["perf"], True)
+                ("T-Steps:", f"{self.total_steps:,}", THEME["perf"], True)
             ]
             if args.demo:
                 left_labels.extend([
@@ -1424,6 +1426,7 @@ class RLSimulation:
             else:
                 info = self.last_info
                 left_labels.extend([
+                    ("Steps:", f"{self.steps:,}", THEME["perf"], True),
                     ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
                     ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
                     ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
@@ -1616,9 +1619,9 @@ class RLSimulation:
             self.writer.add_scalar('Env/Starved', self.starved, self.steps)
             self.writer.flush()
             
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Total Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} T-Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Total Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} T-Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
