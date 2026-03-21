@@ -94,19 +94,24 @@ class Actor(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # 1. 特徵提取與廣義感知 (處理周遭物件)
+        # 1. 特徵提取 (增加 LayerNorm 穩定 Conv 輸出)
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.LayerNorm([HIDDEN_FEAT_DIM, MAX_OBJ]), # 針對 Feature Channel 歸一化
             nn.ReLU(),
-            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1)
+            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.ReLU()
         )
 
-        # 2. Attention 機制 (決定關注哪個物件)
+        # 2. Attention 機制
         self.attn_weights = nn.Sequential(
             nn.Linear(HIDDEN_FEAT_DIM, HIDDEN_ATTN_DIM),
             nn.Tanh(),
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
+        
+        # 關鍵修正：聚合後的特徵歸一化
+        self.feat_norm = nn.LayerNorm(HIDDEN_FEAT_DIM + STATE_IN_DIM)
         
         # 3. 短期記憶層
         self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM, batch_first=True)
@@ -116,7 +121,7 @@ class Actor(nn.Module):
         self.log_std = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         
         self.LOG_STD_MAX = 2
-        self.LOG_STD_MIN = -20
+        self.LOG_STD_MIN = -5  # 從 -20 提升到 -5，強制保留最低限度的探索能力
 
     def forward(self, m_in, s_in, hidden, deterministic=False, with_logprob=True):
         is_seq = (m_in.dim() == 4)
@@ -126,12 +131,13 @@ class Actor(nn.Module):
             s_in = s_in.view(B * L, -1)
         
         # --- 空間特徵聚合 ---
-        feat = F.relu(self.conv(m_in)).transpose(1, 2)
+        feat = self.conv(m_in).transpose(1, 2) # [B, O, Dim]
         weights = F.softmax(self.attn_weights(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 結合自身狀態 [B(*L), Dim + State]
+        # 結合自身狀態並進行 LayerNorm
         combined = torch.cat([x_attn, s_in], dim=-1)
+        combined = self.feat_norm(combined) # 穩定進入 GRU 的數值
         
         # --- 記憶處理 ---
         if is_seq:
@@ -139,7 +145,7 @@ class Actor(nn.Module):
             output, next_hidden = self.gru(combined, hidden)
             x = output.reshape(B * L, -1)
         else:
-            combined = combined.unsqueeze(1) # [B, 1, Dim]
+            combined = combined.unsqueeze(1)
             output, next_hidden = self.gru(combined, hidden)
             x = output.squeeze(1)
         
@@ -154,6 +160,7 @@ class Actor(nn.Module):
         
         log_prob = None
         if with_logprob:
+            # SAC 修正項：防止 tanh 造成的梯度消失
             log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
             
@@ -169,6 +176,7 @@ class Critic(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.LayerNorm([HIDDEN_FEAT_DIM, MAX_OBJ]),
             nn.ReLU(),
             nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1),
             nn.ReLU()
@@ -179,12 +187,13 @@ class Critic(nn.Module):
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        # GRU
+        self.feat_norm = nn.LayerNorm(HIDDEN_FEAT_DIM + STATE_IN_DIM)
         self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM, batch_first=True)
 
         def build_q_head():
             return nn.Sequential(
                 nn.Linear(HIDDEN_FC_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
+                nn.LayerNorm(HIDDEN_FC_DIM), # 在隱藏層間加入 LN
                 nn.ReLU(),
                 nn.Linear(HIDDEN_FC_DIM, 1)
             )
@@ -204,7 +213,7 @@ class Critic(nn.Module):
         weights = F.softmax(self.attn(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        combined = torch.cat([x_attn, s_in], dim=-1)
+        combined = self.feat_norm(torch.cat([x_attn, s_in], dim=-1))
         
         if is_seq:
             combined = combined.view(B, L, -1)
