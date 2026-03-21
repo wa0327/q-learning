@@ -93,11 +93,13 @@ class Actor(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # 1. 特徵提取與廣義感知 (處理周遭物件)
+        # 1. 空間感知層：加入 LayerNorm 防止某些物件特徵過強
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.LayerNorm([HIDDEN_FEAT_DIM, MAX_OBJ]), 
             nn.ReLU(),
-            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1)
+            nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.ReLU()
         )
 
         # 2. Attention 機制 (決定關注哪個物件)
@@ -107,31 +109,30 @@ class Actor(nn.Module):
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        # 3. 決策層 (結合感官與自身狀態)
+        # 3. 決策層：結合點加入歸一化，這是穩定訓練的核心
+        self.feat_norm = nn.LayerNorm(HIDDEN_FEAT_DIM + STATE_IN_DIM)
+        
         self.fc_common = nn.Sequential(
             nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM),
+            nn.LayerNorm(HIDDEN_FC_DIM),
             nn.ReLU(),
             nn.Linear(HIDDEN_FC_DIM, HIDDEN_FC_DIM),
             nn.ReLU()
         )
         
-        # 4. 輸出層 (SAC 需要 Mean 與 Log_Std)
         self.mu = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         self.log_std = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
         
         self.LOG_STD_MAX = 2
-        self.LOG_STD_MIN = -20
+        self.LOG_STD_MIN = -5 # 修正過低的下限，防止探索枯竭
 
     def forward(self, m_in, s_in, deterministic=False, with_logprob=True):
-        # 提取環境特徵 [Batch, HIDDEN_FEAT_DIM, MAX_OBJ] -> [Batch, MAX_OBJ, HIDDEN_FEAT_DIM]
-        feat = F.relu(self.conv(m_in)).transpose(1, 2)
-
-        # 計算權重並加權平均
+        feat = self.conv(m_in).transpose(1, 2)
         weights = F.softmax(self.attn_weights(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 結合自身狀態 [Batch, HIDDEN_FEAT_DIM + STATE_IN_DIM]
-        combined = torch.cat([x_attn, s_in], dim=1)
+        # 結合並歸一化
+        combined = self.feat_norm(torch.cat([x_attn, s_in], dim=1))
         x = self.fc_common(combined)
         
         # 計算分佈參數
@@ -139,20 +140,12 @@ class Actor(nn.Module):
         log_std = torch.clamp(self.log_std(x), self.LOG_STD_MIN, self.LOG_STD_MAX)
         std = torch.exp(log_std)
         
-        # 採樣動作 (Reparameterization Trick)
-        if not deterministic or with_logprob:
-            dist = Normal(mu, std)
-        if deterministic:
-            z = mu
-        else:
-            z = dist.rsample()
-            
-        # 將動作映射到 [-1, 1]
+        dist = Normal(mu, std)
+        z = mu if deterministic else dist.rsample()
         action = torch.tanh(z)
         
         log_prob = None
         if with_logprob:
-            # 修正 Tanh 造成的機率分佈偏離
             log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
             
@@ -165,6 +158,7 @@ class Critic(nn.Module):
         # 共享的感官層 (Backbone)
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
+            nn.LayerNorm([HIDDEN_FEAT_DIM, MAX_OBJ]),
             nn.ReLU(),
             nn.Conv1d(HIDDEN_FEAT_DIM, HIDDEN_FEAT_DIM, 1),
             nn.ReLU()
@@ -179,6 +173,7 @@ class Critic(nn.Module):
         def build_q_head():
             return nn.Sequential(
                 nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
+                nn.LayerNorm(HIDDEN_FC_DIM), # 抑制 Critic 的高估傾向
                 nn.ReLU(),
                 nn.Linear(HIDDEN_FC_DIM, CRITIC_OUT_DIM),
                 nn.ReLU(),
@@ -475,10 +470,11 @@ class RLSimulation:
             log_dir = os.path.join(LOG_PATH, name)
             self.writer = SummaryWriter(log_dir=log_dir)
 
-        # 初始化神經網路
-        self.init_network(Actor, Critic)
-        self.load_state()
+        self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+
         self.reset_env()
+        self.init_network()
+        self.load_state()
 
         # 四類環境物件的 one-hot 編碼
         self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
@@ -557,8 +553,7 @@ class RLSimulation:
         self.forward_speed = torch.zeros(POP_SIZE, device=DEVICE)
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
-        self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
-        self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+        self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE)
         self.bounds = self.screen_size - 1.0
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
@@ -566,20 +561,17 @@ class RLSimulation:
         self.food_pos = self.get_risky_pos(FOOD_SIZE, 0.0) if FOOD_RESPAWN_NEARBY_PREDATOR else self.respawn_food(FOOD_SIZE)
         self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
     
-    def init_network(self, actor=None, critic=None):
-        if actor is None:
-            actor = self.actor.__class__
-        if critic is None:
-            critic = self.critic.__class__
+        self.memory = ReplayMemory(MEMORY_SIZE)
 
+    def init_network(self):
         self.steps = 0
         self.total_steps = 0
         
-        self.actor = actor().to(DEVICE)
+        self.actor = Actor().to(DEVICE)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
 
-        self.critic = critic().to(DEVICE)
-        self.critic_target = critic().to(DEVICE)
+        self.critic = Critic().to(DEVICE)
+        self.critic_target = Critic().to(DEVICE)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
@@ -587,8 +579,6 @@ class RLSimulation:
         self.target_entropy = -ACTOR_OUT_DIM
         self.log_alpha = torch.tensor([math.log(INIT_ALPHA)], requires_grad=True, device=DEVICE)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=LR_ACTOR)
-
-        self.memory = ReplayMemory(MEMORY_SIZE)
 
         self.last_info = {
             "alpha": 0.0,
@@ -766,12 +756,11 @@ class RLSimulation:
     
     def update(self, training, move_food, move_predator):
         was_alive = self.alive.clone()
-        current_states = self.get_states()
+        current_m, current_s = self.last_states
         
         # 取得連續動作並加入探索噪音
         with torch.no_grad():
-            m, s = self.last_states
-            actions, _ = self.actor(m, s, deterministic=not training, with_logprob=False)
+            actions, _ = self.actor(current_m, current_s, deterministic=not training, with_logprob=False)
 
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
@@ -923,15 +912,14 @@ class RLSimulation:
 
         dead_mask = killed | collided | starved
 
-        self.last_actions = actions.detach().clone()
         next_states = self.last_states = self.get_states()
 
         # 把經驗推入 Replay Buffer, 忽略死屍的經驗
         if was_alive.any():
             self.memory.push(
                 was_alive.sum(),
-                current_states[0][was_alive],
-                current_states[1][was_alive],
+                current_m[was_alive],
+                current_s[was_alive],
                 actions[was_alive], 
                 rewards[was_alive], 
                 next_states[0][was_alive], 
@@ -939,6 +927,7 @@ class RLSimulation:
                 dead_mask[was_alive]
             )
 
+        self.respawn_timer[~self.alive] -= 1
         ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
         if ready_to_respawn.any():
             indices = torch.where(ready_to_respawn)[0]
@@ -947,7 +936,7 @@ class RLSimulation:
             self.energy[indices] = MAX_ENERGY
             self.vel[indices] = 0.0
 
-        self.respawn_timer[~self.alive] -= 1
+        self.last_actions = actions.detach().clone()
         self.energy_avg = self.energy_avg * 0.99 + (self.energy.sum().item() / POP_SIZE) * 0.01
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
         self.killed += killed.sum().item()
@@ -958,7 +947,6 @@ class RLSimulation:
 
     def kill(self, killed):
         self.alive[killed] = False
-        self.vel[killed] = 0.0 # 死掉後速度歸零
         self.respawn_timer[killed] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
 
     def get_saftest_pos(self, n):
@@ -1345,7 +1333,7 @@ class RLSimulation:
 
         if draw_label:
             left_labels = [
-                ("Ttl Steps:", f"{self.total_steps:,}", THEME["perf"], True)
+                ("T-Steps:", f"{self.total_steps:,}", THEME["perf"], True)
             ]
             if args.demo:
                 left_labels.extend([
@@ -1354,6 +1342,7 @@ class RLSimulation:
             else:
                 info = self.last_info
                 left_labels.extend([
+                    ("Steps:", f"{self.steps:,}", THEME["perf"], True),
                     ("Init-Alpha:", f"{INIT_ALPHA:.4f}", THEME["param"], False),
                     ("Alpha:", f"{info['alpha']:.4f}", THEME["perf"], False),
                     ("Entropy:", f"{info['entropy']:.4f}", THEME["perf"], False),
@@ -1362,7 +1351,7 @@ class RLSimulation:
                     ("A-Loss:", f"{info['a_loss']:.4f}", THEME["perf"], False)
                 ])
             left_labels.extend([
-                ("Energy:", f"{self.energy_avg:.0f}", THEME["success"] if self.energy_avg > 0 else (255, 0, 0), False),
+                ("Energy:", f"{self.energy_avg:.0f}", THEME["success"] if self.energy_avg > 60 else (255, 0, 0), False),
                 ("Rewards:", f"{self.rewards_avg:.4f}", THEME["success"] if self.rewards_avg > 0 else (255, 0, 0), False),
                 ("Eaten:", f"{self.eaten:,}", THEME["success"], False),
                 ("Killed:", f"{self.killed:,}", THEME["loss"], False),
@@ -1547,9 +1536,9 @@ class RLSimulation:
             self.writer.add_scalar('Env/Starved', self.starved, self.steps)
             self.writer.flush()
             
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} T-Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} T-Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
