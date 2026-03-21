@@ -27,7 +27,7 @@ SAVE_MEM_PATH=f'{BASE_PATH}/{script_name}_memory.pt'
 LOG_PATH = f"logs/{script_name}"
 
 # 環境參數
-STAGE = 4
+STAGE = 1
 SCREEN_W, SCREEN_H = 1280, 720 # 邏輯尺寸 (AI 看到的尺寸)
 SCALE = 1.33 # 顯示倍率 (你的 133% 縮放)
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
@@ -35,14 +35,14 @@ POP_MAX_SPEED = 3.5
 # 生存難度系數
 STAGE_SURVIVAL_MULTIPLIER = 10 if STAGE < 2 else 3 if STAGE < 3 else 2 if STAGE < 4 else 1
 EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED * STAGE_SURVIVAL_MULTIPLIER # 根據速度與「生存者需跑完對角線 71.5%」的目標，推算出所需步數
-POP_SIZE = 50
+POP_SIZE = 1 if STAGE < 1 else 50
 POP_RADIUS = 4                      # 生存者體積半徑
 POP_DAMPING_FACTOR = 0.25           # 阻力系數，越高越需要維持高油門
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
-POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
+POP_PERCEPTION_RADIUS = 50         # 視野感知半徑
 POP_PERCEPT_TEAM = False if STAGE < 2 else True  # 是否將隊友加入環境特徵
-FOOD_SIZE = int(POP_SIZE * (1.5 if STAGE < 2 else 0.75 if STAGE < 4 else 0.5))
+FOOD_SIZE = int(POP_SIZE * (1 if STAGE < 1 else 1.5 if STAGE < 2 else 0.75 if STAGE < 4 else 0.5))
 FOOD_RADIUS = 3         # 食物觸碰半徑
 MAX_ENERGY = 100.0      # 能量最大總值
 FOOD_ENERGY = 25.0      # 食物補充能量
@@ -74,7 +74,7 @@ GAMMA = 0.97
 TAU = 0.005     # 軟更新係數
 LR_ACTOR = 0.0003
 LR_CRITIC = 0.0003
-MEMORY_SIZE = 200000
+MEMORY_SIZE = 50000
 REPLAY_BATCH_SIZE = 256
 FEAT_IN_DIM = 8         # 每個物件特微 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
 STATE_IN_DIM = 3        # 自身狀態 [速度, 轉向, 能量]
@@ -86,9 +86,10 @@ CRITIC_OUT_DIM = 64     # Critic 輸出前的降維層
 TARGET_ENTROPY =  -ACTOR_OUT_DIM + (1 if STAGE < 3 else 0)
 INIT_ALPHA = 1.0
 MIN_ALPHA = 0.0001
-MAX_OBJ = 100    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
+MAX_OBJ = 20    # 最大環境物件數量，實際運行不會超過 POP_SIZE-1 + FOOD_SIZE + PREDATOR_SIZE + 四面牆(最多)
+HIDDEN_EMB_DIM = 8 # 編碼維度 8
+SEQ_LEN = 16
 
-# --- SAC 網路架構 ---
 class Actor(nn.Module):
     def __init__(self):
         super().__init__()
@@ -107,13 +108,10 @@ class Actor(nn.Module):
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
         
-        # 3. 決策層 (結合感官與自身狀態)
-        self.fc_common = nn.Sequential(
-            nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_FC_DIM, HIDDEN_FC_DIM),
-            nn.ReLU()
-        )
+        self.agent_emb = nn.Embedding(POP_SIZE, HIDDEN_EMB_DIM)
+        
+        # 3. 短期記憶層
+        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM + HIDDEN_EMB_DIM, HIDDEN_FC_DIM, batch_first=True)
         
         # 4. 輸出層 (SAC 需要 Mean 與 Log_Std)
         self.mu = nn.Linear(HIDDEN_FC_DIM, ACTOR_OUT_DIM)
@@ -122,47 +120,60 @@ class Actor(nn.Module):
         self.LOG_STD_MAX = 2
         self.LOG_STD_MIN = -20
 
-    def forward(self, m_in, s_in, deterministic=False, with_logprob=True):
-        # 提取環境特徵 [Batch, HIDDEN_FEAT_DIM, MAX_OBJ] -> [Batch, MAX_OBJ, HIDDEN_FEAT_DIM]
-        feat = F.relu(self.conv(m_in)).transpose(1, 2)
+    def forward(self, m_in, s_in, hidden=None, agent_id=None, deterministic=False, with_logprob=True):
+        is_seq = (m_in.dim() == 4)
+        if is_seq:
+            B, L, f, O = m_in.shape
+            m_in = m_in.view(B * L, f, O)
+            s_in = s_in.view(B * L, -1)
+            # 將 agent_id [B] 擴展為序列長度 [B*L]
+            id_feat = self.agent_emb(agent_id).unsqueeze(1).expand(-1, L, -1).reshape(B * L, -1)
+        else:
+            # 推理模式，agent_id 為 [POP_SIZE]
+            id_feat = self.agent_emb(agent_id)
 
-        # 計算權重並加權平均
+        # --- 空間特徵聚合 ---
+        feat = F.relu(self.conv(m_in)).transpose(1, 2)
         weights = F.softmax(self.attn_weights(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 結合自身狀態 [Batch, HIDDEN_FEAT_DIM + STATE_IN_DIM]
-        combined = torch.cat([x_attn, s_in], dim=1)
-        x = self.fc_common(combined)
+        # 結合自身狀態 + 身分特徵 [B(*L), Dim + State + Emb]
+        combined = torch.cat([x_attn, s_in, id_feat], dim=-1)
         
-        # 計算分佈參數
+        # --- 記憶處理 ---
+        if is_seq:
+            combined = combined.view(B, L, -1)
+            output, next_hidden = self.gru(combined, hidden)
+            x = output.reshape(B * L, -1)
+        else:
+            combined = combined.unsqueeze(1) # [B, 1, Dim]
+            output, next_hidden = self.gru(combined, hidden)
+            x = output.squeeze(1)
+        
+        # --- 決策層 ---
         mu = self.mu(x)
         log_std = torch.clamp(self.log_std(x), self.LOG_STD_MIN, self.LOG_STD_MAX)
         std = torch.exp(log_std)
         
-        # 採樣動作 (Reparameterization Trick)
-        if not deterministic or with_logprob:
-            dist = Normal(mu, std)
-        if deterministic:
-            z = mu
-        else:
-            z = dist.rsample()
-            
-        # 將動作映射到 [-1, 1]
+        dist = Normal(mu, std)
+        z = mu if deterministic else dist.rsample()
         action = torch.tanh(z)
         
         log_prob = None
         if with_logprob:
-            # 修正 Tanh 造成的機率分佈偏離
             log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
             log_prob = log_prob.sum(dim=-1, keepdim=True)
             
-        return action, log_prob
+        if is_seq:
+            action = action.view(B, L, -1)
+            if log_prob is not None:
+                log_prob = log_prob.view(B, L, -1)
+
+        return action, log_prob, next_hidden
 
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # 共享的感官層 (Backbone)
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
             nn.ReLU(),
@@ -174,80 +185,127 @@ class Critic(nn.Module):
             nn.Tanh(),
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
+        
+        # 身分嵌入
+        self.agent_emb = nn.Embedding(POP_SIZE, HIDDEN_EMB_DIM)
+        
+        # GRU 輸入維度同步增加
+        self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM + HIDDEN_EMB_DIM, HIDDEN_FC_DIM, batch_first=True)
 
-        # 獨立的 Q 評價層 (Heads)
         def build_q_head():
             return nn.Sequential(
-                nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
+                nn.Linear(HIDDEN_FC_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
                 nn.ReLU(),
-                nn.Linear(HIDDEN_FC_DIM, CRITIC_OUT_DIM),
-                nn.ReLU(),
-                nn.Linear(CRITIC_OUT_DIM, 1)
+                nn.Linear(HIDDEN_FC_DIM, 1)
             )
         
         self.q1_head = build_q_head()
         self.q2_head = build_q_head()
 
-    def forward(self, m_in, s_in, action):
-        # 1. 統一提取特徵 (只算一次)
+    def forward(self, m_in, s_in, action, hidden=None, agent_id=None):
+        is_seq = (m_in.dim() == 4)
+        if is_seq:
+            B, L, f, O = m_in.shape
+            m_in = m_in.view(B * L, f, O)
+            s_in = s_in.view(B * L, -1)
+            action = action.view(B * L, -1)
+            id_feat = self.agent_emb(agent_id).unsqueeze(1).expand(-1, L, -1).reshape(B * L, -1)
+        else:
+            id_feat = self.agent_emb(agent_id)
+
         feat = self.conv(m_in).transpose(1, 2)
         weights = F.softmax(self.attn(feat), dim=1)
         x_attn = torch.sum(feat * weights, dim=1)
         
-        # 2. 拼裝輸入
-        combined = torch.cat([x_attn, s_in, action], dim=1)
-
-        # 3. 分別進入獨立的評估分支
-        q1 = self.q1_head(combined)
-        q2 = self.q2_head(combined)
-        return q1, q2
-
-class ReplayMemory:
-    def __init__(self, capacity):
-        self.capacity = capacity
+        combined = torch.cat([x_attn, s_in, id_feat], dim=-1)
         
-        self.m_states = torch.zeros((capacity, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
-        self.s_states = torch.zeros((capacity, STATE_IN_DIM), device=DEVICE)
-        self.next_m_states = torch.zeros((capacity, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
-        self.next_s_states = torch.zeros((capacity, STATE_IN_DIM), device=DEVICE)
-        self.actions = torch.zeros((capacity, ACTOR_OUT_DIM), device=DEVICE)
-        self.rewards = torch.zeros(capacity, device=DEVICE)
-        self.dones = torch.zeros(capacity, device=DEVICE)
+        if is_seq:
+            combined = combined.view(B, L, -1)
+            output, _ = self.gru(combined, hidden)
+            x = output.reshape(B * L, -1)
+        else:
+            combined = combined.unsqueeze(1)
+            output, _ = self.gru(combined, hidden)
+            x = output.squeeze(1)
+            
+        q_in = torch.cat([x, action], dim=-1)
+        q1 = self.q1_head(q_in)
+        q2 = self.q2_head(q_in)
+        
+        if is_seq:
+            q1, q2 = q1.view(B, L, -1), q2.view(B, L, -1)
+            
+        return q1, q2
+    
+class ReplayMemory:
+    def __init__(self):
+        self.m_states = torch.zeros((MEMORY_SIZE, POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
+        self.s_states = torch.zeros((MEMORY_SIZE, POP_SIZE, STATE_IN_DIM), device=DEVICE)
+        self.actions = torch.zeros((MEMORY_SIZE, POP_SIZE, ACTOR_OUT_DIM), device=DEVICE)
+        self.rewards = torch.zeros((MEMORY_SIZE, POP_SIZE), device=DEVICE)
+        self.dones = torch.zeros((MEMORY_SIZE, POP_SIZE), device=DEVICE)
+        self.agent_ids = torch.zeros((MEMORY_SIZE, POP_SIZE), dtype=torch.long, device=DEVICE)
+        self.life_counters = torch.zeros((MEMORY_SIZE, POP_SIZE), dtype=torch.long, device=DEVICE)
+        self.is_starts = torch.zeros((MEMORY_SIZE, POP_SIZE), dtype=torch.bool, device=DEVICE)
         
         self.idx = 0
         self.size = 0
 
-    def push(self, n, m_s, s_s, action, reward, n_m_s, n_s_s, done):
-        # 計算寫入範圍的索引
-        indices = torch.arange(self.idx, self.idx + n, device=DEVICE) % self.capacity
+    def push(self, m_s, s_s, action, reward, done, ids, life_counts, is_starts):
+        # 每次直接推入一整幀 (包含所有 POP_SIZE 個體，不管死活)
+        self.m_states[self.idx] = m_s.detach()
+        self.s_states[self.idx] = s_s.detach()
+        self.actions[self.idx] = action.detach()
+        self.rewards[self.idx] = reward.detach()
+        self.dones[self.idx] = done.detach()
         
-        # 批次寫入
-        self.m_states[indices] = m_s.detach()
-        self.s_states[indices] = s_s.detach()
-        self.next_m_states[indices] = n_m_s.detach()
-        self.next_s_states[indices] = n_s_s.detach()
-        self.actions[indices] = action.detach()
-        self.rewards[indices] = reward.detach().float()
-        self.dones[indices] = done.detach().float()
+        self.agent_ids[self.idx] = ids.detach()
+        self.life_counters[self.idx] = life_counts.detach()
+        self.is_starts[self.idx] = is_starts.detach()
         
-        # 更新指針與當前大小
-        self.idx = (self.idx + n) % self.capacity
-        self.size = min(self.size + n, self.capacity)
+        self.idx = (self.idx + 1) % MEMORY_SIZE
+        self.size = min(self.size + 1, MEMORY_SIZE)
         
-    def sample(self, batch_size):
-        indices = torch.randint(0, self.size, (batch_size,), device=DEVICE)
+    def sample(self):
+        # 回傳維度需要是 [Batch, Seq_Len, ...]
+        v_m, v_s, v_a, v_r, v_nm, v_ns, v_d, v_ids = [], [], [], [], [], [], [], []
+        
+        while len(v_m) < REPLAY_BATCH_SIZE:
+            # 隨機抽一個時間點與一個 Agent
+            t = torch.randint(0, self.size - SEQ_LEN - 1, (1,), device=DEVICE).item()
+            a_idx = torch.randint(0, POP_SIZE, (1,), device=DEVICE).item()
+            
+            # 檢查這個 Agent 在這 16 步內是否連續存活
+            lifes = self.life_counters[t : t + SEQ_LEN, a_idx]
+            if not torch.all(lifes == lifes[0]):
+                continue
+            
+            starts = self.is_starts[t + 1 : t + SEQ_LEN, a_idx]
+            if torch.any(starts):
+                continue
+                
+            # 收集這個 Agent 的連續 16 步資料
+            v_m.append(self.m_states[t : t + SEQ_LEN, a_idx])
+            v_s.append(self.s_states[t : t + SEQ_LEN, a_idx])
+            v_a.append(self.actions[t : t + SEQ_LEN, a_idx])
+            v_r.append(self.rewards[t : t + SEQ_LEN, a_idx])
+            v_d.append(self.dones[t : t + SEQ_LEN, a_idx])
+            v_ids.append(self.agent_ids[t, a_idx]) # ID 只要一個
+            
+            # Next state 就是平移一格 (t+1 到 t+SEQ_LEN+1)
+            v_nm.append(self.m_states[t + 1 : t + SEQ_LEN + 1, a_idx])
+            v_ns.append(self.s_states[t + 1 : t + SEQ_LEN + 1, a_idx])
+
+        # 堆疊成 Batch
         return (
-            self.m_states[indices],
-            self.s_states[indices],
-            self.actions[indices],
-            self.rewards[indices],
-            self.next_m_states[indices],
-            self.next_s_states[indices],
-            self.dones[indices]
+            torch.stack(v_m), torch.stack(v_s), torch.stack(v_a), 
+            torch.stack(v_r), torch.stack(v_nm), torch.stack(v_ns), 
+            torch.stack(v_d), torch.stack(v_ids)
         )
     
     def __len__(self):
         return self.size
+
 
 class GLRenderer:
     def __init__(self, ctx, fbo_texture, w, h):
@@ -475,10 +533,11 @@ class RLSimulation:
             log_dir = os.path.join(LOG_PATH, name)
             self.writer = SummaryWriter(log_dir=log_dir)
 
-        # 初始化神經網路
-        self.init_network(Actor, Critic)
-        self.load_state()
+        self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
+
         self.reset_env()
+        self.init_network()
+        self.load_state()
 
         # 四類環境物件的 one-hot 編碼
         self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
@@ -558,7 +617,6 @@ class RLSimulation:
         self.energy = torch.full((POP_SIZE,), MAX_ENERGY, device=DEVICE, dtype=torch.float)
         self.alive = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
         self.respawn_timer = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE) 
-        self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
         self.bounds = self.screen_size - 1.0
         self.pos = torch.rand(POP_SIZE, 2, device=DEVICE) * self.screen_size
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=DEVICE) * self.screen_size
@@ -566,20 +624,21 @@ class RLSimulation:
         self.food_pos = self.get_risky_pos(FOOD_SIZE, 0.0) if FOOD_RESPAWN_NEARBY_PREDATOR else self.respawn_food(FOOD_SIZE)
         self.food_vel = (torch.rand(FOOD_SIZE, 2, device=DEVICE) - 0.5) * 3.5
     
-    def init_network(self, actor=None, critic=None):
-        if actor is None:
-            actor = self.actor.__class__
-        if critic is None:
-            critic = self.critic.__class__
-
+        self.memory = ReplayMemory()
+        self.agent_ids = torch.arange(POP_SIZE, device=DEVICE)
+        self.life_counter = torch.zeros(POP_SIZE, dtype=torch.long, device=DEVICE)
+        self.is_first_step = torch.ones(POP_SIZE, dtype=torch.bool, device=DEVICE)
+        self.hidden_state = torch.zeros(1, POP_SIZE, HIDDEN_FC_DIM, device=DEVICE)
+    
+    def init_network(self):
         self.steps = 0
         self.total_steps = 0
         
-        self.actor = actor().to(DEVICE)
+        self.actor = Actor().to(DEVICE)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
 
-        self.critic = critic().to(DEVICE)
-        self.critic_target = critic().to(DEVICE)
+        self.critic = Critic().to(DEVICE)
+        self.critic_target = Critic().to(DEVICE)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         
@@ -587,8 +646,6 @@ class RLSimulation:
         self.target_entropy = -ACTOR_OUT_DIM
         self.log_alpha = torch.tensor([math.log(INIT_ALPHA)], requires_grad=True, device=DEVICE)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=LR_ACTOR)
-
-        self.memory = ReplayMemory(MEMORY_SIZE)
 
         self.last_info = {
             "alpha": 0.0,
@@ -604,26 +661,30 @@ class RLSimulation:
         if len(self.memory) < REPLAY_BATCH_SIZE:
             return False
         
-        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b = self.memory.sample(REPLAY_BATCH_SIZE)
-        r_b = r_b.unsqueeze(1) 
-        d_b = d_b.unsqueeze(1)
+        m_b, s_b, a_b, r_b, nm_b, ns_b, d_b, ids_b = self.memory.sample()
+        r_b = r_b.unsqueeze(-1) # (B, L, 1)
+        d_b = d_b.unsqueeze(-1) # (B, L, 1)
 
-        # 1. 取得當前 alpha 數值用於 Actor/Critic (不帶梯度)
+        
         alpha = self.log_alpha.exp().detach()
-        alpha = torch.clamp(alpha, min=MIN_ALPHA)
+
+        # 初始化隱藏狀態 (若不儲存 hidden 則每次設為 0)
+        h_actor = torch.zeros(1, REPLAY_BATCH_SIZE, HIDDEN_FC_DIM, device=DEVICE)
+        h_critic = torch.zeros(1, REPLAY_BATCH_SIZE, HIDDEN_FC_DIM, device=DEVICE)
+        h_critic_t = torch.zeros(1, REPLAY_BATCH_SIZE, HIDDEN_FC_DIM, device=DEVICE)
 
         # --- 1. 更新 Critic ---
         with torch.no_grad():
-            # 使用 Target Critic 計算，避免過度樂觀估計
-            next_actions, next_log_probs = self.actor(nm_b, ns_b)
-            q1_t, q2_t = self.critic_target(nm_b, ns_b, next_actions)
+            next_actions, next_log_probs, _ = self.actor(nm_b, ns_b, h_actor, agent_id=ids_b)
+            q1_t, q2_t = self.critic_target(nm_b, ns_b, next_actions, h_critic_t, agent_id=ids_b)
             
-            # SAC 核心公式：Q - alpha * log_prob
             min_q_target = torch.min(q1_t, q2_t) - alpha * next_log_probs
             target_q = r_b + (GAMMA * (1.0 - d_b) * min_q_target)
 
-        q1_curr, q2_curr = self.critic(m_b, s_b, a_b)
-        # 計算 MSE 並結合兩個 Q 網路的損失
+        # q1_curr: (B, L, 1)
+        q1_curr, q2_curr = self.critic(m_b, s_b, a_b, h_critic, agent_id=ids_b)
+        
+        # 序列訓練中，MSE 會在 (B, L) 上計算
         critic_loss = F.mse_loss(q1_curr, target_q) + F.mse_loss(q2_curr, target_q)
 
         self.critic_opt.zero_grad()
@@ -631,40 +692,39 @@ class RLSimulation:
         self.critic_opt.step()
 
         # --- 2. 更新 Actor ---
-        # 凍結 Critic 的參數以節省計算資源 (選擇性，但較嚴謹)
         for param in self.critic.parameters():
             param.requires_grad = False
 
-        new_actions, log_probs = self.actor(m_b, s_b)
-        q1_new, q2_new = self.critic(m_b, s_b, new_actions)
+        new_actions, log_probs, _ = self.actor(m_b, s_b, h_actor, agent_id=ids_b)
+        q1_new, q2_new = self.critic(m_b, s_b, new_actions, h_critic, agent_id=ids_b)
         min_q_new = torch.min(q1_new, q2_new)
 
-        # 目標是最小化 (alpha * log_prob - Q)，等同於最大化 (Q - alpha * log_prob)
+        # (B, L, 1) 維度的均值計算
         actor_loss = (alpha * log_probs - min_q_new).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
 
-        # 解凍 Critic
         for param in self.critic.parameters():
             param.requires_grad = True
 
-        # --- 3. 更新 Alpha (自動調整熵) ---
+        # --- 3. 更新 Alpha ---
+        # 注意 log_probs 此時是 (B, L, 1)，mean() 會涵蓋時間維度
         alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
         self.alpha_opt.step()
 
-        # --- 4. 軟更新 Target 網路 ---
-        # SAC 通常只更新 Critic Target
+        # --- 4. 軟更新 ---
         for tp, p in zip(self.critic_target.parameters(), self.critic.parameters()):
             tp.data.copy_(tp.data * (1.0 - TAU) + p.data * TAU)
 
+        # 更新 info (取序列平均值)
         self.last_info = {
             "alpha": alpha.item(),
             "entropy": -log_probs.mean().item(),
-            "q_val": torch.min(q1_curr, q2_curr).mean().item(),
+            "q_val": min_q_new.mean().item(),
             "c_loss": critic_loss.item(),
             "a_loss": actor_loss.item()
         }
@@ -765,13 +825,12 @@ class RLSimulation:
         return (mixed_in, self_in)
     
     def update(self, training, move_food, move_predator):
-        was_alive = self.alive.clone()
-        current_states = self.get_states()
+        current_m, current_s = self.get_states()
         
         # 取得連續動作並加入探索噪音
         with torch.no_grad():
-            m, s = self.last_states
-            actions, _ = self.actor(m, s, deterministic=not training, with_logprob=False)
+            actions, _, next_hidden = self.actor(current_m, current_s, self.hidden_state, self.agent_ids, deterministic=not training, with_logprob=False)
+        self.hidden_state = next_hidden
 
         rewards = torch.full((POP_SIZE,), STEP_REWARD, device=DEVICE)
             
@@ -923,31 +982,27 @@ class RLSimulation:
 
         dead_mask = killed | collided | starved
 
-        self.last_actions = actions.detach().clone()
-        next_states = self.last_states = self.get_states()
+        # 把經驗推入 Replay Buffer
+        self.memory.push(
+            current_m,
+            current_s,
+            actions,
+            rewards,
+            dead_mask,
+            self.agent_ids,
+            self.life_counter,
+            self.is_first_step
+        )
 
-        # 把經驗推入 Replay Buffer, 忽略死屍的經驗
-        if was_alive.any():
-            self.memory.push(
-                was_alive.sum(),
-                current_states[0][was_alive],
-                current_states[1][was_alive],
-                actions[was_alive], 
-                rewards[was_alive], 
-                next_states[0][was_alive], 
-                next_states[1][was_alive], 
-                dead_mask[was_alive]
-            )
-
-        ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
-        if ready_to_respawn.any():
-            indices = torch.where(ready_to_respawn)[0]
-            self.pos[indices] = self.get_saftest_pos(len(indices))
-            self.alive[indices] = True
-            self.energy[indices] = MAX_ENERGY
-            self.vel[indices] = 0.0
+        self.hidden_state[:, dead_mask, :] = 0.0
+        self.is_first_step.fill_(False)
 
         self.respawn_timer[~self.alive] -= 1
+        ready_to_respawn = ~self.alive & (self.respawn_timer <= 0)
+        if ready_to_respawn.any():
+            self.respawn(ready_to_respawn)
+
+        self.last_actions = actions.detach().clone()
         self.energy_avg = self.energy_avg * 0.99 + (self.energy.sum().item() / POP_SIZE) * 0.01
         self.rewards_avg = self.rewards_avg * 0.99 + (rewards.sum().item() / POP_SIZE) * 0.01
         self.killed += killed.sum().item()
@@ -956,9 +1011,22 @@ class RLSimulation:
         self.rewards = rewards
         self.frames += 1
 
+    def respawn(self, idx):
+        self.alive[idx] = True
+        self.pos[idx] = self.get_saftest_pos(idx.sum().item())
+        self.energy[idx] = MAX_ENERGY
+        self.vel[idx] = 0.0
+
+        # 1. 增加生命計數器（代表進入下一個 Episode）
+        self.life_counter[idx] += 1
+        # 2. 標記為第一步（這一步存入 Memory 時 is_cont 會是 False）
+        self.is_first_step[idx] = True
+        # 3. 重要：重置該 Agent 的 GRU 記憶
+        # 既然位置瞬間移動了，舊的空間感必須清空
+        self.hidden_state[:, idx, :] = 0.0
+
     def kill(self, killed):
         self.alive[killed] = False
-        self.vel[killed] = 0.0 # 死掉後速度歸零
         self.respawn_timer[killed] = 1 if POP_SIZE == 1 else torch.randint(60, 360, (killed.sum(),), device=DEVICE)
 
     def get_saftest_pos(self, n):
@@ -1111,11 +1179,12 @@ class RLSimulation:
         torch.save({
             'm_states': self.memory.m_states,
             's_states': self.memory.s_states,
-            'next_m_states': self.memory.next_m_states,
-            'next_s_states': self.memory.next_s_states,
             'actions': self.memory.actions,
             'rewards': self.memory.rewards,
             'dones': self.memory.dones,
+            'agent_ids': self.memory.agent_ids,
+            'life_counters': self.memory.life_counters,
+            'is_starts': self.memory.is_starts,
             'idx': self.memory.idx,
             'size': self.memory.size
         }, SAVE_MEM_PATH)
@@ -1148,11 +1217,12 @@ class RLSimulation:
                     state = torch.load(memory_path, map_location=DEVICE, weights_only=False)
                     self.memory.m_states = state['m_states']
                     self.memory.s_states = state['s_states']
-                    self.memory.next_m_states = state['next_m_states']
-                    self.memory.next_s_states = state['next_s_states']
                     self.memory.actions = state['actions']
                     self.memory.rewards = state['rewards']
                     self.memory.dones = state['dones']
+                    self.memory.agent_ids.copy_(state['agent_ids'])
+                    self.memory.life_counters.copy_(state['life_counters'])
+                    self.memory.is_starts.copy_(state['is_starts'])
                     self.memory.idx = state['idx']
                     self.memory.size = state['size']
                     print(f"--- [Loaded] memory {memory_path}, size {len(self.memory):,} ---")
@@ -1394,7 +1464,6 @@ class RLSimulation:
         frame_queue = None
 
         self.fps_avg = self.clock.get_fps()
-        self.last_states = self.get_states()
 
         def start_record():
             nonlocal video_thread, frame_queue
@@ -1547,9 +1616,9 @@ class RLSimulation:
             self.writer.add_scalar('Env/Starved', self.starved, self.steps)
             self.writer.flush()
             
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Total Steps:{self.total_steps:,} Steps:{self.steps:,} Alpha:{info['alpha']:.4f} Entropy:{info['entropy']:.4f} Q-Val:{info['q_val']:.4f} C-Loss:{info['c_loss']:.4f} A-Loss:{info['a_loss']:.4f} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
         else:
-            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Ttl-Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
+            print(f"[{now}][Info] FPS:{self.fps_avg:.2f} Total Steps:{self.total_steps:,} Frames:{self.frames:,} Energy:{self.energy_avg:.0f} Rewards:{self.rewards_avg:.4f} Eaten:{self.eaten:,} Killed:{self.killed:,} Collided:{self.collided:,} Starved:{self.starved:,}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
