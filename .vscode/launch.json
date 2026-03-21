@@ -8,9 +8,9 @@
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/survivors5.py",
+            "program": "${file}",
             "console": "integratedTerminal",
-            "args": "--demo"
+            "args": ""
         }
     ]
 }
