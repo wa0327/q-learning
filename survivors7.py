@@ -40,7 +40,7 @@ POP_RADIUS = 4                      # 生存者體積半徑
 POP_DAMPING_FACTOR = 0.25           # 阻力系數，越高越需要維持高油門
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)    # 最大轉向角度
-POP_PERCEPTION_RADIUS = 50         # 視野感知半徑
+POP_PERCEPTION_RADIUS = 200         # 視野感知半徑
 POP_PERCEPT_TEAM = False if STAGE < 2 else True  # 是否將隊友加入環境特徵
 FOOD_SIZE = int(POP_SIZE * (1 if STAGE < 1 else 1.5 if STAGE < 2 else 0.75 if STAGE < 4 else 0.5))
 FOOD_RADIUS = 3         # 食物觸碰半徑
@@ -174,6 +174,8 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
+
+        # 共享的感官層 (Backbone)
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
             nn.LayerNorm([HIDDEN_FEAT_DIM, MAX_OBJ]),
@@ -190,10 +192,11 @@ class Critic(nn.Module):
         self.feat_norm = nn.LayerNorm(HIDDEN_FEAT_DIM + STATE_IN_DIM)
         self.gru = nn.GRU(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM, batch_first=True)
 
+        # 獨立的 Q 評價層 (Heads)
         def build_q_head():
             return nn.Sequential(
                 nn.Linear(HIDDEN_FC_DIM + ACTOR_OUT_DIM, HIDDEN_FC_DIM),
-                nn.LayerNorm(HIDDEN_FC_DIM), # 在隱藏層間加入 LN
+                nn.LayerNorm(HIDDEN_FC_DIM), # 抑制 Critic 的高估傾向
                 nn.ReLU(),
                 nn.Linear(HIDDEN_FC_DIM, 1)
             )
@@ -542,28 +545,6 @@ class RLSimulation:
 
         self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=DEVICE, dtype=torch.float)
 
-        self.reset_env()
-        self.init_network()
-        self.load_state()
-
-        # 四類環境物件的 one-hot 編碼
-        self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
-        l_team = torch.tensor([0.0, 1.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
-        l_food = torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE).view(1, 4, 1)
-        l_pred = torch.tensor([0.0, 0.0, 0.0, 1.0], device=DEVICE).view(1, 4, 1)
-        self.l_all = torch.cat([
-            l_team.repeat(1, 1, POP_SIZE),
-            l_food.repeat(1, 1, FOOD_SIZE),
-            l_pred.repeat(1, 1, PREDATOR_SIZE)
-        ], dim=2)
-
-        # 準備對應的半徑與 Label
-        self.dynamic_radii = torch.cat([
-            torch.full((POP_SIZE,), POP_RADIUS, device=DEVICE),
-            torch.full((FOOD_SIZE,), FOOD_RADIUS, device=DEVICE),
-            torch.full((PREDATOR_SIZE,), PREDATOR_RADIUS, device=DEVICE)
-        ])
-
         # 定義牆面
         wall_A, wall_B = [], []
         self.add_wall_group(wall_A, wall_B, [
@@ -592,6 +573,28 @@ class RLSimulation:
         self.wall_A = torch.cat(wall_A, dim=0)
         self.wall_B = torch.cat(wall_B, dim=0)
         self.wall_v = torch.stack([self.wall_A, self.wall_B], dim=1)
+
+        # 四類環境物件的 one-hot 編碼
+        self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1).expand(POP_SIZE, 4, self.wall_A.shape[0])
+        l_team = torch.tensor([0.0, 1.0, 0.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_food = torch.tensor([0.0, 0.0, 1.0, 0.0], device=DEVICE).view(1, 4, 1)
+        l_pred = torch.tensor([0.0, 0.0, 0.0, 1.0], device=DEVICE).view(1, 4, 1)
+        self.l_all = torch.cat([
+            l_team.repeat(1, 1, POP_SIZE),
+            l_food.repeat(1, 1, FOOD_SIZE),
+            l_pred.repeat(1, 1, PREDATOR_SIZE)
+        ], dim=2).expand(POP_SIZE, -1, -1).clone()
+
+        # 準備對應的半徑與 Label
+        self.all_radius = torch.cat([
+            torch.full((POP_SIZE,), POP_RADIUS, device=DEVICE),
+            torch.full((FOOD_SIZE,), FOOD_RADIUS, device=DEVICE),
+            torch.full((PREDATOR_SIZE,), PREDATOR_RADIUS, device=DEVICE)
+        ])
+
+        self.reset_env()
+        self.init_network()
+        self.load_state()
 
     def add_wall_group(self, wall_A, wall_B, points, closed):
         points = torch.tensor(points, dtype=torch.float32, device=DEVICE)
@@ -757,81 +760,115 @@ class RLSimulation:
         abs_ang_w = torch.atan2(diff_wall[..., 1], diff_wall[..., 0])
         rel_ang_w = abs_ang_w - angel
         
-        wall_dist_norm = ((wall_dist - POP_RADIUS) / POP_PERCEPTION_RADIUS).clamp(0, 1)
+        wall_dist_val = (wall_dist - POP_RADIUS) / POP_PERCEPTION_RADIUS
         wall_mask = ((wall_dist - POP_RADIUS) < POP_PERCEPTION_RADIUS).float()
 
-        # 牆壁能量固定為 0.0 (N, W)
-        wall_energy = torch.zeros_like(wall_dist)
-
-        # 構建物理特徵 (Cos, Sin, Dist, Energy) -> (N, 4, W)
+        # 構建物理特徵 (Cos, Sin, Dist, Energy)
         wall_phys = torch.stack([
             torch.cos(rel_ang_w), 
             torch.sin(rel_ang_w), 
-            wall_dist_norm,
-            wall_energy
-        ], dim=1) * wall_mask.unsqueeze(1)
-
-        wall_in = torch.cat([
-            wall_phys, 
-            self.l_wall.expand(POP_SIZE, 4, self.wall_A.shape[0])
+            wall_dist_val,
+            torch.zeros_like(wall_dist)
         ], dim=1)
+        # 拼接 one-hot 相對應的編碼
+        wall_in = torch.cat([wall_phys, self.l_wall], dim=1)
 
-        # --- 2, 3, 4. 合併處理動態物件 (Food, Team, Predator) ---
+        # --- 合併處理動態物件 (Food, Team, Predator) ---
         dynamic_pos = torch.cat([self.pos, self.food_pos, self.pred_pos], dim=0)
-        
         diff_d = dynamic_pos.unsqueeze(0) - p
         dist_d = torch.norm(diff_d, dim=2)
-        dist_d[:, 0:POP_SIZE].fill_diagonal_(1e6)
+        dist_d[:, 0:POP_SIZE].fill_diagonal_(1e6) # 排除自己，設為極大值
 
+        # --- 相對方位特徵處理 ---
         abs_ang_d = torch.atan2(diff_d[..., 1], diff_d[..., 0])
         rel_ang_d = abs_ang_d - angel
         
-        dist_norm_d = ((dist_d - POP_RADIUS - self.dynamic_radii) / POP_PERCEPTION_RADIUS).clamp(0, 1)
+        # --- 距離特徵處理 ---
+        dist_val = (dist_d - POP_RADIUS - self.all_radius) / POP_PERCEPTION_RADIUS
 
-        # --- 能量特徵處理 ---
-        # 1. 初始化全 0 (N, Total_D)
-        energy_norm = torch.zeros((POP_SIZE, dist_d.shape[1]), device=DEVICE)
-        # 2. 填入隊友能量
-        # 這裡取 self.energy 並轉化為 (1, POP_SIZE) 後廣播給所有 Agent
-        energy_norm[:, 0:POP_SIZE] = (self.energy / MAX_ENERGY).view(1, -1)
-        # 3. 填入掠食者能量 (固定為 1.0)
-        energy_norm[:, -PREDATOR_SIZE:] = 1.0
-
-        # 構建物理特徵 (Cos, Sin, Dist, Energy) -> (N, 4, Total_D)
-        mask_d = ((dist_d - POP_RADIUS - self.dynamic_radii) < POP_PERCEPTION_RADIUS).float()
-        # --- 新增：過濾隊友邏輯 ---
+        # 構建物理特徵並套用遮罩 (將 Cos, Sin, Dist, Energy 在無效位置全部抹零)
+        dyna_mask = ((dist_d - POP_RADIUS - self.all_radius) < POP_PERCEPTION_RADIUS).float()
+        dyna_mask[:, 0:POP_SIZE].fill_diagonal_(0.0)
         if not POP_PERCEPT_TEAM:
             # 將前 POP_SIZE 個物件（隊友）的 Mask 強制設為 0
             # 這樣 Agent 就不會「看見」任何隊友的物理與類型特徵
-            mask_d[:, 0:POP_SIZE] = 0.0
-        # ------------------------
+            dyna_mask[:, 0:POP_SIZE] = 0.0
+
+        # --- 能量特徵處理 ---
+        energy_norm = torch.zeros((POP_SIZE, dist_d.shape[1]), device=DEVICE)
+        energy_norm[:, 0:POP_SIZE] = (self.energy / MAX_ENERGY).view(1, -1)
+        if PREDATOR_SIZE > 0:
+            energy_norm[:, -PREDATOR_SIZE:] = 1.0
+
         phys_d = torch.stack([
             torch.cos(rel_ang_d), 
             torch.sin(rel_ang_d), 
-            dist_norm_d,
+            dist_val,
             energy_norm
-        ], dim=1) * mask_d.unsqueeze(1)
-
-        dynamic_in = torch.cat([
-            phys_d, 
-            self.l_all.expand(POP_SIZE, -1, -1)
         ], dim=1)
+        # 拼接 one-hot 相對應的編碼
+        dynamic_in = torch.cat([phys_d, self.l_all], dim=1)
 
-        # --- 5. 拼接與填充 ---
-        all_dist = torch.cat([wall_in, dynamic_in], dim=2) 
-        
-        # 限制最大數量
-        _, indices = torch.sort(all_dist, dim=1) # 由近到遠
-        num_to_take = min(all_dist.shape[2], MAX_OBJ)
-        indices = indices[:, :, :num_to_take]
-        sorted_all_in = torch.gather(all_dist, 2, indices)
+        # --- 拼接與填充，並按距離取最近前 MAX_OBJ 個 ---
+        all_in = torch.cat([wall_in, dynamic_in], dim=2)
+        all_mask = torch.cat([wall_mask, dyna_mask], dim=1)
+        # A. 將 all_in 中無效位置的所有特徵先抹成 0 (避免殘留數值)
+        all_in = all_in * all_mask.unsqueeze(1)
+        # B. 將 all_in 中的距離值 (index 2) 無效位置改成 1e6 以利排序
+        all_dists = all_in[:, 2, :].clone()
+        all_dists[all_mask == 0] = 1e6
+        # C. 取得最近的前 MAX_OBJ 個索引
+        num_to_take = min(all_in.shape[2], MAX_OBJ)
+        _, indices = torch.topk(all_dists, k=num_to_take, dim=1, largest=False) # 由近到遠
+        # D. 根據索引提取特徵
+        indices_expanded = indices.unsqueeze(1).expand(-1, FEAT_IN_DIM, -1)
+        sorted_in = torch.gather(all_in, 2, indices_expanded)
+        # E. 重新提取對應這些索引的 Mask，將 sorted_in 再次抹零 (確保 1e6 不會進網路)
+        # 這是為了處理那些「雖然被選進 topk 但其實是 1e6 填充物」的物件
+        final_mask = torch.gather(all_mask, 1, indices)
+        sorted_in = sorted_in * final_mask.unsqueeze(1)
+
+        # 初始化最終輸入矩陣並填充
         mixed_in = torch.zeros((POP_SIZE, FEAT_IN_DIM, MAX_OBJ), device=DEVICE)
-        mixed_in[:, :, :num_to_take] = sorted_all_in
+        mixed_in[:, :, :num_to_take] = sorted_in
 
         # 自身狀態維持不變
         speed = self.forward_speed / POP_MAX_SPEED
         last_steer = self.last_actions[:, 0]
         self_in = torch.stack([speed, last_steer, self.energy / MAX_ENERGY], dim=1)
+
+        # 1. 取得類別 ID 矩陣
+        all_categories = all_in[:, 4:, :].argmax(dim=1)
+        topk_categories = sorted_in[:, 4:, :].argmax(dim=1)
+
+        # 2. 儲存結果張量 (預填 -1)
+        # 全域感知
+        self.valid_objects = torch.full_like(all_categories, -1, dtype=torch.long)
+        v_mask = all_mask > 0.0
+        self.valid_objects[v_mask] = all_categories[v_mask]
+        # 輸入模型 (Top-K)
+        self.input_objects = torch.full_like(topk_categories, -1, dtype=torch.long)
+        i_mask = final_mask > 1e-3
+        self.input_objects[i_mask] = topk_categories[i_mask]
+        
+        # 3. 判斷掠食者 (ID 3) 是否存在
+        # 因為已經填了 -1，現在判斷變得非常直觀且快速
+        pred_in_perceived = (self.valid_objects == 3).any(dim=1)
+        pred_in_input = (self.input_objects == 3).any(dim=1)
+        
+        # 4. 顏色決定邏輯
+        en_ratio = (self.energy / MAX_ENERGY).view(-1, 1)
+        # 預設：能量比例色
+        self.color = torch.cat([en_ratio, 0.5 * en_ratio, 1.0 - en_ratio], dim=1)
+
+        # 情況 A：看得到但沒進輸入層 -> 黃色警告 [1, 1, 0]
+        yellow_mask = pred_in_perceived & (~pred_in_input)
+        if yellow_mask.any():
+            self.color[yellow_mask] = torch.tensor([1.0, 1.0, 0.0], device=DEVICE)
+        # 情況 B：看得到且已進輸入層 -> 紅色危險 [1, 0, 0]
+        red_mask = pred_in_perceived & pred_in_input
+        if red_mask.any():
+            self.color[red_mask] = torch.tensor([1.0, 0.0, 0.0], device=DEVICE)
 
         return (mixed_in, self_in)
     
@@ -1285,12 +1322,23 @@ class RLSimulation:
                                       torch.tensor([0.47, 0.0, 0.0], device=DEVICE))
                 d_rad = torch.full((d_pos.shape[0], 1), 3.0, device=DEVICE)
                 self.renderer.draw_circles(d_pos, d_rad, d_color)
+                # 顯示復活倒數 (Agent 上方)
+                d_pos_np = d_pos.cpu().numpy()
+                d_rad_np = d_rad.cpu().numpy().flatten()
+                for i in range(len(d_pos)):
+                    px, py = d_pos_np[i]
+                    radius = d_rad_np[i]
+                    t_tmr_np = self.respawn_timer[dead_mask].cpu().numpy()
+                    tmr_text = f"{t_tmr_np[i]:.0f}"
+                    tmr_surf = self.font.render(tmr_text, True, (255, 255, 255))
+                    tmr_rect = tmr_surf.get_rect(center=(int(px), int(py - radius - 8)))
+                    self.ui_surface.blit(tmr_surf, tmr_rect)
 
             # 處理存活 Agents
             if alive_mask.any():
                 a_pos = self.pos[alive_mask]
                 en_ratio = (self.energy[alive_mask] / MAX_ENERGY).unsqueeze(1)
-                a_color = torch.cat([en_ratio, 0.5 * en_ratio, 1.0 - en_ratio], dim=1)
+                a_color = self.color[alive_mask]
                 a_rad = (POP_RADIUS + 4 * en_ratio)
                 
                 # --- 智能體主體 ---
@@ -1367,6 +1415,9 @@ class RLSimulation:
                         a_spd_np = self.forward_speed[alive_mask].cpu().numpy()
                         a_rew_np = self.rewards[alive_mask].cpu().numpy()
 
+                        if verbose >= 3:
+                            a_inp_np = self.input_objects[alive_mask].cpu().numpy()
+
                     for i in range(len(a_pos_np)):
                         px, py = a_pos_np[i]
                         radius = a_rad_np[i]
@@ -1379,7 +1430,12 @@ class RLSimulation:
 
                         # 顯示除錯訊息 (Agent 下方)
                         if verbose >= 2:
-                            dbg_text = f"{a_str_np[i]:.2f} {a_thr_np[i]:.2f} {a_spd_np[i]:.2f} {a_rew_np[i]:.4f}"
+                            if verbose == 2:
+                                dbg_text = f"{a_str_np[i]:.2f} {a_thr_np[i]:.2f} {a_spd_np[i]:.2f} {a_rew_np[i]:.4f}"
+                            elif verbose == 3:
+                                row = a_inp_np[i]
+                                actual_ids = row[row != -1].tolist()
+                                dbg_text = f"{actual_ids}"
                             dbg_surf = self.font.render(dbg_text, True, (255, 255, 255))
                             dbg_rect = dbg_surf.get_rect(center=(int(px), int(py + radius + 8)))
                             self.ui_surface.blit(dbg_surf, dbg_rect)
@@ -1538,7 +1594,7 @@ class RLSimulation:
                             elif event.key == pygame.K_m:
                                 move_predator = not move_predator
                             elif event.key == pygame.K_v:
-                                verbose = (verbose + 1) % 3
+                                verbose = (verbose + 1) % 4
                             elif event.key == pygame.K_r:
                                 if video_thread and video_thread.is_alive():
                                     stop_record()
