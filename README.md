@@ -47,7 +47,8 @@
 * 目前最穩定的版本。
 
 ### 7. 加入RNN成為RecurrentSAC版本 (`survivors7.py`)
-* 但還沒成功。
+* 從 `survivors6.py` 繼承的環境特徵資料計算方式有誤，連同 `survivors6.py` 一起修復後，即可正常訓練。
+* 各項表現均略優於 `survivors6.py`，但訓練時間也比較長，`survivors6.py` FPS在 100~130，而 `survivors7.py` 只有 67~74。
 
 
 ---
