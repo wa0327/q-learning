@@ -446,7 +446,7 @@ class GLRenderer:
 class RLSimulation:
     def __init__(self, args):
         self.args = args
-        self.fps = 300
+        self.fps = 0
         pygame.init()
         if not args.headless:
             self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
@@ -900,24 +900,24 @@ class RLSimulation:
         self.kill(starved)
 
         # --- 移動獎勵計算 ---
-        # 1. 有效前進速度
+        # 有效前進速度
         self.forward_speed = torch.linalg.vecdot(self.vel, pop_vecs)
-        # 2. 前進純度
+        # 前進純度
         vel_mag = torch.norm(self.vel, dim=1, keepdim=True) + 1e-6
         vel_purity = torch.relu(torch.linalg.vecdot(self.vel / vel_mag, pop_vecs))
-        # 2. 基礎移動獎勵
+        # 1. 基礎移動獎勵
         move_reward =  MOVE_REWARD * 2.5 * (torch.relu(self.forward_speed) / POP_MAX_SPEED) * vel_purity
         # 如果「側滑」太嚴重（速度方向與車頭方向不一），直接扣除所有移動獎勵
         # 我們定義一個「有效係數」，如果 purity < 0.8，move_reward 快速衰減
         eff_move_factor = torch.pow(vel_purity, 4) # 0.8^4 剩下約 0.4，0.7^4 剩下 0.24
         move_reward = move_reward * eff_move_factor
-        # 3. 動作變動量懲罰 (要求動作平滑度)
+        # 2. 動作變動量懲罰 (要求動作平滑度)
         action_diff = actions - self.last_actions
         smooth_penalty = MOVE_REWARD * 0.2 * torch.mean((action_diff).pow(2), dim=1)
-        # 4. 控制油門效率懲罰
+        # 3. 控制油門效率懲罰
         abs_throttle = torch.abs(throttle_vals)
         throttle_penalty = MOVE_REWARD * 0.2 * torch.relu(abs_throttle - 0.75)
-        # 5. 轉向懲罰
+        # 4. 轉向懲罰
         steer_penalty = MOVE_REWARD * 0.3 * torch.pow(steer_vals * throttle_vals, 2)
         # 5. 角速度懲罰，如果原地轉圈(forward_speed小)，但steer大，扣分加劇
         # 引入【旋轉臨界懲罰】：當夾角過大(purity過低)，懲罰指數級上升
@@ -1423,7 +1423,6 @@ class RLSimulation:
         win_w, win_h = pygame.display.get_window_size()
         self.renderer.blit_to_screen(win_w, win_h)
         pygame.display.flip()
-        self.clock.tick(self.fps)
 
     def run(self, args):
         running = True
@@ -1439,7 +1438,7 @@ class RLSimulation:
         video_thread = None
         frame_queue = None
 
-        self.fps_avg = self.clock.get_fps()
+        self.fps_avg = 0.0
         self.last_states = self.get_states()
 
         def start_record():
@@ -1528,13 +1527,16 @@ class RLSimulation:
                         if self.frames >= args.frames:
                             running = False
 
+                if self.fps_avg == 0.0:
+                    if self.frames > 300:
+                        self.fps_avg = self.clock.get_fps()
+                else:
+                    self.fps_avg = self.fps_avg * 0.9996 + self.clock.get_fps() * 0.0004
                 if args.headless:
-                    self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
                     self.clock.tick(self.fps)
                 else:
-                    self.fps_avg = self.fps_avg * 0.99 + self.clock.get_fps() * 0.01
                     self.draw(draw_label, draw_units, draw_perception, draw_alert, verbose)
-
+                    self.clock.tick(self.fps)
                     if video_thread and video_thread.is_alive():
                         self.fbo.read_into(self.pbo, components=3)
                         frame_queue.put(self.pbo.read())
