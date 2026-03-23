@@ -50,6 +50,9 @@
 * 從 `survivors6.py` 繼承的環境特徵資料計算方式有誤，連同 `survivors6.py` 一起修復後，即可正常訓練。
 * 各項表現均略優於 `survivors6.py`，但訓練時間也比較長，`survivors6.py` FPS在 100~130，而 `survivors7.py` 只有 67~74。
 
+### 8. 繼承自 `survivors6.py` 的 `survivors8.py`，將自身狀態擴展至 7 維，加入了 dx, dy, omega_yaw。
+
+### 9. 使用 gymnasium+stable_baseline3 框架 (`survivors9.py`)
 
 ---
 
