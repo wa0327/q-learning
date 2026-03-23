@@ -14,7 +14,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, CallbackList
 import argparse
 
 script_name = Path(__file__).stem
@@ -31,7 +31,7 @@ os.makedirs(LOG_PATH, exist_ok=True)
 # ==========================================
 # 參數設定
 # ==========================================
-STAGE = 3
+STAGE = 2 # 1:學走路 2:學吃飯 3:學初級躲避 4:學高級躲避 5:煉獄模式
 SCREEN_W, SCREEN_H = 1280, 800
 POP_MAX_SPEED = 3.5
 POP_RADIUS = 4
@@ -40,30 +40,30 @@ POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER = math.radians(15)
 POP_PERCEPTION_RADIUS = 200
 # 生存難度系數
-STAGE_SURVIVAL_MULTIPLIER = 2 if STAGE < 1 else 10 if STAGE < 2 else 3 if STAGE < 3 else 2 if STAGE < 4 else 1
+STAGE_SURVIVAL_MULTIPLIER = 100 if STAGE < 2 else 5 if STAGE < 3 else 2 if STAGE < 4 else 1
 EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED * STAGE_SURVIVAL_MULTIPLIER # 根據速度與「生存者需跑完對角線 71.5%」的目標，推算出所需步數
 
 # 環境物件設定
-FOOD_SIZE = 50 if STAGE < 2 else 25 if STAGE < 5 else 5
+FOOD_SIZE = 5 if STAGE < 2 else 50 if STAGE < 3 else 25 if STAGE < 5 else 5
 FOOD_RADIUS = 3
 MAX_ENERGY = 100.0
 FOOD_ENERGY = 25.0
-ENERGY_DECAY = 0 if STAGE == 1 else FOOD_ENERGY / EST_STEPS
+ENERGY_DECAY = FOOD_ENERGY / EST_STEPS
 MOVE_FOOD = False if STAGE < 4 else True
 PREDATOR_SIZE = 0 if STAGE < 3 else 5 if STAGE < 4 else 8 if STAGE < 5 else 16
 PREDATOR_RADIUS = 20.0
 PREDATOR_MIN_SPEED = 1.5
-PREDATOR_MAX_SPEED = 2.5 if STAGE < 3 else 3.0 if STAGE < 4 else 3.4
+PREDATOR_MAX_SPEED = 2.5 if STAGE < 4 else 3.0 if STAGE < 5 else 3.2
 POP_ALERT_RADIUS = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58)
 RND_POS_PADDING = POP_RADIUS + POP_ALERT_RADIUS  # 隨機取位邊距
 WALL_SIZE = 0
 
 # 獎懲設定
-FOOD_REWARD = 100 if STAGE < 1 else 50.0    # 吃到食物
+FOOD_REWARD = 50.0    # 吃到食物
 KILLED_REWARD = -75   # 被殺
 COLLIDED_REWARD = -60 # 撞死
 STARVED_REWARD = -70  # 餓死
-MOVE_REWARD_FACTOR = 0.35 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
+MOVE_REWARD_FACTOR = 2.0 if STAGE < 2 else 0.35 # [移動總獎勵]與[最大獎勵]的佔比，數值越低對模型越驅策
 MOVE_REWARD = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS # 移動基礎獎勵
 TIME_PENALTY_FACTOR = 0 if STAGE == 1 else 0.15 # [餓死前的總懲罰]與[餓死懲罰]的佔比，數值越低對模型來說越划算
 STEP_REWARD = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS # 每步時間獎懲
@@ -101,11 +101,12 @@ class SurvivorsEnv(gym.Env):
     """
     自訂的 Gymnasium 環境，遵循標準介面: reset, step, render, close
     """
-    metadata = {"render_modes": ["human"], "render_fps": 0}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, render_fps=120):
         super().__init__()
         self.render_mode = render_mode
+        self.render_fps = render_fps
         
         # 動作空間：[轉向, 油門]，範圍 [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(ACTOR_OUT_DIM,), dtype=np.float32)
@@ -118,6 +119,7 @@ class SurvivorsEnv(gym.Env):
         
         self.move_food = MOVE_FOOD
         self.move_predator = True
+        self.verbose = 0
 
         # 牆壁定義 (對應原本的 add_wall_group)
         self.walls = [
@@ -156,6 +158,7 @@ class SurvivorsEnv(gym.Env):
         reward = STEP_REWARD
         terminated = False
         truncated = False
+        death_reason = None
         
         # 取得控制值
         steer_val = np.clip(action[0], -1.0, 1.0)
@@ -195,6 +198,7 @@ class SurvivorsEnv(gym.Env):
             if np.any(dists_to_pred < (POP_RADIUS + PREDATOR_RADIUS)):
                 reward += KILLED_REWARD
                 terminated = True
+                death_reason = 'killed'
             # 靠近告警
             elif np.any(dists_to_pred < POP_ALERT_RADIUS):
                 reward += PREDATOR_NEARBY_REWARD
@@ -206,6 +210,7 @@ class SurvivorsEnv(gym.Env):
                 if dist < POP_RADIUS:
                     reward += COLLIDED_REWARD
                     terminated = True
+                    death_reason = 'collided'
                     break
                 elif dist < POP_ALERT_RADIUS:
                     reward += WALL_NEARBY_REWARD
@@ -234,6 +239,7 @@ class SurvivorsEnv(gym.Env):
             if self.energy <= 0:
                 reward += STARVED_REWARD
                 terminated = True
+                death_reason = 'starved'
 
         # --- 移動獎勵計算 ---
         if not terminated:
@@ -279,7 +285,9 @@ class SurvivorsEnv(gym.Env):
         # 更新歷史
         self.last_action = action.copy()
         obs = self._get_obs()
-        info = {}
+        info = {
+            "death_reason": death_reason
+        }
 
         if self.render_mode == "human":
             self.render()
@@ -287,7 +295,8 @@ class SurvivorsEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _update_entities(self, pos_arr, vel_arr, radius, min_speed, max_speed):
-        if len(pos_arr) == 0: return
+        if len(pos_arr) == 0:
+            return
         # 加入擾動
         change_mask = np.random.rand(len(pos_arr), 1) < 0.05
         vel_arr += (np.random.rand(*vel_arr.shape) - 0.5) * (1.8 * change_mask)
@@ -380,11 +389,16 @@ class SurvivorsEnv(gym.Env):
         pygame.draw.line(canvas, (255, 255, 255), self.pos.astype(int), end_pos.astype(int), 2)
 
         self.window.blit(canvas, canvas.get_rect())
-        pygame.display.flip()
         
         # 處理 pygame 事件避免視窗無回應
         pygame.event.pump()
-        self.clock.tick(self.metadata["render_fps"])
+        if self.render_mode == "human":
+            # 這會確保展示時不會太快，且視窗不會失去響應
+            pygame.display.flip()
+            self.clock.tick(self.render_fps)
+        elif self.render_mode == "rgb_array":
+            # 如果是為了錄影，就不需要 tick，直接回傳像素矩陣
+            return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2))
 
     def close(self):
         if self.window is not None:
@@ -461,27 +475,60 @@ class RenderEvalCallback(BaseCallback):
             print("[Callback] 展示結束，繼續並行訓練...\n")
         return True
 
-# ==========================================
-# 主程式執行區塊
-# ==========================================
+class DeathAnalysisCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.death_counts = {"killed": 0, "collided": 0, "starved": 0}
+
+    def _on_step(self) -> bool:
+        # SB3 會把每個環境的 info 放在 self.locals["infos"]
+        for info in self.locals["infos"]:
+            if "death_reason" in info:
+                reason = info["death_reason"]
+                if reason in self.death_counts:
+                    self.death_counts[reason] += 1
+                    
+        # 每隔一段時間紀錄到 TensorBoard
+        if self.n_calls % 1000 == 0:
+            for reason, count in self.death_counts.items():
+                self.logger.record(f"deaths/{reason}", count)
+
+        return True
+    
 def make_env(rank, render_mode=None):
     def _init():
         env = SurvivorsEnv(render_mode=render_mode)
-        env = TimeLimit(env, max_episode_steps=5000)
-        env = Monitor(env)
         check_env(env, warn=True)
+
+        max_steps = None
+        if STAGE == 1:
+            max_steps = 3000
+        elif STAGE == 2:
+            max_steps = 5000
+        elif STAGE == 3:
+            max_steps = 10000
+        elif STAGE == 4:
+            max_steps = 8000
+        if max_steps:
+            env = TimeLimit(env, max_episode_steps=max_steps)
+
+        env = Monitor(env)
         return env
     
     return _init
 
+# ==========================================
+# 主程式執行區塊
+# ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=CAPTION)
     parser.add_argument("-e", "--epoch", type=str, default=None, help="一個訓練週期")
     parser.add_argument("-s", "--steps", type=int, default=float('inf'), help="達到此步數時退出")
+    parser.add_argument("--vec", type=int, default=16, help="並行環境數量")
     parser.add_argument("-r", "--record", action="store_true", default=False, help="啟動即開始錄影")
     parser.add_argument("--demo", action="store_true", default=False, help="模型性能展示")
     parser.add_argument("--frames", type=int, default=float('inf'), help="模型性能展示幀數")
-    parser.add_argument("--headless", action="store_true", default=False, help="無頭模式")
+    parser.add_argument("--ui", action="store_true", default=False, help="UI模式")
     args = parser.parse_args()
 
     if args.demo:
@@ -489,12 +536,11 @@ if __name__ == "__main__":
             print(f"錯誤：找不到權重檔案 {FINAL_FULL_PATH}")
         else:
             # 展示訓練成果 (開啟渲染)
-            env = DummyVecEnv([make_env(0, render_mode='human')])
-            model = SAC.load(FINAL_PATH, env=env)
-            obs = env.reset()
-
+            venv = DummyVecEnv([make_env(0, render_mode='human')])
+            model = SAC.load(FINAL_FULL_PATH, env=venv)
+            # print(model.policy)
+            obs = venv.reset()
             try:
-                print("=== 啟動展示模式 ===")
                 running = True
                 while running:
                     for event in pygame.event.get():
@@ -503,45 +549,46 @@ if __name__ == "__main__":
                         elif event.type == pygame.KEYDOWN:
                             if event.key == pygame.K_ESCAPE:
                                 running = False
+                            elif event.key == pygame.K_f:
+                                val = venv.envs[0].get_wrapper_attr("move_food")
+                                venv.envs[0].set_wrapper_attr("move_food", not val)
+                            elif event.key == pygame.K_m:
+                                val = venv.envs[0].get_wrapper_attr("move_predator")
+                                venv.envs[0].set_wrapper_attr("move_predator", not val)
+                            elif event.key == pygame.K_v:
+                                val = venv.envs[0].get_wrapper_attr("verbose")
+                                venv.envs[0].set_wrapper_attr("verbose", (val + 1) % 4)
 
                     action, _ = model.predict(obs, deterministic=True)
-                    obs, rewards, dones, infos = env.step(action)
-                print("=== 結束展示模式 ===")
+                    obs, rewards, dones, infos = venv.step(action)
+                    if dones:
+                        obs = venv.reset()
             except KeyboardInterrupt:
                 pass
 
-            env.close()
+            venv.close()
     else:
         # 建立並行環境 (Vectorized Environments)
-        VEC_NUM = 24 # 要並行開啟的環境實例數量
-        if VEC_NUM > 1:
-            envs = [make_env(i) for i in range(VEC_NUM)]
-            env = SubprocVecEnv(envs)
+        if args.vec > 1:
+            venv = [make_env(i) for i in range(args.vec)]
+            venv = SubprocVecEnv(venv)
         else:
-            envs = [make_env(0)]
-            env = DummyVecEnv(envs)
+            if args.ui:
+                venv = make_env(0, render_mode='human')
+            else:
+                venv = make_env(0)
+            venv = DummyVecEnv([venv])
 
         if os.path.exists(FINAL_FULL_PATH):
             print("加載舊模型繼續訓練...")
-            model = SAC.load(FINAL_FULL_PATH, env=env)
+            model = SAC.load(FINAL_FULL_PATH, env=venv)
         else:
             print("建立新模型...")
-            # 注入我們自訂的 Attention 特徵提取器
-            policy_kwargs = dict(
-                features_extractor_class=CustomFeaturesExtractor,
-                features_extractor_kwargs=dict(features_dim=HIDDEN_FC_DIM),
-                net_arch=dict(
-                    pi=[HIDDEN_FC_DIM],
-                    qf=[HIDDEN_FC_DIM]
-                ),
-                activation_fn=nn.ReLU
-            )
-            # 建立 SAC 模型
             model = SAC(
-                "MultiInputPolicy", # 處理 Dict 觀察空間必須用這個
-                env,
+                "MultiInputPolicy",
+                venv,
                 learning_rate=0.0003,
-                buffer_size=25000 * VEC_NUM,
+                buffer_size=200000,
                 learning_starts=100,
                 batch_size=512,
                 tau=0.005  ,
@@ -551,26 +598,43 @@ if __name__ == "__main__":
                 ent_coef='auto',
                 target_entropy='auto',
                 tensorboard_log=LOG_PATH,
-                policy_kwargs=policy_kwargs,
+                policy_kwargs=dict(
+                    features_extractor_class=CustomFeaturesExtractor,
+                    features_extractor_kwargs=dict(features_dim=HIDDEN_FC_DIM),
+                    net_arch=dict(
+                        pi=[HIDDEN_FC_DIM],
+                        qf=[HIDDEN_FC_DIM]
+                    ),
+                    activation_fn=nn.ReLU
+                ),
                 verbose=2,
                 device='cuda'
             )
 
-        # 每 save_freq 步存一次檔
-        checkpoint_callback = CheckpointCallback(
-            save_freq=10000, 
-            save_path=BASE_PATH, 
-            name_prefix=script_name
-        )
+        callbacks = [DeathAnalysisCallback()]
+        if args.epoch:
+            callbacks.append(CheckpointCallback(
+                save_freq=10000, 
+                save_path=f'{BASE_PATH}', 
+                name_prefix=f'{script_name}_{args.epoch}'
+            ))
 
-        print(f"啟動 {VEC_NUM} 個進程進行並行訓練... (按 Ctrl+C 提早中斷)")
+        print(f"啟動 {args.vec} 個進程進行並行訓練... (按 Ctrl+C 提早中斷)")
         try:
             # 進行訓練
-            model.learn(total_timesteps=10000 * VEC_NUM, callback=checkpoint_callback)
+            model.learn(
+                total_timesteps=args.steps * args.vec,
+                callback=CallbackList(callbacks),
+                log_interval=4,
+                tb_log_name=args.epoch if args.epoch else "SAC",
+                progress_bar=True
+            )
             model.save(FINAL_PATH)
             print(f"訓練結束，模型儲存至 {FINAL_PATH}。")
+            if args.epoch:
+                model.save(f"{SAVE_PATH}_{args.epoch}")
         except KeyboardInterrupt:
             print("訓練提早中斷，正在儲存模型...")
             model.save(INTERRUPTED_PATH)
 
-        env.close()
+        venv.close()
