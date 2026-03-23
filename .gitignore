@@ -1,6 +1,5 @@
 .venv
-*.pt
 *.mp4
 *.log
 logs/
-models/
+weights/
