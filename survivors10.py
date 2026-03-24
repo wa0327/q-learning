@@ -34,11 +34,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Constants (from survivors8.py)
-# ═══════════════════════════════════════════════════════════════════════════
-DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
-DEVICE = torch.device(DEVICE_STR)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 畫面
 SCREEN_W, SCREEN_H = 1280, 800
@@ -46,54 +42,60 @@ SCALE = 1.0
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 
 # 代理物理
-NUM_ENVS          = 1       # VecEnv 同時跑的環境數 (每個環境內有 POP_SIZE 個 agent)
-POP_SIZE          = 50      # 每個環境中的 agent 數
+STAGE             = 1
+# VecEnv 同時跑的環境數 (每個環境內有 POP_SIZE 個 agent)
+NUM_ENVS          = 1
+# 每個環境中的 agent 數   
+POP_SIZE          = 1 if STAGE < 1 else 1000 if STAGE < 2 else 50 if STAGE < 5 else 1
 POP_MAX_SPEED     = 3.5
 POP_RADIUS        = 4
 POP_DAMPING_FACTOR = 0.25
 POP_BACKWARD_FACTOR = 0.33
 POP_MAX_STEER     = math.radians(15)
 POP_PERCEPTION_RADIUS = 200
+POP_PERCEPT_TEAM = False if STAGE < 2 else True
 
 # 生存難度
-STAGE = 2
-STAGE_SURVIVAL_MULTIPLIER = 3
+STAGE_SURVIVAL_MULTIPLIER = 2 if STAGE < 1 else 10 if STAGE < 2 else 3 if STAGE < 3 else 2 if STAGE < 4 else 1
 EST_STEPS = math.sqrt(SCREEN_W**2 + SCREEN_H**2) * 0.715 / POP_MAX_SPEED * STAGE_SURVIVAL_MULTIPLIER
 
 # 食物
-FOOD_SIZE         = int(POP_SIZE * 1.5)
+FOOD_SIZE         = int(POP_SIZE * (1 if STAGE < 1 else 0.001 if STAGE < 2 else 1.5 if STAGE < 2 else 0.75 if STAGE < 4 else 0.5))
 FOOD_RADIUS       = 3
 MAX_ENERGY        = 100.0
 FOOD_ENERGY       = 25.0
-ENERGY_DECAY      = FOOD_ENERGY / EST_STEPS
-MOVE_FOOD         = False
+ENERGY_DECAY      = 0 if STAGE == 1 else FOOD_ENERGY / EST_STEPS # 每步消耗能量
+MOVE_FOOD         = False if STAGE < 4 else True
 
 # 掠食者
-PREDATOR_SIZE     = 5
+PREDATOR_SIZE     = 0 if STAGE < 3 else 5 if STAGE < 4 else 8
 PREDATOR_RADIUS   = 20.0
 PREDATOR_MIN_SPEED = 1.5
-PREDATOR_MAX_SPEED = 3.0
+PREDATOR_MAX_SPEED = 2.5 if STAGE < 3 else 3.0 if STAGE < 4 else 3.4
 POP_ALERT_RADIUS  = max(POP_MAX_SPEED, (PREDATOR_MAX_SPEED / POP_MAX_SPEED) ** 2 * 20.58)
 RND_POS_PADDING   = POP_RADIUS + POP_ALERT_RADIUS
 
 # 獎懲
-FOOD_REWARD        = 50.0
+FOOD_REWARD        = 100 if STAGE < 1 else 50.0
 KILLED_REWARD      = -75.0
 COLLIDED_REWARD    = -60.0
 STARVED_REWARD     = -70.0
 MOVE_REWARD_FACTOR = 0.35
 MOVE_REWARD        = FOOD_REWARD * MOVE_REWARD_FACTOR / EST_STEPS
-TIME_PENALTY_FACTOR = 0.15
+TIME_PENALTY_FACTOR = 0 if STAGE == 1 else 0.15
 STEP_REWARD        = STARVED_REWARD * TIME_PENALTY_FACTOR / EST_STEPS
 WALL_NEARBY_REWARD = COLLIDED_REWARD * 0.25
 PREDATOR_NEARBY_REWARD = KILLED_REWARD * 0.25
 
-# 觀測維度
-FEAT_IN_DIM  = 8   # 每物件特徵 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
-STATE_IN_DIM = 7   # 自身狀態
-MAX_OBJ      = 25
+# 模型核心參數
+FEAT_IN_DIM = 8         # 每個物件特微 [cos, sin, dist, energy, is_wall, is_food, is_team, is_pred]
+STATE_IN_DIM = 7        # 自身狀態 [前向速度, 側向速度, 前次轉向指令, 能量, dx_ego, dy_ego, omega_yaw]
+ACTOR_OUT_DIM = 2       # Actor 輸出層數，輸出動作 [轉向, 油門]
+HIDDEN_FEAT_DIM = 64    # 特徵提取層 (Conv1d) 的輸出維度(環境特徵)
+HIDDEN_ATTN_DIM = 32    # Attention 內部的隱藏層維度
+HIDDEN_FC_DIM = 256     # 後段全連接層 (MLP) 的主要維度(決策輸出)
+MAX_OBJ = 25            # 視野內最近距離中最多的環境物件數量
 OBS_DIM      = FEAT_IN_DIM * MAX_OBJ + STATE_IN_DIM  # 展平後的觀測向量大小
-NUM_ACTIONS  = 2   # [轉向, 油門]
 
 # PPO 最大步數 (episode truncation)
 MAX_EPISODE_STEPS = int(EST_STEPS * 2)
@@ -113,14 +115,14 @@ class SurvivorsVecEnv(VecEnv):
         "policy" → (total_agents, OBS_DIM)
     """
 
-    def __init__(self, num_envs: int = NUM_ENVS, device: str = DEVICE_STR):
+    def __init__(self, num_envs: int = NUM_ENVS, device: str = DEVICE):
         self._n_worlds = num_envs
         self._pop = POP_SIZE
         total = self._n_worlds * self._pop
 
         # ── VecEnv 必要屬性 ──
         self.num_envs           = total
-        self.num_actions        = NUM_ACTIONS
+        self.num_actions        = ACTOR_OUT_DIM
         self.max_episode_length = MAX_EPISODE_STEPS
         self.episode_length_buf = torch.zeros(total, dtype=torch.long, device=device)
         self.device             = device
@@ -192,7 +194,7 @@ class SurvivorsVecEnv(VecEnv):
         self.energy = torch.full((N,), MAX_ENERGY, device=dev)
         self.alive = torch.ones(N, dtype=torch.bool, device=dev)
         self.respawn_timer = torch.zeros(N, dtype=torch.long, device=dev)
-        self.last_actions = torch.zeros(N, NUM_ACTIONS, device=dev)
+        self.last_actions = torch.zeros(N, ACTOR_OUT_DIM, device=dev)
 
         self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=dev) * self.screen_size
         self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=dev) - 0.5) * 3.5
@@ -393,7 +395,6 @@ class SurvivorsVecEnv(VecEnv):
         N = self.num_envs
         dev = self.device
 
-        was_alive = self.alive.clone()
         rewards = torch.full((N,), STEP_REWARD, device=dev)
 
         steer_vals = actions[:, 0]
@@ -1068,7 +1069,7 @@ def train_loop(runner: OnPolicyRunner, env: SurvivorsVecEnv,
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
-    device    = DEVICE_STR
+    device    = DEVICE
     env       = SurvivorsVecEnv(num_envs=NUM_ENVS, device=device)
     renderer  = Renderer()
     train_cfg = make_train_cfg()
@@ -1076,7 +1077,7 @@ def main():
 
     print("=" * 60)
     print("  PPO Survivors — rsl-rl-lib v5")
-    print(f"  Agents: {env.num_envs}  ObsDim: {OBS_DIM}  Actions: {NUM_ACTIONS}")
+    print(f"  Agents: {env.num_envs}  ObsDim: {OBS_DIM}  Actions: {ACTOR_OUT_DIM}")
     print(f"  Food: {FOOD_SIZE}  Predators: {PREDATOR_SIZE}")
     print(f"  MaxSteps: {MAX_EPISODE_STEPS}  EstSteps: {EST_STEPS:.0f}")
     print("=" * 60)
