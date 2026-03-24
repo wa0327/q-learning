@@ -54,6 +54,8 @@
 
 ### 9. 使用 gymnasium+stable_baseline3 框架 (`survivors9.py`)
 
+### 10. 初版 RSL-RL 版本 survivors (`survivors10.py`)
+
 ---
 
 ## 🛠️ 技術關鍵字
