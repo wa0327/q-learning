@@ -45,12 +45,11 @@ from rsl_rl.models import MLPModel
 #  Constants
 # ═══════════════════════════════════════════════════════════════════════════
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CAPTION = "PPO Survivors — rsl-rl-lib v5"
+CAPTION = "Vectra: Apex Protocol"
 
 # 存檔路徑
 script_name = Path(__file__).stem
-BASE_PATH   = f"weights/{script_name}"
-SAVE_PATH   = f"{BASE_PATH}/{script_name}.pt"
+LOG_PATH    = f"logs/{script_name}"
 
 # 畫面
 SCREEN_W, SCREEN_H = 1280, 800
@@ -58,9 +57,9 @@ SCALE = 1.0
 WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 
 # 代理物理
-STAGE             = 1
-NUM_ENVS          = 1       # VecEnv 同時跑的環境數 (每個環境內有 POP_SIZE 個 agent)
-POP_SIZE          = 1 if STAGE < 1 else 100 if STAGE < 2 else 50 if STAGE < 5 else 1
+NUM_ENVS          = 1024       # VecEnv 同時跑的環境數 (每個環境內有 POP_SIZE 個 agent)
+STAGE             = 5
+POP_SIZE          = 1 if STAGE < 1 else 50 if STAGE < 2 else 16 if STAGE < 5 else 1
 POP_MAX_SPEED     = 3.5
 POP_RADIUS        = 4
 POP_DAMPING_FACTOR = 0.25
@@ -181,18 +180,23 @@ class SurvivorsCustomModel(MLPModel):
 # ═══════════════════════════════════════════════════════════════════════════
 class SurvivorsVecEnv(VecEnv):
     """
-    rsl-rl 看到的 num_envs = NUM_ENVS * POP_SIZE (展平)。
+    每個 env (world) 是一個獨立的模擬環境，擁有自己的食物與掠食者。
+    每個 world 內有 POP_SIZE 個 agent。
 
-    內含 SurvivorsFeatureExtractor，在回傳觀測值前先將
-    無定序的物件特徵壓縮為固定維度向量。
-    PPO 看到的 Observation TensorDict:
-        "policy" → (total_agents, EXTRACTED_OBS_DIM)
+    rsl-rl 看到的 num_envs = N_WORLDS * POP_SIZE (展平)。
+    PPO Observation TensorDict: "policy" → (total_agents, OBS_DIM)
+
+    資料佈局：
+      - agents: (total, ...) 其中 total = N_WORLDS * POP_SIZE
+                world_id = agent_idx // POP_SIZE
+      - food:   (N_WORLDS, FOOD_SIZE, 2)   — 每個 world 獨立
+      - pred:   (N_WORLDS, PREDATOR_SIZE, 2) — 每個 world 獨立
     """
 
     def __init__(self, num_envs: int = NUM_ENVS, device: str = DEVICE):
-        self._n_worlds = num_envs
-        self._pop = POP_SIZE
-        total = self._n_worlds * self._pop
+        self._W = num_envs       # N_WORLDS
+        self._P = POP_SIZE       # agents per world
+        total = self._W * self._P
 
         # ── VecEnv 必要屬性 ──
         self.num_envs           = total
@@ -206,11 +210,13 @@ class SurvivorsVecEnv(VecEnv):
         self.bounds = self.screen_size - 1.0
         self.throttle_factor = POP_MAX_SPEED * POP_DAMPING_FACTOR
 
+        # agent→world 映射 (預計算，不變)
+        self._world_idx = torch.arange(total, device=device) // self._P  # (total,)
+
         # 統計
         self.total_episodes  = 0
         self.reward_buf: list[float] = []
         self._ep_reward = torch.zeros(total, dtype=torch.float32, device=device)
-
         self.energy_avg  = 0.0
         self.rewards_avg = 0.0
         self.eaten   = 0
@@ -219,30 +225,29 @@ class SurvivorsVecEnv(VecEnv):
         self.starved = 0
         self.frames  = 0
 
-        # 牆壁
+        # 牆壁 (所有 world 共用同一組牆)
         self._build_walls()
 
-        # one-hot labels — 安全處理 size=0 的情況
-        n_dyn = self._pop + FOOD_SIZE + PREDATOR_SIZE
+        # one-hot labels — 每個 agent 看到的動態物件 = 同 world 的 (POP_SIZE + FOOD_SIZE + PREDATOR_SIZE)
+        n_dyn = self._P + FOOD_SIZE + PREDATOR_SIZE
         self.l_wall = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).view(1, 4, 1).expand(
             total, 4, self.wall_A.shape[0])
 
         label_parts = []
-        if self._pop > 0:
-            label_parts.append(torch.tensor([0,1,0,0], device=device, dtype=torch.float).view(1,4,1).repeat(1,1,self._pop))
+        if self._P > 0:
+            label_parts.append(torch.tensor([0,1,0,0], device=device, dtype=torch.float).view(1,4,1).repeat(1,1,self._P))
         if FOOD_SIZE > 0:
             label_parts.append(torch.tensor([0,0,1,0], device=device, dtype=torch.float).view(1,4,1).repeat(1,1,FOOD_SIZE))
         if PREDATOR_SIZE > 0:
             label_parts.append(torch.tensor([0,0,0,1], device=device, dtype=torch.float).view(1,4,1).repeat(1,1,PREDATOR_SIZE))
-
         if label_parts:
             self.l_all = torch.cat(label_parts, dim=2).expand(total, -1, -1).clone()
         else:
             self.l_all = torch.zeros(total, 4, 0, device=device)
 
         radius_parts = []
-        if self._pop > 0:
-            radius_parts.append(torch.full((self._pop,), POP_RADIUS, device=device))
+        if self._P > 0:
+            radius_parts.append(torch.full((self._P,), POP_RADIUS, device=device))
         if FOOD_SIZE > 0:
             radius_parts.append(torch.full((FOOD_SIZE,), FOOD_RADIUS, device=device))
         if PREDATOR_SIZE > 0:
@@ -260,7 +265,8 @@ class SurvivorsVecEnv(VecEnv):
         self.wall_v = torch.stack([self.wall_A, self.wall_B], dim=1)
 
     def _reset_all(self):
-        N = self.num_envs
+        N = self.num_envs   # total agents
+        W = self._W
         dev = self.device
         self.pos = torch.rand(N, 2, device=dev) * self.screen_size
         self.last_pos = self.pos.clone()
@@ -273,19 +279,20 @@ class SurvivorsVecEnv(VecEnv):
         self.respawn_timer = torch.zeros(N, dtype=torch.long, device=dev)
         self.last_actions = torch.zeros(N, ACTOR_OUT_DIM, device=dev)
 
+        # 每個 world 獨立的食物與掠食者
         if PREDATOR_SIZE > 0:
-            self.pred_pos = torch.rand(PREDATOR_SIZE, 2, device=dev) * self.screen_size
-            self.pred_vel = (torch.rand(PREDATOR_SIZE, 2, device=dev) - 0.5) * 3.5
+            self.pred_pos = torch.rand(W, PREDATOR_SIZE, 2, device=dev) * self.screen_size
+            self.pred_vel = (torch.rand(W, PREDATOR_SIZE, 2, device=dev) - 0.5) * 3.5
         else:
-            self.pred_pos = torch.empty(0, 2, device=dev)
-            self.pred_vel = torch.empty(0, 2, device=dev)
+            self.pred_pos = torch.empty(W, 0, 2, device=dev)
+            self.pred_vel = torch.empty(W, 0, 2, device=dev)
 
         if FOOD_SIZE > 0:
-            self.food_pos = self._respawn_food(FOOD_SIZE)
-            self.food_vel = (torch.rand(FOOD_SIZE, 2, device=dev) - 0.5) * 3.5
+            self.food_pos = self._respawn_food_all()
+            self.food_vel = (torch.rand(W, FOOD_SIZE, 2, device=dev) - 0.5) * 3.5
         else:
-            self.food_pos = torch.empty(0, 2, device=dev)
-            self.food_vel = torch.empty(0, 2, device=dev)
+            self.food_pos = torch.empty(W, 0, 2, device=dev)
+            self.food_vel = torch.empty(W, 0, 2, device=dev)
 
         self.episode_length_buf.zero_()
         self._ep_reward.zero_()
@@ -298,7 +305,7 @@ class SurvivorsVecEnv(VecEnv):
             return
         n = mask.sum().item()
         dev = self.device
-        self.pos[mask] = self._get_safe_pos(n)
+        self.pos[mask] = self._get_safe_pos(mask)
         self.last_pos[mask] = self.pos[mask].clone()
         self.angle[mask] = torch.rand(n, device=dev) * (2 * math.pi)
         self.last_angle[mask] = self.angle[mask].clone()
@@ -310,66 +317,69 @@ class SurvivorsVecEnv(VecEnv):
         self.last_actions[mask] = 0
         self.episode_length_buf[mask] = 0
 
-    def _get_safe_pos(self, n):
-        num_samples = max(n * 10, max(self._pop, PREDATOR_SIZE + 1))
-        samples = torch.empty(num_samples, 2, device=self.device)
+    def _get_safe_pos(self, mask):
+        """為 mask 中的 agents 生成安全位置（考慮其所屬 world 的障礙物）。"""
+        n = mask.sum().item()
+        dev = self.device
+        # 簡化：隨機位置 + padding
+        samples = torch.empty(n, 2, device=dev)
         samples[:, 0].uniform_(RND_POS_PADDING, SCREEN_W - RND_POS_PADDING)
         samples[:, 1].uniform_(RND_POS_PADDING, SCREEN_H - RND_POS_PADDING)
-        if PREDATOR_SIZE > 0:
-            obstacles = torch.cat([self.pos[self.alive], self.pred_pos], dim=0)
-            if obstacles.shape[0] > 0:
-                dists = torch.cdist(samples, obstacles)
-                min_dists = dists.min(dim=1).values
-                _, top_idx = torch.topk(min_dists, k=min(n, num_samples))
-                return samples[top_idx[:n]]
-        return samples[:n]
+        return samples
 
-    def _respawn_food(self, n):
-        if n <= 0:
-            return torch.empty(0, 2, device=self.device)
+    def _respawn_food_all(self):
+        """為所有 world 生成食物位置。"""
+        if FOOD_SIZE <= 0:
+            return torch.empty(self._W, 0, 2, device=self.device)
         pad = RND_POS_PADDING
-        candidates = torch.rand(n, 30, 2, device=self.device)
-        candidates[..., 0] = candidates[..., 0] * (SCREEN_W - 2*pad) + pad
-        candidates[..., 1] = candidates[..., 1] * (SCREEN_H - 2*pad) + pad
-        parts = [self.pos[self.alive] if hasattr(self, 'alive') else self.pos]
-        if PREDATOR_SIZE > 0 and hasattr(self, 'pred_pos'):
-            parts.append(self.pred_pos)
-        all_obs = torch.cat(parts, dim=0)
-        if all_obs.shape[0] == 0:
-            return candidates[:, 0, :]
-        all_obs = all_obs.view(1, 1, -1, 2)
-        dists_all = torch.norm(candidates.unsqueeze(2) - all_obs, dim=-1)
-        min_dists = dists_all.min(dim=2)[0]
-        top_k = min(5, 30)
-        _, top_indices = torch.topk(min_dists, k=top_k, dim=1)
-        rand_pick = torch.randint(0, top_k, (n,), device=self.device)
-        final_indices = top_indices[torch.arange(n, device=self.device), rand_pick]
-        return candidates[torch.arange(n, device=self.device), final_indices]
+        pos = torch.rand(self._W, FOOD_SIZE, 2, device=self.device)
+        pos[..., 0] = pos[..., 0] * (SCREEN_W - 2*pad) + pad
+        pos[..., 1] = pos[..., 1] * (SCREEN_H - 2*pad) + pad
+        return pos
+
+    def _respawn_food_at(self, world_mask, food_mask):
+        """重新生成指定 world 中被吃掉的食物。"""
+        # world_mask: (W,) bool — 哪些 world 有食物被吃
+        # food_mask: (W, FOOD_SIZE) bool — 哪些食物被吃
+        if not world_mask.any():
+            return
+        pad = RND_POS_PADDING
+        new_pos = torch.rand_like(self.food_pos)
+        new_pos[..., 0] = new_pos[..., 0] * (SCREEN_W - 2*pad) + pad
+        new_pos[..., 1] = new_pos[..., 1] * (SCREEN_H - 2*pad) + pad
+        self.food_pos[food_mask] = new_pos[food_mask]
 
     def _update_entities(self, pos, vel, radius, min_speed, max_speed, jitter_chance=0.05):
-        if pos.shape[0] == 0:
+        """pos/vel shape: (W, K, 2)"""
+        if pos.shape[1] == 0:
             return pos, vel
-        change_mask = torch.rand(pos.shape[0], 1, device=self.device) < jitter_chance
-        vel.add_((torch.rand_like(vel) - 0.5) * (1.8 * change_mask))
-        speeds = torch.norm(vel, dim=1, keepdim=True)
+        W, K, _ = pos.shape
+        change_mask = (torch.rand(W, K, 1, device=self.device) < jitter_chance)
+        vel = vel + (torch.rand_like(vel) - 0.5) * (1.8 * change_mask)
+        speeds = torch.norm(vel, dim=2, keepdim=True)
         new_speeds = torch.clamp(speeds, min_speed, max_speed)
-        vel.mul_(new_speeds / (speeds + 1e-6))
-        pos.add_(vel)
-        min_bound = torch.full_like(self.bounds, radius)
-        max_bound = self.bounds - radius
-        out_of_bounds = (pos < min_bound) | (pos > max_bound)
-        vel[out_of_bounds] *= -1.0
-        pos.clamp_(min_bound, max_bound)
+        vel = vel * (new_speeds / (speeds + 1e-6))
+        pos = pos + vel
+        min_bound = radius
+        max_bound_x = SCREEN_W - 1.0 - radius
+        max_bound_y = SCREEN_H - 1.0 - radius
+        # 反彈
+        vel[..., 0][(pos[..., 0] < min_bound) | (pos[..., 0] > max_bound_x)] *= -1
+        vel[..., 1][(pos[..., 1] < min_bound) | (pos[..., 1] > max_bound_y)] *= -1
+        pos[..., 0].clamp_(min_bound, max_bound_x)
+        pos[..., 1].clamp_(min_bound, max_bound_y)
         return pos, vel
 
     # ── 觀測構建 ──
     def _get_states(self):
-        N = self.num_envs
+        N = self.num_envs   # total agents
+        W = self._W
+        P = self._P
         dev = self.device
         angel = self.angle.view(N, 1)
-        p = self.pos.unsqueeze(1)
+        p = self.pos.unsqueeze(1)  # (N, 1, 2)
 
-        # 牆壁
+        # ── 牆壁 (對所有 agent 相同) ──
         a = self.wall_A.unsqueeze(0)
         b = self.wall_B.unsqueeze(0)
         ab = b - a
@@ -388,31 +398,44 @@ class SurvivorsVecEnv(VecEnv):
         ], dim=1)
         wall_in = torch.cat([wall_phys, self.l_wall], dim=1)
 
-        # 動態物件
-        dyn_parts = [self.pos]
+        # ── 動態物件 (per-world) ──
+        # 組合每個 world 的 (agents, food, predators)
+        # agents_by_world: (W, P, 2)
+        agents_bw = self.pos.view(W, P, 2)
+        dyn_parts = [agents_bw]
         if FOOD_SIZE > 0:
-            dyn_parts.append(self.food_pos)
+            dyn_parts.append(self.food_pos)     # (W, FOOD_SIZE, 2)
         if PREDATOR_SIZE > 0:
-            dyn_parts.append(self.pred_pos)
-        dynamic_pos = torch.cat(dyn_parts, dim=0)
+            dyn_parts.append(self.pred_pos)     # (W, PRED_SIZE, 2)
+        dyn_bw = torch.cat(dyn_parts, dim=1)   # (W, P+F+Pr, 2)
+        n_dyn = dyn_bw.shape[1]
 
-        diff_d = dynamic_pos.unsqueeze(0) - p
-        dist_d = torch.norm(diff_d, dim=2)
-        diag_idx = torch.arange(N, device=dev)
-        if N <= dynamic_pos.shape[0]:
-            dist_d[diag_idx, diag_idx] = 1e6
+        # 展開 agent 視角: (N, n_dyn, 2)
+        # 每個 agent 看到的是自己所屬 world 的動態物件
+        dyn_expanded = dyn_bw[self._world_idx]   # (N, n_dyn, 2)
+
+        diff_d = dyn_expanded - p                # (N, n_dyn, 2)
+        dist_d = torch.norm(diff_d, dim=2)       # (N, n_dyn)
+
+        # 排除自己：agent i 在 world w 中是第 (i % P) 個
+        local_idx = torch.arange(N, device=dev) % P  # (N,)
+        dist_d[torch.arange(N, device=dev), local_idx] = 1e6
 
         abs_ang_d = torch.atan2(diff_d[..., 1], diff_d[..., 0])
         rel_ang_d = abs_ang_d - angel
         dist_val = (dist_d - POP_RADIUS - self.all_radius) / POP_PERCEPTION_RADIUS
         dyna_mask = ((dist_d - POP_RADIUS - self.all_radius) < POP_PERCEPTION_RADIUS).float()
-        if N <= self._pop:
-            dyna_mask[diag_idx, diag_idx] = 0.0
+        # 排除自己
+        dyna_mask[torch.arange(N, device=dev), local_idx] = 0.0
+        # 隊友感知
         if not POP_PERCEPT_TEAM:
-            dyna_mask[:, :self._pop] = 0.0
+            dyna_mask[:, :P] = 0.0
 
-        energy_norm = torch.zeros(N, dist_d.shape[1], device=dev)
-        energy_norm[:, :N] = (self.energy / MAX_ENERGY).view(1, -1)
+        # 能量特徵
+        energy_bw = (self.energy / MAX_ENERGY).view(W, P)  # (W, P)
+        energy_norm = torch.zeros(N, n_dyn, device=dev)
+        # 同 world agents 的能量
+        energy_norm[:, :P] = energy_bw[self._world_idx]
         if PREDATOR_SIZE > 0:
             energy_norm[:, -PREDATOR_SIZE:] = 1.0
 
@@ -422,6 +445,7 @@ class SurvivorsVecEnv(VecEnv):
         ], dim=1)
         dynamic_in = torch.cat([phys_d, self.l_all], dim=1)
 
+        # ── 合併取 top-k ──
         all_in = torch.cat([wall_in, dynamic_in], dim=2)
         all_mask = torch.cat([wall_mask, dyna_mask], dim=1)
         all_in = all_in * all_mask.unsqueeze(1)
@@ -437,7 +461,7 @@ class SurvivorsVecEnv(VecEnv):
         mixed_in = torch.zeros(N, FEAT_IN_DIM, MAX_OBJ, device=dev)
         mixed_in[:, :, :num_to_take] = sorted_in
 
-        # 自身狀態
+        # ── 自身狀態 ──
         delta_pos_global = self.pos - self.last_pos
         cos_a = torch.cos(self.angle)
         sin_a = torch.sin(self.angle)
@@ -466,7 +490,6 @@ class SurvivorsVecEnv(VecEnv):
 
     def _build_obs(self) -> TensorDict:
         mixed_in, self_in = self._last_states
-        # 展平原始觀測
         obs = torch.cat([mixed_in.reshape(self.num_envs, -1), self_in], dim=1)
         return TensorDict({"policy": obs}, batch_size=[self.num_envs], device=self.device)
 
@@ -479,6 +502,8 @@ class SurvivorsVecEnv(VecEnv):
         actions = actions.clamp(-1, 1)
 
         N = self.num_envs
+        W = self._W
+        P = self._P
         dev = self.device
         rewards = torch.full((N,), STEP_REWARD, device=dev)
         steer_vals = actions[:, 0]
@@ -498,49 +523,61 @@ class SurvivorsVecEnv(VecEnv):
         self.vel = (self.vel * (1 - POP_DAMPING_FACTOR) + thrust) * self.alive.unsqueeze(1)
         self.pos += self.vel * self.alive.unsqueeze(1)
 
-        # ── 掠食者 ──
+        # ── 掠食者 (per-world) ──
         if PREDATOR_SIZE > 0:
             self.pred_pos, self.pred_vel = self._update_entities(
                 self.pred_pos, self.pred_vel, PREDATOR_RADIUS,
                 min_speed=PREDATOR_MIN_SPEED, max_speed=PREDATOR_MAX_SPEED)
-            dist_pred = torch.cdist(self.pos, self.pred_pos)
-            killed = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=1) & self.alive
+            # (W, P, 2) vs (W, PRED, 2) → (W, P, PRED)
+            agents_bw = self.pos.view(W, P, 2)
+            dist_pred = torch.cdist(agents_bw, self.pred_pos)  # (W, P, PRED)
+            killed_bw = (dist_pred < POP_RADIUS + PREDATOR_RADIUS).any(dim=2)  # (W, P)
+            alive_bw = self.alive.view(W, P)
+            killed = (killed_bw & alive_bw).view(N)
             rewards[killed] += KILLED_REWARD
             self._kill(killed)
-            pred_nearby = (dist_pred - POP_RADIUS - PREDATOR_RADIUS < POP_ALERT_RADIUS).any(dim=1) & self.alive
+            pred_nearby_bw = (dist_pred - POP_RADIUS - PREDATOR_RADIUS < POP_ALERT_RADIUS).any(dim=2)
+            pred_nearby = (pred_nearby_bw & alive_bw).view(N)
             rewards[pred_nearby] += PREDATOR_NEARBY_REWARD
         else:
             killed = torch.zeros(N, dtype=torch.bool, device=dev)
 
         # ── 撞牆 ──
         p = self.pos.unsqueeze(1)
-        a = self.wall_A.unsqueeze(0)
-        b = self.wall_B.unsqueeze(0)
-        ab = b - a
-        ap = p - a
+        wa = self.wall_A.unsqueeze(0)
+        wb = self.wall_B.unsqueeze(0)
+        ab = wb - wa
+        ap = p - wa
         t = (torch.sum(ap * ab, dim=-1) / (torch.sum(ab * ab, dim=-1) + 1e-6)).clamp(0, 1)
-        wall_closest_points = a + t.unsqueeze(-1) * ab
+        wall_closest_points = wa + t.unsqueeze(-1) * ab
         dist_to_walls = torch.norm(self.pos.unsqueeze(1) - wall_closest_points, dim=-1)
         collided = (dist_to_walls < POP_RADIUS).any(dim=1) & self.alive
         rewards[collided] += COLLIDED_REWARD
         self._kill(collided)
 
-        # ── 食物 ──
+        # ── 食物 (per-world) ──
         if FOOD_SIZE > 0:
-            dist_food = torch.cdist(self.pos, self.food_pos)
-            hits_food = (dist_food < POP_RADIUS + FOOD_RADIUS) & self.alive.unsqueeze(1)
+            agents_bw = self.pos.view(W, P, 2)
+            dist_food = torch.cdist(agents_bw, self.food_pos)  # (W, P, FOOD)
+            alive_bw = self.alive.view(W, P)
+            hits_food = (dist_food < POP_RADIUS + FOOD_RADIUS) & alive_bw.unsqueeze(2)  # (W, P, FOOD)
             if hits_food.any():
+                # 每個食物只能被同 world 中最近的 agent 吃到
                 masked_dist = torch.where(hits_food, dist_food, torch.tensor(float('inf'), device=dev))
-                min_dists, closest_a_idx = torch.min(masked_dist, dim=0)
-                valid = min_dists != float('inf')
-                f_idx = torch.where(valid)[0]
-                a_idx = closest_a_idx[valid]
-                n_eaten = len(a_idx)
-                rewards.index_add_(0, a_idx, torch.full((n_eaten,), FOOD_REWARD, device=dev))
-                self.energy.index_add_(0, a_idx, torch.full((n_eaten,), FOOD_ENERGY, device=dev))
-                self.energy.clamp_(max=MAX_ENERGY)
-                self.food_pos[f_idx] = self._respawn_food(len(f_idx))
-                self.eaten += len(f_idx)
+                min_dists, closest_a_local = torch.min(masked_dist, dim=1)  # (W, FOOD)
+                valid = min_dists != float('inf')  # (W, FOOD)
+                if valid.any():
+                    w_idx, f_idx = torch.where(valid)
+                    a_local = closest_a_local[w_idx, f_idx]
+                    a_global = w_idx * P + a_local
+                    n_eaten = len(a_global)
+                    rewards.index_add_(0, a_global, torch.full((n_eaten,), FOOD_REWARD, device=dev))
+                    self.energy.index_add_(0, a_global, torch.full((n_eaten,), FOOD_ENERGY, device=dev))
+                    self.energy.clamp_(max=MAX_ENERGY)
+                    # 重生食物
+                    food_eaten_mask = valid  # (W, FOOD)
+                    self._respawn_food_at(valid.any(dim=1), food_eaten_mask)
+                    self.eaten += n_eaten
 
         # ── 能量消耗 ──
         if ENERGY_DECAY > 0:
@@ -629,54 +666,7 @@ class SurvivorsVecEnv(VecEnv):
         self.alive[mask] = False
         n = mask.sum().item()
         if n > 0:
-            self.respawn_timer[mask] = 1 if self._pop == 1 else torch.randint(30, 180, (n,), device=self.device)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Config — rsl-rl PPO (標準 MLPModel，吃特徵提取後的觀測)
-# ═══════════════════════════════════════════════════════════════════════════
-def make_train_cfg():
-    return {
-        "seed": 42,
-        "num_steps_per_env": 64,
-        "save_interval": 500,
-
-        "algorithm": {
-            "class_name":             "PPO",
-            "gamma":                  0.97,
-            "lam":                    0.95,
-            "value_loss_coef":        1.0,
-            "use_clipped_value_loss": True,
-            "clip_param":             0.2,
-            "entropy_coef":           0.01,
-            "num_learning_epochs":    4,
-            "num_mini_batches":       4,
-            "learning_rate":          3e-4,
-            "schedule":               "adaptive",
-            "desired_kl":             0.01,
-            "max_grad_norm":          1.0,
-        },
-
-        "actor": {
-            "class_name":  "survivors10.SurvivorsCustomModel",
-            "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM // 2],
-            "activation":  "elu",
-            "distribution_cfg": {
-                "class_name": "GaussianDistribution",
-                "init_std": 1.0,
-            },
-        },
-        "critic": {
-            "class_name":  "survivors10.SurvivorsCustomModel",
-            "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM // 2],
-            "activation":  "elu",
-        },
-
-        "obs_groups": {
-            "actor":  ["policy"],
-            "critic": ["policy"],
-        },
-    }
+            self.respawn_timer[mask] = 1 if self._P == 1 else torch.randint(30, 180, (n,), device=self.device)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -835,17 +825,18 @@ class Renderer:
         self.ui_surface.fill((0, 0, 0, 0))
         dev = env.device
 
-        # ── Snapshot ──
-        snap_pos = env.pos.clone()
-        snap_alive = env.alive.clone()
-        snap_energy = env.energy.clone()
-        snap_color = env.color.clone()
-        snap_vel = env.vel.clone()
-        snap_fwd = env.forward_speed.clone()
-        snap_angle = env.angle.clone()
-        snap_act = env.last_actions.clone()
-        snap_food = env.food_pos.clone() if FOOD_SIZE > 0 else None
-        snap_pred = env.pred_pos.clone() if PREDATOR_SIZE > 0 else None
+        # ── Snapshot (只渲染 world 0 的 agents) ──
+        P = env._P
+        snap_pos = env.pos[:P].clone()
+        snap_alive = env.alive[:P].clone()
+        snap_energy = env.energy[:P].clone()
+        snap_color = env.color[:P].clone()
+        snap_vel = env.vel[:P].clone()
+        snap_fwd = env.forward_speed[:P].clone()
+        snap_angle = env.angle[:P].clone()
+        snap_act = env.last_actions[:P].clone()
+        snap_food = env.food_pos[0].clone() if FOOD_SIZE > 0 else None       # (FOOD_SIZE, 2)
+        snap_pred = env.pred_pos[0].clone() if PREDATOR_SIZE > 0 else None   # (PRED_SIZE, 2)
         snap_wl = env.wall_lines.clone() if env.wall_lines is not None else None
 
         if self.draw_units:
@@ -972,87 +963,58 @@ class TrainState:
         self.lock = threading.Lock()
 
 
-def train_loop(runner: OnPolicyRunner, env: SurvivorsVecEnv,
-               state: TrainState, max_iter: int, epoch: str = None):
-    alg = runner.alg
-    steps_per = runner.cfg["num_steps_per_env"]
-    alg.train_mode()
-    obs_td = env.get_observations()
-
-    start_iter = state.iteration
-    for it_offset in range(max_iter):
-        it = start_iter + it_offset
-        while True:
-            with state.lock:
-                if state.stop: return
-                if state.reset_req:
-                    env._reset_all(); obs_td = env.get_observations(); state.reset_req = False
-                if not state.paused: break
-            time.sleep(0.05)
-
-        for _ in range(steps_per):
-            with torch.no_grad():
-                actions = alg.act(obs_td)
-            next_obs, rewards, dones, extras = env.step(actions)
-            alg.process_env_step(obs=obs_td, rewards=rewards, dones=dones, extras=extras)
-            obs_td = next_obs
-
-        with torch.no_grad():
-            alg.compute_returns(obs_td)
-        res = alg.update()
-
-        with state.lock:
-            state.iteration = it + 1
-        runner._iteration = it + 1
-
-        if (it + 1) % 50 == 0:
-            ep = env.total_episodes
-            rew = float(np.mean(env.reward_buf)) if env.reward_buf else 0.0
-            print(f"[Iter {it+1:>5}]  ep={ep:>5}  rew={rew:>7.3f}  "
-                  f"eaten={env.eaten}  killed={env.killed}  collided={env.collided}  starved={env.starved}  "
-                  f"val={res.get('value_loss',0):.4f}  surr={res.get('surrogate_loss',0):.4f}")
-
-        # 定期存檔
-        if (it + 1) % 500 == 0:
-            save_state(runner, env, epoch)
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  Save / Load
+#  Config — rsl-rl PPO (標準 MLPModel，吃特徵提取後的觀測)
 # ═══════════════════════════════════════════════════════════════════════════
-def save_state(runner: OnPolicyRunner, env: SurvivorsVecEnv, epoch: str = None):
-    """儲存 PPO (actor/critic) + 特徵提取器權重。"""
-    Path(BASE_PATH).mkdir(parents=True, exist_ok=True)
-    state = {
-        "actor":             runner.alg.actor.state_dict(),
-        "critic":            runner.alg.critic.state_dict(),
-        "iteration":         getattr(runner, '_iteration', 0),
+def make_train_cfg():
+    return {
+        "seed": 42,
+        "num_steps_per_env": 24,
+        "save_interval": 1000,
+
+        "obs_groups": {
+            "actor":  ["policy"],
+            "critic": ["policy"],
+        },
+
+        "algorithm": {
+            "class_name":             "PPO",
+            "num_learning_epochs":    5,
+            "num_mini_batches":       4,
+            "gamma":                  0.97,
+            "lam":                    0.95,
+        },
+
+        "actor": {
+            "class_name":  "survivors10.SurvivorsCustomModel",
+            "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM],
+            "activation":  "elu",
+            "distribution_cfg": {
+                "class_name": "GaussianDistribution",
+                "init_std": 1.0,
+            },
+        },
+        "critic": {
+            "class_name":  "survivors10.SurvivorsCustomModel",
+            "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM],
+            "activation":  "elu",
+        },
     }
-    torch.save(state, SAVE_PATH)
-    print(f"[Save] {SAVE_PATH}")
-    if epoch:
-        ep_path = f"{BASE_PATH}/{script_name}_{epoch}.pt"
-        import shutil
-        shutil.copy2(SAVE_PATH, ep_path)
-        print(f"[Save] {ep_path}")
 
 
-def load_state(runner: OnPolicyRunner, env: SurvivorsVecEnv) -> int:
-    """載入權重，回傳已訓練的 iteration 數。"""
-    if not os.path.exists(SAVE_PATH):
-        print(f"[Load] No checkpoint found at {SAVE_PATH}")
-        return 0
-    try:
-        state = torch.load(SAVE_PATH, map_location=DEVICE, weights_only=False)
-        runner.alg.actor.load_state_dict(state["actor"])
-        runner.alg.critic.load_state_dict(state["critic"])
-        it = state.get("iteration", 0)
-        print(f"[Load] {SAVE_PATH}  iteration={it:,}")
-        return it
-    except Exception as e:
-        print(f"[Load] Failed: {e}")
-        return 0
+def train_loop(runner: OnPolicyRunner, max_iter: int):
+    runner.learn(max_iter)
 
+
+def get_latest_checkpoint(path):
+    import glob
+    import re
+    files = glob.glob(os.path.join(path, "model_*.pt"))
+    if not files:
+        return None
+    # 提取數字並找出最大值
+    iters = [int(re.findall(r'model_(\d+).pt', f)[0]) for f in files]
+    return max(iters)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main
@@ -1069,66 +1031,59 @@ def main():
 
     env = SurvivorsVecEnv(num_envs=NUM_ENVS, device=DEVICE)
     train_cfg = make_train_cfg()
-    log_dir = "logs/ppo_survivors"
 
     print("=" * 60)
     print(f"  {CAPTION}")
-    print(f"  Stage: {STAGE}  Agents: {env.num_envs}  Actions: {ACTOR_OUT_DIM}")
-    print(f"  RawObs: {OBS_DIM}  ExtractedObs: {EXTRACTED_OBS_DIM}")
+    print(f"  Stage: {STAGE}  Worlds: {NUM_ENVS}  PopPerWorld: {POP_SIZE}  TotalAgents: {env.num_envs}")
+    print(f"  Actions: {ACTOR_OUT_DIM}  RawObs: {OBS_DIM}  ExtractedObs: {EXTRACTED_OBS_DIM}")
     print(f"  Food: {FOOD_SIZE}  Predators: {PREDATOR_SIZE}  EnergyDecay: {ENERGY_DECAY:.4f}")
     print(f"  MaxSteps: {MAX_EPISODE_STEPS}  EstSteps: {EST_STEPS:.0f}")
-    print(f"  Headless: {args.headless}")
-    print(f"  Extractor: Conv1d({FEAT_IN_DIM}→{HIDDEN_FEAT_DIM}) + Attn({HIDDEN_ATTN_DIM}) → FC({HIDDEN_FC_DIM})")
-    print(f"  PPO MLPModel: {EXTRACTED_OBS_DIM} → [{HIDDEN_FC_DIM}, {HIDDEN_FC_DIM//2}] → {ACTOR_OUT_DIM}")
     print("=" * 60)
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=DEVICE)
-    loaded_iter = load_state(runner, env)
+    runner = OnPolicyRunner(env, train_cfg, log_dir=LOG_PATH, device=DEVICE)
     print("Runner built. Training starts!")
 
+    latest_idx = get_latest_checkpoint(LOG_PATH)
+    if latest_idx is not None:
+        file_path = os.path.join(LOG_PATH, f"model_{latest_idx}.pt")
+        runner.load(file_path)
+        print(f"[Load] {file_path} iteration={runner.current_learning_iteration:,}")
+
     state = TrainState()
-    state.iteration = loaded_iter
-    max_iter = 100000
+    max_iter = 1000
 
     if args.headless:
-        print("Running headless...")
         try:
-            train_loop(runner, env, state, max_iter, args.epoch)
+            runner.learn(max_iter)
         except KeyboardInterrupt:
-            print("\nInterrupted.")
-        save_state(runner, env, args.epoch)
-        print("Training finished.")
+            pass
+        finally:
+            file_path = os.path.join(LOG_PATH, f"model_{runner.current_learning_iteration}.pt")
+            runner.save(file_path)
+            print(f"[Save] {file_path} iteration={runner.current_learning_iteration}")
     else:
         renderer = Renderer()
-        print("  SPACE=Pause  R=Reset  Q/ESC=Quit  U=Units  L=Labels  V=Verbose")
-
         t = threading.Thread(
             target=train_loop,
-            args=(runner, env, state, max_iter, args.epoch),
+            args=(runner, max_iter),
             daemon=True,
         )
         t.start()
 
         stats = {}
-        while t.is_alive():
-            ev = renderer.handle_events()
-            if ev["quit"]:
+        try:
+            while t.is_alive():
                 with state.lock:
-                    state.stop = True
-                break
-            if ev["pause"]:
-                with state.lock:
-                    state.paused = not state.paused
-            if ev["reset"]:
-                with state.lock:
-                    state.reset_req = True
-            with state.lock:
-                stats["iteration"] = state.iteration
-                stats["paused"] = state.paused
-            renderer.draw(env, stats)
+                    stats["iteration"] = runner.current_learning_iteration
+                renderer.draw(env, stats)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            file_path = os.path.join(LOG_PATH, f"model_{runner.current_learning_iteration}.pt")
+            runner.save(file_path)
+            print(f"[Save] {file_path} iteration={runner.current_learning_iteration}")
 
         t.join(timeout=3.0)
-        save_state(runner, env, args.epoch)
         print("\nTraining finished, closing.")
         renderer.quit()
 
