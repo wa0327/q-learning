@@ -39,6 +39,7 @@ from pathlib import Path
 
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.models import MLPModel
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -59,7 +60,7 @@ WINDOW_W, WINDOW_H = int(SCREEN_W * SCALE), int(SCREEN_H * SCALE)
 # 代理物理
 STAGE             = 1
 NUM_ENVS          = 1       # VecEnv 同時跑的環境數 (每個環境內有 POP_SIZE 個 agent)
-POP_SIZE          = 1 if STAGE < 1 else 1000 if STAGE < 2 else 50 if STAGE < 5 else 1
+POP_SIZE          = 1 if STAGE < 1 else 100 if STAGE < 2 else 50 if STAGE < 5 else 1
 POP_MAX_SPEED     = 3.5
 POP_RADIUS        = 4
 POP_DAMPING_FACTOR = 0.25
@@ -108,8 +109,9 @@ HIDDEN_FEAT_DIM = 64    # 特徵提取層 (Conv1d) 的輸出維度
 HIDDEN_ATTN_DIM = 32    # Attention 內部隱藏層維度
 HIDDEN_FC_DIM   = 256   # 後段全連接層 (MLP) 主要維度
 MAX_OBJ         = 25    # 視野內最近距離中最多的環境物件數量
-OBS_DIM         = FEAT_IN_DIM * MAX_OBJ + STATE_IN_DIM  # 展平後的觀測向量大小 (提取前)
-EXTRACTED_OBS_DIM = HIDDEN_FC_DIM + STATE_IN_DIM          # 提取後 PPO 看到的觀測維度
+FEAT_FLAT_DIM   = FEAT_IN_DIM * MAX_OBJ
+OBS_DIM         = FEAT_FLAT_DIM + STATE_IN_DIM  # 展平後的觀測向量大小 (提取前)
+EXTRACTED_OBS_DIM = HIDDEN_FEAT_DIM + STATE_IN_DIM          # 提取後 PPO 看到的觀測維度
 
 # PPO 最大步數 (episode truncation)
 MAX_EPISODE_STEPS = int(EST_STEPS * 2)
@@ -117,25 +119,24 @@ MAX_EPISODE_STEPS = int(EST_STEPS * 2)
 FPS_RENDER = 60
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  Custom Feature Extractor (from survivors8.py Conv1d + Attention)
-# ═══════════════════════════════════════════════════════════════════════════
-class SurvivorsFeatureExtractor(nn.Module):
-    """
-    獨立的特徵提取器，在環境回傳觀測值之前執行。
+class SurvivorsCustomModel(MLPModel):
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
+        activation: str = "elu",
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None
+    ) -> None:
+        # 先調用父類初始化 (注意：此處 MLP 會暫時以原始維度初始化，我們後面會重寫它)
+        super().__init__(
+            obs, obs_groups, obs_set, output_dim, 
+            hidden_dims, activation, obs_normalization, distribution_cfg
+        )
 
-    接收展平的原始觀測 (batch, OBS_DIM)，拆分為：
-      - m_in: (batch, FEAT_IN_DIM, MAX_OBJ) — 環境物件特徵 (無定序)
-      - s_in: (batch, STATE_IN_DIM)          — 自身狀態
-
-    對 m_in 做 Conv1d → Attention → 產出 (batch, HIDDEN_FEAT_DIM) 的特徵，
-    再與 s_in 拼接 → LayerNorm → FC → 輸出 (batch, HIDDEN_FC_DIM)。
-    最後與 s_in 合併為 (batch, HIDDEN_FC_DIM + STATE_IN_DIM) 回傳給 PPO。
-
-    此模組不由 PPO 的 optimizer 更新，而是獨立保存/載入權重。
-    """
-    def __init__(self):
-        super().__init__()
         # 1. 空間感知層
         self.conv = nn.Sequential(
             nn.Conv1d(FEAT_IN_DIM, HIDDEN_FEAT_DIM, 1),
@@ -150,33 +151,29 @@ class SurvivorsFeatureExtractor(nn.Module):
             nn.Tanh(),
             nn.Linear(HIDDEN_ATTN_DIM, 1)
         )
-        # 3. 結合歸一化
-        self.feat_norm = nn.LayerNorm(HIDDEN_FEAT_DIM + STATE_IN_DIM)
-        # 4. 投射到 HIDDEN_FC_DIM
-        self.fc = nn.Sequential(
-            nn.Linear(HIDDEN_FEAT_DIM + STATE_IN_DIM, HIDDEN_FC_DIM),
-            nn.LayerNorm(HIDDEN_FC_DIM),
-            nn.ReLU(),
-        )
 
-    def forward(self, flat_obs: torch.Tensor) -> torch.Tensor:
-        """
-        flat_obs: (B, OBS_DIM)
-        returns:  (B, EXTRACTED_OBS_DIM) = (B, HIDDEN_FC_DIM + STATE_IN_DIM)
-        """
-        m_flat = flat_obs[:, :FEAT_IN_DIM * MAX_OBJ]
-        s_in   = flat_obs[:, FEAT_IN_DIM * MAX_OBJ:]
-        m_in   = m_flat.view(-1, FEAT_IN_DIM, MAX_OBJ)
+    def get_latent(
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: None = None
+    ) -> torch.Tensor:
+        
+        latent = super().get_latent(obs, masks, hidden_state)
 
-        feat = self.conv(m_in).transpose(1, 2)              # (B, MAX_OBJ, HIDDEN_FEAT_DIM)
-        weights = F.softmax(self.attn_weights(feat), dim=1)  # (B, MAX_OBJ, 1)
-        x_attn = torch.sum(feat * weights, dim=1)            # (B, HIDDEN_FEAT_DIM)
+        m_flat = latent[:, :FEAT_FLAT_DIM]
+        s_in = latent[:, FEAT_FLAT_DIM:]
+        m_in = m_flat.view(-1, FEAT_IN_DIM, MAX_OBJ)
 
-        combined = self.feat_norm(torch.cat([x_attn, s_in], dim=1))
-        extracted = self.fc(combined)                         # (B, HIDDEN_FC_DIM)
+        feat = self.conv(m_in).transpose(1, 2)
+        weights = F.softmax(self.attn_weights(feat), dim=1)
+        x_attn = torch.sum(weights * feat, dim=1)
 
-        # 與 s_in 合併成最終觀測
-        return torch.cat([extracted, s_in], dim=1)            # (B, EXTRACTED_OBS_DIM)
+        combined = torch.cat([x_attn, s_in], dim=1)
+        return combined
+    
+    def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
+        """Select active observation groups and compute observation dimension."""
+        active_obs_groups = obs_groups[obs_set]
+        obs_dim = EXTRACTED_OBS_DIM
+        return active_obs_groups, obs_dim
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -204,10 +201,6 @@ class SurvivorsVecEnv(VecEnv):
         self.episode_length_buf = torch.zeros(total, dtype=torch.long, device=device)
         self.device             = device
         self.cfg                = {}
-
-        # ── 特徵提取器 (獨立於 PPO，在 env 端運行) ──
-        self.feature_extractor = SurvivorsFeatureExtractor().to(device)
-        self.feature_extractor.eval()  # 推論模式，不參與 PPO 的梯度計算
 
         self.screen_size = torch.tensor([SCREEN_W, SCREEN_H], device=device, dtype=torch.float)
         self.bounds = self.screen_size - 1.0
@@ -474,11 +467,8 @@ class SurvivorsVecEnv(VecEnv):
     def _build_obs(self) -> TensorDict:
         mixed_in, self_in = self._last_states
         # 展平原始觀測
-        flat_raw = torch.cat([mixed_in.reshape(self.num_envs, -1), self_in], dim=1)
-        # 特徵提取 (no_grad — 不參與 PPO 的反向傳播)
-        with torch.no_grad():
-            extracted = self.feature_extractor(flat_raw)  # (N, EXTRACTED_OBS_DIM)
-        return TensorDict({"policy": extracted}, batch_size=[self.num_envs], device=self.device)
+        obs = torch.cat([mixed_in.reshape(self.num_envs, -1), self_in], dim=1)
+        return TensorDict({"policy": obs}, batch_size=[self.num_envs], device=self.device)
 
     def get_observations(self) -> TensorDict:
         return self._build_obs()
@@ -668,7 +658,7 @@ def make_train_cfg():
         },
 
         "actor": {
-            "class_name":  "MLPModel",
+            "class_name":  "survivors10.SurvivorsCustomModel",
             "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM // 2],
             "activation":  "elu",
             "distribution_cfg": {
@@ -677,7 +667,7 @@ def make_train_cfg():
             },
         },
         "critic": {
-            "class_name":  "MLPModel",
+            "class_name":  "survivors10.SurvivorsCustomModel",
             "hidden_dims": [HIDDEN_FC_DIM, HIDDEN_FC_DIM // 2],
             "activation":  "elu",
         },
@@ -1034,7 +1024,6 @@ def save_state(runner: OnPolicyRunner, env: SurvivorsVecEnv, epoch: str = None):
     """儲存 PPO (actor/critic) + 特徵提取器權重。"""
     Path(BASE_PATH).mkdir(parents=True, exist_ok=True)
     state = {
-        "feature_extractor": env.feature_extractor.state_dict(),
         "actor":             runner.alg.actor.state_dict(),
         "critic":            runner.alg.critic.state_dict(),
         "iteration":         getattr(runner, '_iteration', 0),
@@ -1055,7 +1044,6 @@ def load_state(runner: OnPolicyRunner, env: SurvivorsVecEnv) -> int:
         return 0
     try:
         state = torch.load(SAVE_PATH, map_location=DEVICE, weights_only=False)
-        env.feature_extractor.load_state_dict(state["feature_extractor"])
         runner.alg.actor.load_state_dict(state["actor"])
         runner.alg.critic.load_state_dict(state["critic"])
         it = state.get("iteration", 0)
