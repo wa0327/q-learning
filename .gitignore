@@ -3,3 +3,4 @@
 *.log
 logs/
 weights/
+__pycache__
