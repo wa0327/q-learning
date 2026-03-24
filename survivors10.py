@@ -1,31 +1,5 @@
-"""
-PPO Survivors — rsl-rl-lib v5 + moderngl + pygame
-===================================================
-基於 rsl-rl-example.py 的 PPO 架構，引入 survivors8.py 的：
-  - 車輛物理模型 (轉向/油門/阻力/慣性)
-  - 環境元素 (牆壁、食物、掠食者)
-  - 獎勵機制 (食物、撞牆、被殺、餓死、移動品質)
-  - moderngl 渲染
-  - 自訂 Conv1d+Attention 特徵提取器
-
-執行方式：
-    conda activate isaaclab
-    pip install pygame moderngl
-    python ppo_survivors.py              # 有視窗訓練
-    python ppo_survivors.py --headless   # 無頭模式
-
-鍵盤 (有視窗時)：
-    SPACE  — 暫停 / 繼續
-    R      — 重置環境
-    Q/ESC  — 離開
-    U      — 顯示/隱藏單位
-    L      — 顯示/隱藏標籤
-    V      — 切換詳細程度 (0-3)
-"""
-
 import argparse
 import math
-import time
 import threading
 
 import numpy as np
